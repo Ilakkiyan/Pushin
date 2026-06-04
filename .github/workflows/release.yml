@@ -1,0 +1,80 @@
+name: Release
+
+# Builds the installers on each native OS and attaches them to a GitHub Release.
+# A macOS .dmg must be built on macOS and a Windows .exe/.msi on Windows — that's why
+# this runs a per-OS matrix instead of cross-compiling.
+#
+# Trigger by pushing a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# or run it manually from the Actions tab (workflow_dispatch).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # Apple Silicon (.dmg / .app)
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest # Intel macs (.dmg / .app)
+            args: "--target x86_64-apple-darwin"
+          - platform: ubuntu-22.04 # Linux (.AppImage / .deb)
+            args: ""
+          - platform: windows-latest # Windows (.msi / NSIS .exe)
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            file \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build & release (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Pushin ${{ github.ref_name }}"
+          releaseBody: "Download the installer for your platform below, then run it — no separate install needed."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

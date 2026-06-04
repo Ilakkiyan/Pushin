@@ -142,6 +142,26 @@ export interface BookingSlot {
   end: string;
 }
 
+export interface HabitDay {
+  day: string; // "YYYY-MM-DD"
+  done: boolean;
+}
+
+export interface HabitStats {
+  id: number;
+  name: string;
+  color: string;
+  cadence: string;
+  durationMinutes: number;
+  createdAt: string;
+  doneToday: boolean;
+  currentStreak: number;
+  longestStreak: number;
+  completionRate: number; // 0..1 over the last 30 days
+  totalDone: number;
+  history: HabitDay[]; // contiguous days, oldest → today
+}
+
 // ---- commands ----
 export const api = {
   loadAll: () => invoke<AppData>("load_all"),
@@ -170,6 +190,15 @@ export const api = {
     invoke<BookingSlot[]>("booking_slots", { eventTypeId, horizonDays }),
   createBooking: (eventTypeId: number, name: string, email: string, start: string, end: string) =>
     invoke<ScheduleResult>("create_booking", { eventTypeId, name, email, start, end }),
+
+  listHabits: () => invoke<HabitStats[]>("list_habits"),
+  createHabit: (name: string, color: string, cadence: string, durationMinutes: number) =>
+    invoke<HabitStats[]>("create_habit", { name, color, cadence, durationMinutes }),
+  updateHabit: (id: number, name: string, color: string, durationMinutes: number) =>
+    invoke<HabitStats[]>("update_habit", { id, name, color, durationMinutes }),
+  toggleHabit: (id: number, day: string | null) => invoke<HabitStats[]>("toggle_habit", { id, day }),
+  deleteHabit: (id: number) => invoke<HabitStats[]>("delete_habit", { id }),
+  scheduleHabit: (id: number, day: string | null) => invoke<ScheduleResult>("schedule_habit", { id, day }),
 
   connectGoogle: () => invoke<string>("connect_google"),
   disconnectGoogle: () => invoke<void>("disconnect_google"),

@@ -7,6 +7,7 @@ import {
   type CalEvent,
   type Conflict,
   type EventType,
+  type HabitStats,
   type LlmStatus,
   type PlanOutcome,
   type Project,
@@ -16,7 +17,7 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "booking" | "settings";
+type View = "calendar" | "month" | "habits" | "booking" | "settings";
 
 interface State {
   loaded: boolean;
@@ -32,9 +33,21 @@ interface State {
   conflicts: Conflict[];
   llm: LlmStatus | null;
 
+  // When the month view hands off to the week view, the day to open to.
+  focusDateIso: string | null;
+  habits: HabitStats[];
+
   setView: (v: View) => void;
+  setFocusDate: (iso: string | null) => void;
   load: () => Promise<void>;
   refreshLlm: () => Promise<void>;
+
+  loadHabits: () => Promise<void>;
+  createHabit: (name: string, color: string, durationMinutes: number) => Promise<void>;
+  updateHabit: (id: number, name: string, color: string, durationMinutes: number) => Promise<void>;
+  toggleHabit: (id: number, day?: string | null) => Promise<void>;
+  deleteHabit: (id: number) => Promise<void>;
+  scheduleHabit: (id: number, day?: string | null) => Promise<void>;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number) => Promise<void>;
@@ -105,8 +118,11 @@ export const useStore = create<State>((set, get) => {
     bookings: [],
     conflicts: [],
     llm: null,
+    focusDateIso: null,
+    habits: [],
 
     setView: (v) => set({ view: v }),
+    setFocusDate: (iso) => set({ focusDateIso: iso }),
 
     load: async () => {
       await refreshData();
@@ -147,6 +163,15 @@ export const useStore = create<State>((set, get) => {
     reschedule: () => mutate(() => api.reschedule()),
     createBooking: (eventTypeId, name, email, start, end) =>
       mutate(() => api.createBooking(eventTypeId, name, email, start, end)),
+
+    // Habit commands return the full recomputed list, so we just store the result.
+    loadHabits: async () => set({ habits: await api.listHabits() }),
+    createHabit: async (name, color, durationMinutes) => set({ habits: await api.createHabit(name, color, "daily", durationMinutes) }),
+    updateHabit: async (id, name, color, durationMinutes) => set({ habits: await api.updateHabit(id, name, color, durationMinutes) }),
+    toggleHabit: async (id, day = null) => set({ habits: await api.toggleHabit(id, day) }),
+    deleteHabit: async (id) => set({ habits: await api.deleteHabit(id) }),
+    // Scheduling a habit creates a calendar event + re-plans, so refresh app data via mutate.
+    scheduleHabit: (id, day = null) => mutate(() => api.scheduleHabit(id, day)),
 
     saveSettings: async (s) => {
       await api.saveSettings(s);

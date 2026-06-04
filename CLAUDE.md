@@ -22,7 +22,8 @@ and was learned the hard way.
 - **Inference:** llama.cpp **`llama-server`** run as a child process, OpenAI-compatible API at `http://127.0.0.1:8080`, using **`response_format: json_schema`** for constrained JSON.
 - **Models** (`model_manager::MODELS`): Qwen2.5 **3B** (default), **7B** ("most reliable", ~4.7GB), **1.5B** (lite). 4-bit GGUF from bartowski on HuggingFace, auto-downloaded on first run.
 - **DB:** SQLite via `rusqlite` (Rust) + `@tauri-apps/plugin-sql` (frontend). Lives at `~/Library/Application Support/com.pushin.app/pushin.db`.
-- Target: **macOS arm64** (the dev machine). Windows/Linux are documented follow-ups.
+- Target: **macOS arm64**, **Linux x64/arm64**, **Windows x64/arm64**. The engine
+  auto-download/unpack/spawn is cross-platform (`model_manager.rs`); macOS is the most-tested.
 
 ## Architecture
 ```
@@ -49,6 +50,11 @@ Rust core
 - `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, etc.
 - `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init`, `0002_google`).
 - `model_manager.rs` — model + engine auto-download, `llama-server` spawn/health, `MODELS` list.
+  Cross-platform: picks the **CPU** llama.cpp release asset per OS/arch (asset substrings are
+  extension-less since llama.cpp churns extensions — Linux moved `.zip`→`.tar.gz`). macOS/Linux
+  `.tar.gz` unpack via system `tar`; Windows `.zip` via the in-process `zip` crate. Extracts to a
+  staging dir then **flattens binary + co-located libs into `bin/`**. Spawn sets `LD_LIBRARY_PATH`
+  (Linux) and `CREATE_NO_WINDOW` (Windows).
 - `llm.rs` — `chat_json(messages, schema)`; sampling tuned to stop runaway (see Gotchas).
 - `parser.rs` — **the trickiest file.** NL→plan, day-word→date, dedupe, edit-merge. See Gotchas.
 - `scheduler.rs` — auto-scheduler + `parse_dt`/`fmt_dt` time helpers. Has unit tests.
@@ -149,7 +155,9 @@ Rust core
   inference** (link llama.cpp via FFI, or MLC/MediaPipe) + a smaller default model (1.5B/0.5B). Memory
   (~2GB for 3B) is the real wall on phones.
 - Google **tokens → OS keychain**; smarter **block-mirror diffing** (avoid delete+recreate churn).
-- **Bundle `llama-server`** as a per-OS sidecar so users don't rely on the auto-download.
+- **Engine auto-download now spans macOS/Linux/Windows** (CPU build). Still TODO: optionally
+  **bundle `llama-server`** as a per-OS sidecar (offline installs), and offer GPU builds
+  (CUDA/Vulkan/Metal) instead of the GPU-agnostic CPU asset. Live-verify on Linux/Windows.
 - **Public booking page** needs a hosted relay (the in-app booking is a local mockup).
 - No **drag-to-resize** on the calendar yet (only drag-to-move).
 

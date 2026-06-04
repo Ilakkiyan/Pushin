@@ -35,8 +35,14 @@ export default function CalendarPane() {
   const unlockBlock = useStore((s) => s.unlockBlock);
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
+  const focusDateIso = useStore((s) => s.focusDateIso);
 
-  const [anchor, setAnchor] = useState(() => startOfWeek(new Date()));
+  const [anchor, setAnchor] = useState(() => startOfWeek(focusDateIso ? parseLocal(focusDateIso) : new Date()));
+
+  // Month view hands off a day to open to; jump to its week when it changes.
+  useEffect(() => {
+    if (focusDateIso) setAnchor(startOfWeek(parseLocal(focusDateIso)));
+  }, [focusDateIso]);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [modal, setModal] = useState<{ start: Date } | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
@@ -116,6 +122,7 @@ export default function CalendarPane() {
         <div className="ml-auto flex items-center gap-3 text-[11px] text-gray-500">
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
+          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
           <span className="flex items-center gap-1"><Lock className="size-3" /> pinned</span>
         </div>
       </div>
@@ -229,10 +236,14 @@ function minutesBetweenBlock(b: Block) {
 }
 
 function EventCard({ ev, top, height, onDelete }: { ev: CalEvent; top: number; height: number; onDelete: () => void }) {
+  const isHabit = ev.kind === "habit";
   return (
     <div
       onClick={(e) => e.stopPropagation()}
-      className="group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 bg-rose-500/15 border border-rose-400/40 text-rose-100"
+      className={clsx(
+        "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
+        isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100",
+      )}
       style={{ top, height }}
       title={ev.title}
     >

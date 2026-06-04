@@ -7,6 +7,8 @@ use rusqlite::{params, Connection, Row};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_google.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_habits.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_habit_duration.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -25,6 +27,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 2 {
         conn.execute_batch(MIGRATION_0002)?;
         conn.pragma_update(None, "user_version", 2)?;
+    }
+    if version < 3 {
+        conn.execute_batch(MIGRATION_0003)?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        conn.execute_batch(MIGRATION_0004)?;
+        conn.pragma_update(None, "user_version", 4)?;
     }
     Ok(())
 }
@@ -355,6 +365,71 @@ pub fn mark_event_pushed(conn: &Connection, id: i64, external_id: &str, etag: Op
         params![id, external_id, etag],
     )?;
     Ok(())
+}
+
+// ---------- Habits ----------
+
+fn row_to_habit(r: &Row) -> rusqlite::Result<Habit> {
+    Ok(Habit {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        color: r.get("color")?,
+        cadence: r.get("cadence")?,
+        duration_minutes: r.get("duration_minutes")?,
+        archived: r.get::<_, i64>("archived")? != 0,
+        created_at: r.get("created_at")?,
+    })
+}
+
+pub fn list_habits(conn: &Connection) -> Result<Vec<Habit>> {
+    let mut stmt = conn.prepare("SELECT * FROM habits WHERE archived = 0 ORDER BY created_at")?;
+    let rows: Vec<Habit> = stmt.query_map([], row_to_habit)?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+pub fn insert_habit(conn: &Connection, name: &str, color: &str, cadence: &str, duration_minutes: i64) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO habits(name, color, cadence, duration_minutes, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![name, color, cadence, duration_minutes, now_iso()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_habit(conn: &Connection, id: i64, name: &str, color: &str, duration_minutes: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE habits SET name = ?2, color = ?3, duration_minutes = ?4 WHERE id = ?1",
+        params![id, name, color, duration_minutes],
+    )?;
+    Ok(())
+}
+
+pub fn delete_habit(conn: &Connection, id: i64) -> Result<()> {
+    // habit_logs cascade via the FK (foreign_keys pragma is ON).
+    conn.execute("DELETE FROM habits WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// The calendar days a habit was completed (each "YYYY-MM-DD"), for stats.
+pub fn done_days_for_habit(conn: &Connection, habit_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT day FROM habit_logs WHERE habit_id = ?1")?;
+    let rows = stmt.query_map(params![habit_id], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Toggle a habit's completion for a day. Returns true if it's now done, false if cleared.
+pub fn toggle_habit_log(conn: &Connection, habit_id: i64, day: &str) -> Result<bool> {
+    let removed = conn.execute(
+        "DELETE FROM habit_logs WHERE habit_id = ?1 AND day = ?2",
+        params![habit_id, day],
+    )?;
+    if removed > 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO habit_logs(habit_id, day) VALUES(?1, ?2)",
+        params![habit_id, day],
+    )?;
+    Ok(true)
 }
 
 // ---------- Event types & bookings (booking-page seam) ----------

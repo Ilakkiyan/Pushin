@@ -3,6 +3,8 @@ import { useStore } from "./state/store";
 import TopBar from "./components/TopBar";
 import ConflictBanner from "./components/ConflictBanner";
 import CalendarPane from "./panes/CalendarPane";
+import MonthPane from "./panes/MonthPane";
+import HabitsPane from "./panes/HabitsPane";
 import ChatPane from "./panes/ChatPane";
 import TaskListPane from "./panes/TaskListPane";
 import BookingPane from "./panes/BookingPane";
@@ -26,11 +28,9 @@ export default function App() {
       <TopBar />
       <ConflictBanner />
       <main className="flex-1 min-h-0 flex">
-        {view === "calendar" && (
+        {(view === "calendar" || view === "month") && (
           <>
-            <div className="flex-1 min-w-0">
-              <CalendarPane />
-            </div>
+            <div className="flex-1 min-w-0">{view === "month" ? <MonthPane /> : <CalendarPane />}</div>
             <aside className="w-[400px] shrink-0 border-l border-white/10 flex flex-col min-h-0">
               <div className="flex-1 min-h-0 overflow-hidden">
                 <ChatPane />
@@ -41,6 +41,7 @@ export default function App() {
             </aside>
           </>
         )}
+        {view === "habits" && <HabitsPane />}
         {view === "booking" && <BookingPane />}
         {view === "settings" && <SettingsPane />}
       </main>

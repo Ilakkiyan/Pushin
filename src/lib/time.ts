@@ -31,6 +31,26 @@ export function startOfWeek(d: Date): Date {
   return date;
 }
 
+/** Add whole days via calendar arithmetic (DST-safe, unlike adding 1440 minutes). */
+export function addDays(d: Date, days: number): Date {
+  const date = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  date.setDate(date.getDate() + days);
+  return date;
+}
+
+export function startOfMonth(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+
+export function sameMonth(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+}
+
+/** Monday-based weekday index: 0 = Mon … 6 = Sun. */
+export function mondayIndex(d: Date): number {
+  return (d.getDay() + 6) % 7;
+}
+
 export function sameDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }

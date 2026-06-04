@@ -86,6 +86,45 @@ pub struct Booking {
     pub created_at: String,
 }
 
+/// A tracked habit. `cadence` is "daily" for now (room to grow to weekly targets).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Habit {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub cadence: String,
+    pub duration_minutes: i64,
+    pub archived: bool,
+    pub created_at: String,
+}
+
+/// One day in a habit's history (for the consistency heatmap). `day` is "YYYY-MM-DD".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HabitDay {
+    pub day: String,
+    pub done: bool,
+}
+
+/// A habit plus the derived streak/consistency metrics the UI renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HabitStats {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    pub cadence: String,
+    pub duration_minutes: i64,
+    pub created_at: String,
+    pub done_today: bool,
+    pub current_streak: i64,
+    pub longest_streak: i64,
+    pub completion_rate: f64, // fraction of the last 30 days completed (0..1)
+    pub total_done: i64,
+    pub history: Vec<HabitDay>, // contiguous days, oldest → today, for the heatmap
+}
+
 /// A connected Google account + its OAuth tokens and incremental sync state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

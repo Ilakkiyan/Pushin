@@ -2,6 +2,7 @@ mod booking;
 mod calendar;
 mod commands;
 mod db;
+mod habits;
 mod llm;
 mod model;
 mod model_manager;
@@ -50,6 +51,12 @@ pub fn run() {
             commands::delete_event_type,
             commands::booking_slots,
             commands::create_booking,
+            commands::list_habits,
+            commands::create_habit,
+            commands::update_habit,
+            commands::toggle_habit,
+            commands::delete_habit,
+            commands::schedule_habit,
             commands::connect_google,
             commands::disconnect_google,
             commands::sync_google,

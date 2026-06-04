@@ -7,10 +7,11 @@ use crate::model::*;
 use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
 use crate::scheduler::{self, Interval};
-use crate::{db, llm};
-use chrono::Local;
+use crate::{db, habits, llm};
+use chrono::{Local, NaiveDate, Timelike};
 use rusqlite::Connection;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::process::Child;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
@@ -251,6 +252,131 @@ pub fn create_event_type(
 pub fn delete_event_type(state: State<AppState>, id: i64) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_event_type(&conn, id).map_err(err)
+}
+
+// ---------- habits ----------
+
+/// Load every active habit with its derived streak/consistency metrics.
+fn habit_stats(conn: &Connection) -> anyhow::Result<Vec<HabitStats>> {
+    let today = Local::now().naive_local().date();
+    db::list_habits(conn)?
+        .iter()
+        .map(|h| {
+            let done: HashSet<NaiveDate> = db::done_days_for_habit(conn, h.id)?
+                .iter()
+                .filter_map(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                .collect();
+            Ok(habits::compute_stats(h, &done, today))
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn list_habits(state: State<AppState>) -> Result<Vec<HabitStats>, String> {
+    let conn = state.db.lock().unwrap();
+    habit_stats(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn create_habit(
+    state: State<AppState>,
+    name: String,
+    color: String,
+    cadence: String,
+    duration_minutes: i64,
+) -> Result<Vec<HabitStats>, String> {
+    let conn = state.db.lock().unwrap();
+    db::insert_habit(&conn, &name, &color, &cadence, duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
+    habit_stats(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn update_habit(
+    state: State<AppState>,
+    id: i64,
+    name: String,
+    color: String,
+    duration_minutes: i64,
+) -> Result<Vec<HabitStats>, String> {
+    let conn = state.db.lock().unwrap();
+    db::update_habit(&conn, id, &name, &color, duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
+    habit_stats(&conn).map_err(err)
+}
+
+/// Drop a habit onto the calendar for a day (default today), slotting it into a free gap
+/// near the end of the day. Creates a `kind = "habit"` event so the task scheduler plans
+/// around it, then re-plans.
+#[tauri::command]
+pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<ScheduleResult, String> {
+    const DAY_START_H: u32 = 7;
+    const DAY_END_H: u32 = 22;
+
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    let now = Local::now().naive_local();
+    let day_date = day
+        .as_deref()
+        .and_then(|s| NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").ok())
+        .unwrap_or_else(|| now.date());
+
+    let habit = db::list_habits(&conn)
+        .map_err(err)?
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| "habit not found".to_string())?;
+
+    // Everything already on that day becomes "busy" so the habit slots around it.
+    let day_lo = day_date.and_hms_opt(0, 0, 0).unwrap();
+    let day_hi = day_date.and_hms_opt(23, 59, 59).unwrap();
+    let mut busy: Vec<Interval> = Vec::new();
+    let mut collect = |start: &str, end: &str| {
+        if let (Some(s), Some(e)) = (scheduler::parse_dt(start), scheduler::parse_dt(end)) {
+            if e > day_lo && s < day_hi {
+                busy.push(Interval { start: s, end: e });
+            }
+        }
+    };
+    for ev in db::list_events(&conn).map_err(err)? {
+        collect(&ev.start, &ev.end);
+    }
+    for b in db::list_blocks(&conn).map_err(err)? {
+        collect(&b.start, &b.end);
+    }
+
+    // Awake window for the day; never place in the past when it's today.
+    let mut window_start = day_date.and_hms_opt(DAY_START_H, 0, 0).unwrap();
+    let window_end = day_date.and_hms_opt(DAY_END_H, 0, 0).unwrap();
+    if day_date == now.date() {
+        let rounded = ((now.hour() as i64 * 60 + now.minute() as i64) + 14) / 15 * 15;
+        let candidate = day_lo + chrono::Duration::minutes(rounded);
+        if candidate > window_start {
+            window_start = candidate.min(window_end);
+        }
+    }
+
+    match habits::find_habit_slot(&busy, window_start, window_end, habit.duration_minutes) {
+        Some((s, e)) => {
+            db::insert_event(&conn, &habit.name, &scheduler::fmt_dt(s), &scheduler::fmt_dt(e), "habit").map_err(err)?;
+        }
+        None => return Err("No room left in the day to schedule this habit — try another day.".into()),
+    }
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
+/// Toggle a habit's completion for a day ("YYYY-MM-DD"); defaults to today.
+#[tauri::command]
+pub fn toggle_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<Vec<HabitStats>, String> {
+    let conn = state.db.lock().unwrap();
+    let day = day.unwrap_or_else(|| Local::now().naive_local().date().format("%Y-%m-%d").to_string());
+    db::toggle_habit_log(&conn, id, &day).map_err(err)?;
+    habit_stats(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_habit(state: State<AppState>, id: i64) -> Result<Vec<HabitStats>, String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_habit(&conn, id).map_err(err)?;
+    habit_stats(&conn).map_err(err)
 }
 
 #[tauri::command]
