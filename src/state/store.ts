@@ -17,7 +17,8 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "month" | "habits" | "booking" | "settings";
+type View = "calendar" | "habits" | "booking" | "settings";
+type CalMode = "week" | "month";
 
 interface State {
   loaded: boolean;
@@ -33,11 +34,14 @@ interface State {
   conflicts: Conflict[];
   llm: LlmStatus | null;
 
+  // Calendar view mode (week vs month), independent of which page you're on.
+  calMode: CalMode;
   // When the month view hands off to the week view, the day to open to.
   focusDateIso: string | null;
   habits: HabitStats[];
 
   setView: (v: View) => void;
+  setCalMode: (m: CalMode) => void;
   setFocusDate: (iso: string | null) => void;
   load: () => Promise<void>;
   refreshLlm: () => Promise<void>;
@@ -118,15 +122,29 @@ export const useStore = create<State>((set, get) => {
     bookings: [],
     conflicts: [],
     llm: null,
+    calMode: "week",
     focusDateIso: null,
     habits: [],
 
     setView: (v) => set({ view: v }),
+    setCalMode: (m) => set({ calMode: m }),
     setFocusDate: (iso) => set({ focusDateIso: iso }),
 
     load: async () => {
       await refreshData();
-      get().refreshLlm();
+      await get().refreshLlm();
+      // Auto-start the local inference server on open if it isn't already up, so the app is
+      // "AI ready" without a manual click. ensure_inference is safe to call blindly: it no-ops
+      // when a server is already running and errors (no download) when no model exists yet —
+      // in which case the chat setup card handles downloading.
+      if (!get().llm?.reachable) {
+        try {
+          await api.ensureInference();
+        } catch {
+          /* no model yet → the setup card prompts a download */
+        }
+        await get().refreshLlm();
+      }
     },
 
     refreshLlm: async () => {
@@ -145,6 +163,8 @@ export const useStore = create<State>((set, get) => {
         // plan_tasks reschedules internally; pull fresh conflicts.
         const r = await api.reschedule();
         set({ conflicts: r.conflicts });
+        // If the AI created habits, refresh the Habits page data too.
+        if (outcome.createdHabitNames.length) await get().loadHabits();
         return outcome;
       } finally {
         set({ busy: false });

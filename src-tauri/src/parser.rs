@@ -19,7 +19,7 @@ pub struct ChatTurn {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedTask {
     pub title: String,
     #[serde(default)]
@@ -63,6 +63,10 @@ pub struct ParsedEvent {
     /// Event length in minutes — an alternative to `endTime` for "a 2 hour meeting".
     #[serde(default, rename = "durationMinutes")]
     pub duration_minutes: Option<i64>,
+    /// Number of days the event spans (a trip / multi-day event). Set deterministically in
+    /// Rust from the text ("for two weeks" → 14); when present the event is all-day.
+    #[serde(default)]
+    pub span_days: Option<i64>,
 }
 
 /// Change an existing event (matched by a fuzzy title/description).
@@ -81,6 +85,11 @@ pub struct UpdateEvent {
     /// New length in minutes, keeping the start — for "make it 2 hours instead of 1".
     #[serde(default, rename = "durationMinutes")]
     pub duration_minutes: Option<i64>,
+    /// Explicit "YYYY-MM-DD" and/or a multi-day span — both resolved in Rust from the text.
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub span_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +97,15 @@ pub struct ParsedProject {
     pub name: String,
     #[serde(default)]
     pub tasks: Vec<ParsedTask>,
+}
+
+/// A recurring routine the user does regularly ("practice violin every day"). Routed to the
+/// habit tracker instead of being a one-off event or task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedHabit {
+    pub name: String,
+    #[serde(default = "default_minutes", rename = "durationMinutes")]
+    pub duration_minutes: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,6 +119,8 @@ pub struct ParsedPlan {
     #[serde(default)]
     pub projects: Vec<ParsedProject>,
     #[serde(default)]
+    pub habits: Vec<ParsedHabit>,
+    #[serde(default)]
     pub clarifications: Vec<String>,
 }
 
@@ -112,6 +132,7 @@ pub struct PlanOutcome {
     pub created_event_titles: Vec<String>,
     pub updated_event_titles: Vec<String>,
     pub removed_event_titles: Vec<String>,
+    pub created_habit_names: Vec<String>,
     pub clarifications: Vec<String>,
 }
 
@@ -198,6 +219,19 @@ fn response_schema() -> Value {
                     "required": ["name", "tasks"]
                 }
             },
+            "habits": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "name": { "type": "string", "maxLength": 80 },
+                        "durationMinutes": { "type": ["integer", "null"] }
+                    },
+                    "required": ["name"]
+                }
+            },
             "clarifications": { "type": "array", "maxItems": 5, "items": { "type": "string", "maxLength": 200 } }
         },
         "required": ["events", "projects", "clarifications"]
@@ -267,6 +301,8 @@ event's title, plus only the fields that change. Do NOT also create it. To chang
 \"remove all sleepovers\" → removeEvents: [\"sleepover\"]. Do NOT create anything.\n\
 - TASKS (work to do: write, design, build, study, plan) → `projects[].tasks` with `estimated_minutes`, \
 `priority`, `depends_on`. NEVER put work as an event.\n\
+- RECURRING routines done regularly (\"every day\", \"daily\", \"each morning\", \"every night\") → \
+`habits` with `name` and `durationMinutes`. NOT an event, NOT a task. Don't ask which weekdays.\n\
 Rules:\n\
 - `day` is the EXACT word the user used (\"today\", \"tomorrow\", or a weekday). NEVER output a computed \
 date. One day can cover several events (\"X tomorrow and Y as well\") — set it on EACH. Never ask whether \
@@ -280,6 +316,8 @@ that is already shown there; just use it.\n\
 NEVER ask for an end time or duration — if the user gave a range/length use it, else the app defaults it. \
 If no day is given, assume today; don't ask.\n\
 - Never output the same item twice.\n\
+- Only output items from THIS message. The examples below are formatting samples — never copy \
+their titles (e.g. \"Blog\", \"Pick platform\") unless the user actually mentions them.\n\
 Events already on the calendar (reference these to change or remove them):\n\
 {calendar}\n\
 Examples:\n\
@@ -287,6 +325,8 @@ user: lunch with mom friday 12-2 → {{\"events\":[{{\"title\":\"Lunch with mom\
 user: remove all sleepovers → {{\"removeEvents\":[\"sleepover\"]}}\n\
 user: make the sleepover 8pm to 8am → {{\"updateEvents\":[{{\"match\":\"sleepover\",\"startTime\":\"20:00\",\"endTime\":\"08:00\"}}]}}\n\
 user: make the meeting today 2 hours instead of 1 → {{\"updateEvents\":[{{\"match\":\"Meeting\",\"durationMinutes\":120}}]}}\n\
+user: practice violin every day from 4pm to 5pm → {{\"habits\":[{{\"name\":\"Violin practice\",\"durationMinutes\":60}}]}}\n\
+user: exercise daily → {{\"habits\":[{{\"name\":\"Exercise\",\"durationMinutes\":30}}]}}\n\
 user: plan a blog - pick platform, write posts → {{\"projects\":[{{\"name\":\"Blog\",\"tasks\":[{{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}}]}}]}}",
         now = now.format("%Y-%m-%d %H:%M"),
         weekday = now.format("%A"),
@@ -320,9 +360,63 @@ pub async fn plan(
     .await?;
 
     let mut parsed: ParsedPlan = serde_json::from_value(raw)?;
+    unescape_plan(&mut parsed);
     resolve_task_deadlines(&mut parsed);
-    backfill_event_fields(&mut parsed, user_text);
+    backfill_event_fields(&mut parsed, user_text, Local::now().naive_local().date());
+    route_recurring_to_habits(&mut parsed, user_text);
     Ok(parsed)
+}
+
+/// Daily-recurrence language. Recurring routines become habits, not one-off events/tasks.
+fn daily_recurrence(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["every day", "everyday", "each day", "daily", "every morning", "every night", "every evening", "each morning", "each night"]
+        .iter()
+        .any(|p| t.contains(p))
+}
+
+/// Minutes spanned by a time range in the text ("4pm to 5pm" → 60), for sizing a habit.
+fn range_minutes(text: &str) -> Option<i64> {
+    let (start, end_raw) = find_time_range(text)?;
+    let base = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap().and_time(start);
+    let mins = (compute_end(base, Some(&end_raw)) - base).num_minutes();
+    (mins > 0).then_some(mins)
+}
+
+/// Route recurring routines to the habit tracker. The model is told to emit `habits` directly,
+/// but as a deterministic safety net we also convert a single recurring event/task it created
+/// (e.g. "practice violin every day" routed as one event) into a habit. Always dedupes.
+fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
+    if daily_recurrence(user_text) && plan.habits.is_empty() {
+        let dur = find_duration_minutes(user_text).or_else(|| range_minutes(user_text));
+        let total_tasks: usize = plan.projects.iter().map(|p| p.tasks.len()).sum();
+
+        if plan.events.len() == 1 && total_tasks == 0 && plan.update_events.is_empty() {
+            let ev = plan.events.remove(0);
+            let d = dur.or(ev.duration_minutes).unwrap_or(60);
+            plan.habits.push(ParsedHabit { name: ev.title, duration_minutes: d });
+        } else if plan.events.is_empty() && total_tasks == 1 {
+            let mut taken = None;
+            for proj in &mut plan.projects {
+                if let Some(t) = proj.tasks.pop() {
+                    taken = Some(t);
+                    break;
+                }
+            }
+            plan.projects.retain(|p| !p.tasks.is_empty());
+            if let Some(t) = taken {
+                let d = dur.unwrap_or_else(|| t.estimated_minutes.max(15));
+                plan.habits.push(ParsedHabit { name: t.title, duration_minutes: d });
+            }
+        }
+    }
+
+    // Dedupe by name and clamp durations to something sane.
+    let mut seen = HashSet::new();
+    plan.habits.retain(|h| !h.name.trim().is_empty() && seen.insert(h.name.trim().to_lowercase()));
+    for h in &mut plan.habits {
+        h.duration_minutes = h.duration_minutes.clamp(5, 24 * 60);
+    }
 }
 
 /// Distinct day words ("today", "tomorrow", a weekday) appearing in the user's text, in
@@ -338,13 +432,151 @@ fn find_day_phrases(text: &str) -> Vec<String> {
     found
 }
 
+/// Two or more named days in one message describe a multi-day span ("orientation wednesday
+/// and thursday" → all-day Wed–Thu). Returns (start date, day count) from earliest to latest.
+fn find_weekday_span(text: &str, today: NaiveDate) -> Option<(NaiveDate, i64)> {
+    let mut dates: Vec<NaiveDate> = find_day_phrases(text).iter().filter_map(|d| resolve_day(today, d)).collect();
+    dates.sort();
+    dates.dedup();
+    if dates.len() < 2 {
+        return None;
+    }
+    let (lo, hi) = (*dates.first()?, *dates.last()?);
+    let span = (hi - lo).num_days() + 1;
+    (2..=31).contains(&span).then_some((lo, span))
+}
+
+fn word_number(w: &str) -> Option<i64> {
+    Some(match w {
+        "a" | "an" | "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        _ => return None,
+    })
+}
+
+/// A multi-day span in the text ("two weeks" → 14, "5 days" → 5, "a week" → 7). Drives
+/// all-day multi-day events (trips), which the model can't express as start/end times.
+fn find_span_days(text: &str) -> Option<i64> {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for w in toks.windows(2) {
+        let count = w[0].parse::<i64>().ok().or_else(|| word_number(w[0]));
+        if let Some(c) = count.filter(|c| *c > 0 && *c <= 365) {
+            match w[1] {
+                "day" | "days" => return Some(c),
+                "week" | "weeks" => return Some(c * 7),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// An explicit "M/D" or "M/D/YYYY" date in the text (the model is unreliable at numeric
+/// dates). Year defaults to the current year, bumped forward if the bare date is well past.
+fn find_explicit_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        if chars[i].is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
+            let ms = i;
+            while i < n && chars[i].is_ascii_digit() && i - ms < 2 {
+                i += 1;
+            }
+            if i < n && chars[i] == '/' {
+                let ds = i + 1;
+                let mut de = ds;
+                while de < n && chars[de].is_ascii_digit() && de - ds < 2 {
+                    de += 1;
+                }
+                if de > ds {
+                    let month: u32 = chars[ms..i].iter().collect::<String>().parse().unwrap_or(0);
+                    let day: u32 = chars[ds..de].iter().collect::<String>().parse().unwrap_or(0);
+                    let mut year = today.year();
+                    let mut had_year = false;
+                    if de < n && chars[de] == '/' {
+                        let ys = de + 1;
+                        let mut ye = ys;
+                        while ye < n && chars[ye].is_ascii_digit() && ye - ys < 4 {
+                            ye += 1;
+                        }
+                        if let Ok(y) = chars[ys..ye].iter().collect::<String>().parse::<i32>() {
+                            year = if y < 100 { 2000 + y } else { y };
+                            had_year = true;
+                        }
+                    }
+                    if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                        if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
+                            if !had_year && d < today - Duration::days(30) {
+                                return NaiveDate::from_ymd_opt(year + 1, month, day).or(Some(d));
+                            }
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Some models HTML-escape titles ("A&M" → "A&amp;M"). Undo the common entities so titles
+/// render correctly. `&amp;` is unescaped last to avoid double-decoding.
+fn unescape_html(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Clean HTML entities out of every title-ish field the model produced.
+fn unescape_plan(plan: &mut ParsedPlan) {
+    for e in &mut plan.events {
+        e.title = unescape_html(&e.title);
+    }
+    for u in &mut plan.update_events {
+        u.target = unescape_html(&u.target);
+        u.title = u.title.as_deref().map(unescape_html);
+    }
+    for r in &mut plan.remove_events {
+        *r = unescape_html(r);
+    }
+    for p in &mut plan.projects {
+        p.name = unescape_html(&p.name);
+        for t in &mut p.tasks {
+            t.title = unescape_html(&t.title);
+        }
+    }
+    for h in &mut plan.habits {
+        h.name = unescape_html(&h.name);
+    }
+}
+
+/// "make it a full day" language → the targeted event(s) should be all-day.
+fn find_all_day(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["full day", "full-day", "all day", "all-day", "whole day", "entire day"].iter().any(|p| t.contains(p))
+}
+
 /// The small model frequently drops or mis-assigns the optional fields it's worst at:
 /// `endTime`/`durationMinutes` (→ events collapse to the 60-min default or duration edits
 /// loop) and the day when one day covers several events ("birthday lunch tomorrow … and a
 /// party … as well" → only one lands on tomorrow). Since the user literally typed these,
 /// recover them deterministically from their text — the same way we never trust the model
 /// for dates. Only fills/corrects what the model got wrong.
-fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str) {
+fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
     // --- Day: if the user named exactly ONE day for the whole message, it applies to every
     // event they're creating ("… tomorrow … and a party … as well"). One day word means
     // there's no other day they could have meant, so override the model's guess too. ---
@@ -363,21 +595,90 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str) {
         }
     }
 
+    // --- "full day" / "all day": mark every targeted event all-day (span 1), unless it
+    // already has a multi-day span. Applies broadly since "all day" is unambiguous. ---
+    if find_all_day(user_text) {
+        for ev in &mut plan.events {
+            ev.span_days = ev.span_days.or(Some(1));
+        }
+        for up in &mut plan.update_events {
+            up.span_days = up.span_days.or(Some(1));
+        }
+    }
+
     let range = find_time_range(user_text);
     let duration = find_duration_minutes(user_text);
-    if range.is_none() && duration.is_none() {
+    let span = find_span_days(user_text);
+    let explicit_date = find_explicit_date(user_text, today);
+    // A range of named days ("wednesday and thursday") → a multi-day all-day span.
+    let weekday_span = find_weekday_span(user_text, today);
+    if range.is_none() && duration.is_none() && span.is_none() && explicit_date.is_none() && weekday_span.is_none() {
         return;
     }
+    let date_str = explicit_date.map(|d| d.format("%Y-%m-%d").to_string());
     // A time string is "unset" if the model omitted it or it can't be parsed.
     let unset = |s: &Option<String>| s.as_deref().and_then(parse_hm).is_none();
 
+    // --- Named day range ("wednesday to thursday") = ONE multi-day all-day event. The model
+    // often splits it into a create + a per-day update (or several creates); collapse those
+    // back into a single spanning event so it isn't a lone 1-hour block. Only do this when the
+    // message is about a SINGLE event — "lunch today and dinner tomorrow" is two events, not a
+    // span, so we leave those alone. ---
+    let distinct_titles: HashSet<String> = plan.events.iter().map(|e| e.title.to_lowercase()).collect();
+    let distinct_targets: HashSet<String> = plan.update_events.iter().map(|u| u.target.to_lowercase()).collect();
+    let single_subject = if plan.events.is_empty() {
+        distinct_targets.len() <= 1
+    } else {
+        distinct_titles.len() == 1 && distinct_targets.iter().all(|t| event_matches(&plan.events[0].title, t))
+    };
+    if let Some((lo, sp)) = weekday_span.filter(|_| single_subject) {
+        let date = lo.format("%Y-%m-%d").to_string();
+        if !plan.events.is_empty() {
+            let title = {
+                let ev = &mut plan.events[0];
+                ev.date = Some(date);
+                ev.day = None;
+                ev.span_days = Some(sp);
+                ev.title.clone()
+            };
+            // Drop the model's duplicate per-day copies of the same event.
+            let mut seen = HashSet::new();
+            plan.events.retain(|e| seen.insert(e.title.to_lowercase()));
+            plan.update_events.retain(|u| !event_matches(&title, &u.target));
+        } else if !plan.update_events.is_empty() {
+            {
+                let up = &mut plan.update_events[0];
+                up.date = Some(date);
+                up.day = None;
+                up.span_days = Some(sp);
+            }
+            let target = plan.update_events[0].target.clone();
+            let mut kept_first = false;
+            plan.update_events.retain(|u| {
+                if event_matches(&target, &u.target) {
+                    let keep = !kept_first;
+                    kept_first = true;
+                    keep
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     // Only act when there's a single, unambiguous target, so a range/length is never
-    // mis-assigned across multiple events in one message.
+    // mis-assigned across multiple events in one message. (Counts reflect the collapse above.)
     let single_create = plan.events.len() == 1 && plan.update_events.is_empty() && plan.remove_events.is_empty();
     let single_update = plan.update_events.len() == 1 && plan.events.is_empty() && plan.remove_events.is_empty();
 
     if single_create {
         let ev = &mut plan.events[0];
+        if let Some(d) = &date_str {
+            ev.date = Some(d.clone()); // user typed "6/12" — trust it over the model
+        }
+        if span.is_some() {
+            ev.span_days = span; // multi-day trip → all-day, overriding any bogus end time
+        }
         if let Some((start_norm, end_raw)) = range {
             if unset(&ev.start_time) {
                 ev.start_time = Some(start_norm.format("%H:%M").to_string());
@@ -393,6 +694,12 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str) {
         }
     } else if single_update {
         let up = &mut plan.update_events[0];
+        if let Some(d) = &date_str {
+            up.date = Some(d.clone());
+        }
+        if span.is_some() {
+            up.span_days = span;
+        }
         if let Some((start_norm, end_raw)) = range {
             if unset(&up.start_time) {
                 up.start_time = Some(start_norm.format("%H:%M").to_string());
@@ -657,11 +964,13 @@ fn resolve_day(today: NaiveDate, day: &str) -> Option<NaiveDate> {
     }
 }
 
-/// True if the event carries any usable time signal (start, end, or a positive duration).
+/// True if the event carries any usable time signal (start, end, a positive duration, or a
+/// multi-day span).
 fn event_has_time(ev: &ParsedEvent) -> bool {
     ev.start_time.as_deref().and_then(parse_hm).is_some()
         || ev.end_time.as_deref().and_then(parse_hm).is_some()
         || ev.duration_minutes.map(|d| d > 0).unwrap_or(false)
+        || ev.span_days.map(|d| d >= 1).unwrap_or(false)
 }
 
 /// Resolve an event's (start, end). Returns None only when there's no day AND no time at
@@ -682,6 +991,14 @@ fn resolve_event(now: NaiveDateTime, ev: &ParsedEvent) -> Option<(NaiveDateTime,
 
     // Guardrail: never lose a timed event just because the model omitted the day.
     let date = explicit_date.or(day_date).or_else(|| event_has_time(ev).then(|| now.date()))?;
+
+    // Multi-day all-day event (a trip): span whole days from the start date. Takes precedence
+    // over any (often bogus) end time the model produced for "two weeks".
+    if let Some(span) = ev.span_days.filter(|d| *d >= 1) {
+        let start = date.and_hms_opt(0, 0, 0).unwrap();
+        let end = (date + Duration::days(span)).and_hms_opt(0, 0, 0).unwrap();
+        return Some((start, end));
+    }
 
     let start_time = ev.start_time.as_deref().and_then(parse_hm).unwrap_or(NaiveTime::from_hms_opt(12, 0, 0).unwrap());
     let start = date.and_time(start_time);
@@ -735,13 +1052,16 @@ fn compute_end(start: NaiveDateTime, end_time: Option<&str>) -> NaiveDateTime {
 /// Apply a partial change to an existing event, keeping fields the user didn't mention
 /// (so "move it to 9pm" preserves the duration, "end at 7am" preserves the start).
 /// Returns (title, start_iso, end_iso).
+#[allow(clippy::too_many_arguments)]
 fn merge_event(
     existing: &Event,
     now: NaiveDateTime,
     day: Option<&str>,
+    explicit_date: Option<&str>,
     start_time: Option<&str>,
     end_time: Option<&str>,
     duration: Option<i64>,
+    span: Option<i64>,
     title: Option<&str>,
 ) -> (String, String, String) {
     let cur_start = parse_dt(&existing.start).unwrap_or(now);
@@ -749,10 +1069,26 @@ fn merge_event(
         .map(|e| (e - cur_start).num_minutes())
         .filter(|d| *d > 0)
         .unwrap_or(60);
-    let date = day
+    let date = explicit_date
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
-        .and_then(|d| resolve_day(now.date(), d))
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .or_else(|| {
+            day.filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+                .and_then(|d| resolve_day(now.date(), d))
+        })
         .unwrap_or(cur_start.date());
+    let new_title = title
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| existing.title.clone());
+
+    // Multi-day all-day update (a trip): span whole days from the (possibly new) start date.
+    if let Some(sp) = span.filter(|d| *d >= 1) {
+        let s = date.and_hms_opt(0, 0, 0).unwrap();
+        let e = (date + Duration::days(sp)).and_hms_opt(0, 0, 0).unwrap();
+        return (new_title, fmt_dt(s), fmt_dt(e));
+    }
+
     let st = start_time.and_then(parse_hm).unwrap_or(cur_start.time());
     let new_start = date.and_time(st);
     // An explicit end wins; else a stated new duration ("make it 2 hours"); else keep the
@@ -764,10 +1100,6 @@ fn merge_event(
     } else {
         new_start + Duration::minutes(cur_dur)
     };
-    let new_title = title
-        .filter(|t| !t.trim().is_empty())
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| existing.title.clone());
     (new_title, fmt_dt(new_start), fmt_dt(end_after(new_start, new_end)))
 }
 
@@ -795,6 +1127,14 @@ fn asks_placed_property(c_lc: &str) -> bool {
         || c_lc.contains("the event")
 }
 
+/// A question quibbling over the recurrence we already resolved by making it a daily habit
+/// ("did you mean every weekday?" / "every week instead of everyday?"). Pure loop fuel.
+fn is_recurrence_question(c_lc: &str) -> bool {
+    c_lc.contains("weekday") || c_lc.contains("every week") || c_lc.contains("everyday")
+        || c_lc.contains("every day") || c_lc.contains("each day") || c_lc.contains("weekly")
+        || c_lc.contains("recurr")
+}
+
 /// Decide which clarifying questions to actually surface. The core job is breaking the
 /// loop where, after successfully editing an event, the model keeps asking for the time/day
 /// it just set. We drop any model question that names a distinctive word from an event we
@@ -807,6 +1147,7 @@ fn filter_clarifications(
     created: &[String],
     updated: &[String],
     removed: &[String],
+    created_habits: &[String],
 ) -> Vec<String> {
     // Common words that carry no identity — matching on these would over-suppress.
     const FILLER: &[&str] = &["with", "the", "and", "you", "your", "for", "that", "this", "from", "into", "about", "new"];
@@ -814,10 +1155,12 @@ fn filter_clarifications(
         .iter()
         .chain(updated.iter())
         .chain(removed.iter())
+        .chain(created_habits.iter())
         .flat_map(|t| t.to_lowercase().split_whitespace().map(str::to_string).collect::<Vec<_>>())
         .filter(|w| w.len() >= 3 && !FILLER.contains(&w.as_str()))
         .collect();
     let placed_event = !created.is_empty() || !updated.is_empty();
+    let made_habit = !created_habits.is_empty();
 
     let mut out: Vec<String> = Vec::new();
     let push_unique = |dst: &mut Vec<String>, c: &str| {
@@ -843,6 +1186,10 @@ fn filter_clarifications(
         if placed_event && (confirms_day(&c_lc) || asks_placed_property(&c_lc)) {
             continue;
         }
+        // We turned a recurring routine into a daily habit — don't quibble over weekdays.
+        if made_habit && is_recurrence_question(&c_lc) {
+            continue;
+        }
         push_unique(&mut out, c);
     }
     // Our own clarifications (an event we genuinely couldn't place) are always real.
@@ -863,18 +1210,48 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
     let mut title_to_id: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     let mut extra_clarifications: Vec<String> = Vec::new();
 
-    // Projects + tasks (dedupe identical task titles within a project).
+    // ---- Habits (recurring routines) ----
+    // Create new habits, skipping ones that already exist (so re-running doesn't duplicate).
+    const HABIT_PALETTE: &[&str] = &["#22c55e", "#0ea5e9", "#a855f7", "#f59e0b", "#ec4899", "#14b8a6"];
+    let mut created_habit_names: Vec<String> = Vec::new();
+    if !plan.habits.is_empty() {
+        let existing: HashSet<String> = crate::db::list_habits(conn)?.iter().map(|h| h.name.to_lowercase()).collect();
+        let mut seen: HashSet<String> = existing.clone();
+        for h in &plan.habits {
+            let name = h.name.trim();
+            let key = name.to_lowercase();
+            if name.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            let color = HABIT_PALETTE[created_habit_names.len() % HABIT_PALETTE.len()];
+            crate::db::insert_habit(conn, name, color, "daily", h.duration_minutes.clamp(5, 24 * 60))?;
+            created_habit_names.push(name.to_string());
+        }
+    }
+    // Anything we just made a habit must not also be created as an event/task.
+    let habit_lc: HashSet<String> = created_habit_names.iter().map(|n| n.to_lowercase()).collect();
+
+    // Projects + tasks. Skip tasks that duplicate an existing active task — the small model
+    // tends to re-emit example tasks ("Pick platform") every turn, which otherwise piles up.
+    let mut existing_task_lc: HashSet<String> =
+        crate::db::list_tasks(conn)?.iter().filter(|t| t.status != "done").map(|t| t.title.to_lowercase()).collect();
     for proj in &plan.projects {
-        if proj.tasks.is_empty() {
-            continue;
+        // Keep only genuinely new tasks (not a duplicate, a habit, or blank).
+        let mut seen_titles: HashSet<String> = HashSet::new();
+        let new_tasks: Vec<&ParsedTask> = proj
+            .tasks
+            .iter()
+            .filter(|t| {
+                let lc = t.title.trim().to_lowercase();
+                !lc.is_empty() && !habit_lc.contains(&lc) && !existing_task_lc.contains(&lc) && seen_titles.insert(lc)
+            })
+            .collect();
+        if new_tasks.is_empty() {
+            continue; // don't create an empty/duplicate project
         }
         let pid = crate::db::insert_project(conn, &proj.name, "#6366f1")?;
         project_names.push(proj.name.clone());
-        let mut seen_titles: HashSet<String> = HashSet::new();
-        for t in &proj.tasks {
-            if !seen_titles.insert(t.title.to_lowercase()) {
-                continue;
-            }
+        for t in new_tasks {
             let min_chunk = if t.chunkable { settings.default_min_chunk } else { t.estimated_minutes.max(15) };
             let id = crate::db::insert_task(
                 conn,
@@ -889,6 +1266,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
                 &[],
             )?;
             title_to_id.insert(t.title.clone(), id);
+            existing_task_lc.insert(t.title.trim().to_lowercase());
             created_task_ids.push(id);
         }
     }
@@ -926,7 +1304,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             if !event_matches(&e.title, &up.target) {
                 continue;
             }
-            let (t, s, en) = merge_event(&e, now, up.day.as_deref(), up.start_time.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.title.as_deref());
+            let (t, s, en) = merge_event(&e, now, up.day.as_deref(), up.date.as_deref(), up.start_time.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
             crate::db::update_event(conn, e.id, &t, &s, &en)?;
             updated_event_titles.push(t);
         }
@@ -940,13 +1318,13 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
     let mut created_event_titles = Vec::new();
     for ev in &plan.events {
         // Guardrail: never persist a blank-titled event (the schema allows ""), it'd show as
-        // an empty block the user can't address.
-        if ev.title.trim().is_empty() {
+        // an empty block the user can't address. Also skip anything we just made a habit.
+        if ev.title.trim().is_empty() || habit_lc.contains(&ev.title.trim().to_lowercase()) {
             continue;
         }
         // Edit routed as a create: same title exists → merge the change in (keep unspecified fields).
         if let Some(existing) = current.iter_mut().find(|x| x.title.eq_ignore_ascii_case(&ev.title)) {
-            let (t, s, e) = merge_event(existing, now, ev.day.as_deref(), ev.start_time.as_deref(), ev.end_time.as_deref(), ev.duration_minutes, None);
+            let (t, s, e) = merge_event(existing, now, ev.day.as_deref(), ev.date.as_deref(), ev.start_time.as_deref(), ev.end_time.as_deref(), ev.duration_minutes, ev.span_days, None);
             crate::db::update_event(conn, existing.id, &t, &s, &e)?;
             existing.start = s;
             existing.end = e;
@@ -983,6 +1361,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         &created_event_titles,
         &updated_event_titles,
         &removed_event_titles,
+        &created_habit_names,
     );
 
     Ok(PlanOutcome {
@@ -991,6 +1370,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         created_event_titles,
         updated_event_titles,
         removed_event_titles,
+        created_habit_names,
         clarifications,
     })
 }
@@ -1007,6 +1387,7 @@ mod tests {
             start_time: st.map(String::from),
             end_time: et.map(String::from),
             duration_minutes: None,
+            span_days: None,
         }
     }
 
@@ -1043,29 +1424,35 @@ mod tests {
         let e = sample_event();
         let dur = |s: &str, en: &str| (parse_dt(en).unwrap() - parse_dt(s).unwrap()).num_minutes();
 
+        // merge_event(existing, now, day, date, start, end, duration, span, title)
         // Move start only → keep the 12h duration.
-        let (_t, s, en) = merge_event(&e, now, None, Some("21:00"), None, None, None);
+        let (_t, s, en) = merge_event(&e, now, None, None, Some("21:00"), None, None, None, None);
         assert_eq!(s, "2026-06-06T21:00:00");
         assert_eq!(dur(&s, &en), 720);
 
         // Change end only → keep the original start.
-        let (_t, s, en) = merge_event(&e, now, None, None, Some("07:00"), None, None);
+        let (_t, s, en) = merge_event(&e, now, None, None, None, Some("07:00"), None, None, None);
         assert_eq!(s, "2026-06-06T20:00:00");
         assert_eq!(dur(&s, &en), 660);
 
         // Rename only → keep times.
-        let (t, s, _en) = merge_event(&e, now, None, None, None, None, Some("Movie Night"));
+        let (t, s, _en) = merge_event(&e, now, None, None, None, None, None, None, Some("Movie Night"));
         assert_eq!(t, "Movie Night");
         assert_eq!(s, "2026-06-06T20:00:00");
 
         // New duration only ("make it 2 hours") → keep start, set length, ignore old end.
-        let (_t, s, en) = merge_event(&e, now, None, None, None, Some(120), None);
+        let (_t, s, en) = merge_event(&e, now, None, None, None, None, Some(120), None, None);
         assert_eq!(s, "2026-06-06T20:00:00");
         assert_eq!(dur(&s, &en), 120);
 
         // An explicit end still wins over a duration if both are somehow present.
-        let (_t, s, en) = merge_event(&e, now, None, None, Some("23:00"), Some(120), None);
+        let (_t, s, en) = merge_event(&e, now, None, None, None, Some("23:00"), Some(120), None, None);
         assert_eq!(dur(&s, &en), 180);
+
+        // A multi-day span makes it an all-day trip from the start date.
+        let (_t, s, en) = merge_event(&e, now, None, None, None, None, None, Some(14), None);
+        assert_eq!(s, "2026-06-06T00:00:00");
+        assert_eq!(en, "2026-06-20T00:00:00"); // +14 days, all-day
     }
 
     #[test]
@@ -1103,7 +1490,7 @@ mod tests {
             events: vec![ev("friday", Some("12:00"), None)],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "lunch with mom friday 12-2");
+        backfill_event_fields(&mut plan, "lunch with mom friday 12-2", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(plan.events[0].end_time.as_deref(), Some("2"));
         assert_eq!(dur(&plan.events[0]), 120); // recovered the 2-hour range
 
@@ -1112,7 +1499,7 @@ mod tests {
             events: vec![ev("friday", None, None)],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "meeting friday 2pm to 4pm");
+        backfill_event_fields(&mut plan, "meeting friday 2pm to 4pm", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(dur(&plan.events[0]), 120);
 
         // A correct endTime from the model is never overwritten.
@@ -1120,7 +1507,7 @@ mod tests {
             events: vec![ev("friday", Some("12:00"), Some("13:00"))],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "lunch friday 12-2");
+        backfill_event_fields(&mut plan, "lunch friday 12-2", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(plan.events[0].end_time.as_deref(), Some("13:00"));
 
         // No range in the text → nothing changes (still the 60-min default).
@@ -1128,7 +1515,7 @@ mod tests {
             events: vec![ev("friday", Some("12:00"), None)],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "lunch friday at noon");
+        backfill_event_fields(&mut plan, "lunch friday at noon", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(plan.events[0].end_time, None);
 
         // Ambiguous: 2+ events in one message → don't guess which gets the range.
@@ -1136,7 +1523,7 @@ mod tests {
             events: vec![ev("friday", Some("12:00"), None), ev("friday", Some("15:00"), None)],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "lunch 12-2 and a call");
+        backfill_event_fields(&mut plan, "lunch 12-2 and a call", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(plan.events[0].end_time, None);
         assert_eq!(plan.events[1].end_time, None);
     }
@@ -1197,14 +1584,16 @@ mod tests {
                 start_time: None,
                 end_time: None,
                 duration_minutes: None,
+                date: None,
+                span_days: None,
             }],
             ..Default::default()
         };
-        backfill_event_fields(&mut plan, "Change the meeting I have today to be 2 hours instead of 1");
+        backfill_event_fields(&mut plan, "Change the meeting I have today to be 2 hours instead of 1", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(plan.update_events[0].duration_minutes, Some(120));
 
         let up = &plan.update_events[0];
-        let (_t, s, en) = merge_event(&meeting, now, up.day.as_deref(), up.start_time.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.title.as_deref());
+        let (_t, s, en) = merge_event(&meeting, now, up.day.as_deref(), up.date.as_deref(), up.start_time.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
         assert_eq!(s, "2026-06-04T13:00:00"); // start preserved
         assert_eq!((parse_dt(&en).unwrap() - parse_dt(&s).unwrap()).num_minutes(), 120); // now 2h
     }
@@ -1214,42 +1603,26 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let updated = s(&["Meeting with my friend"]);
 
+        let nh: &[String] = &[];
+
         // The exact loop from the screenshots: we updated the meeting but the model still
         // asks for the start/end time. Those questions must be dropped.
-        let out = filter_clarifications(
-            &s(&["What is the start time of the updated meeting?"]),
-            &[],
-            &[],
-            &updated,
-            &[],
-        );
+        let out = filter_clarifications(&s(&["What is the start time of the updated meeting?"]), &[], &[], &updated, &[], nh);
         assert!(out.is_empty(), "redundant time question should be dropped, got {out:?}");
 
-        let out = filter_clarifications(&s(&["What is the new end time for the meeting?"]), &[], &[], &updated, &[]);
+        let out = filter_clarifications(&s(&["What is the new end time for the meeting?"]), &[], &[], &updated, &[], nh);
         assert!(out.is_empty());
 
         // A question naming a different, untouched event still gets through.
-        let out = filter_clarifications(
-            &s(&["What time is the dentist appointment?"]),
-            &[],
-            &[],
-            &updated, // we touched the meeting, not the dentist
-            &[],
-        );
+        let out = filter_clarifications(&s(&["What time is the dentist appointment?"]), &[], &[], &updated, &[], nh);
         assert_eq!(out.len(), 1);
 
         // Our own "couldn't place it" question survives even alongside an edit.
-        let out = filter_clarifications(
-            &s(&[]),
-            &s(&["What date and time is \"Yoga\"?"]),
-            &[],
-            &updated,
-            &[],
-        );
+        let out = filter_clarifications(&s(&[]), &s(&["What date and time is \"Yoga\"?"]), &[], &updated, &[], nh);
         assert_eq!(out.len(), 1);
 
         // Non-questions (restatements) are dropped.
-        let out = filter_clarifications(&s(&["Updated the meeting."]), &[], &[], &updated, &[]);
+        let out = filter_clarifications(&s(&["Updated the meeting."]), &[], &[], &updated, &[], nh);
         assert!(out.is_empty());
     }
 
@@ -1266,7 +1639,7 @@ mod tests {
         party.day = None; // model left it blank
         let mut plan = ParsedPlan { events: vec![lunch, party], ..Default::default() };
 
-        backfill_event_fields(&mut plan, "I have my birthday lunch tomorrow from 12 - 2 and a graduation party from 6 - 10 as well");
+        backfill_event_fields(&mut plan, "I have my birthday lunch tomorrow from 12 - 2 and a graduation party from 6 - 10 as well", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
 
         let tomorrow = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
         for e in &plan.events {
@@ -1274,38 +1647,80 @@ mod tests {
             assert_eq!(resolve_event(now, e).unwrap().0.date(), tomorrow);
         }
 
-        // Two distinct days in the message → leave each event's day alone.
-        let mut plan = ParsedPlan {
-            events: vec![ev("today", Some("12:00"), None), ev("tomorrow", Some("18:00"), None)],
-            ..Default::default()
-        };
-        backfill_event_fields(&mut plan, "lunch today and dinner tomorrow");
+        // Two distinct events on two days → leave each alone (NOT a single multi-day span).
+        let mut lunch = ev("today", Some("12:00"), None);
+        lunch.title = "Lunch".into();
+        let mut dinner = ev("tomorrow", Some("18:00"), None);
+        dinner.title = "Dinner".into();
+        let mut plan = ParsedPlan { events: vec![lunch, dinner], ..Default::default() };
+        backfill_event_fields(&mut plan, "lunch today and dinner tomorrow", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+        assert_eq!(plan.events.len(), 2);
         assert_eq!(plan.events[0].day.as_deref(), Some("today"));
         assert_eq!(plan.events[1].day.as_deref(), Some("tomorrow"));
+        assert_eq!(plan.events[0].span_days, None); // not collapsed into a span
     }
 
     #[test]
     fn day_confirmations_and_chatter_dropped() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let created = s(&["Birthday lunch", "Graduation party"]);
+        let nh: &[String] = &[];
 
         // Rust already resolved "tomorrow" and placed the events — confirming is noise.
-        let out = filter_clarifications(&s(&["Is 'tomorrow' the day after today?"]), &[], &created, &[], &[]);
+        let out = filter_clarifications(&s(&["Is 'tomorrow' the day after today?"]), &[], &created, &[], &[], nh);
         assert!(out.is_empty(), "got {out:?}");
-        let out = filter_clarifications(&s(&["Is 'tomorrow' referring to June 5th?"]), &[], &created, &[], &[]);
+        let out = filter_clarifications(&s(&["Is 'tomorrow' referring to June 5th?"]), &[], &created, &[], &[], nh);
         assert!(out.is_empty());
 
         // Generic "anything else" filler is dropped.
-        let out = filter_clarifications(&s(&["Is there anything else you need me to add or change?"]), &[], &created, &[], &[]);
+        let out = filter_clarifications(&s(&["Is there anything else you need me to add or change?"]), &[], &created, &[], &[], nh);
         assert!(out.is_empty());
 
         // The reported case: event placed, but the model still asks for its duration.
-        let out = filter_clarifications(&s(&["What is the duration in minutes for this event?"]), &[], &created, &[], &[]);
+        let out = filter_clarifications(&s(&["What is the duration in minutes for this event?"]), &[], &created, &[], &[], nh);
         assert!(out.is_empty(), "duration question after placing is noise, got {out:?}");
 
         // But when nothing was placed, a genuine day/time question still comes through.
-        let out = filter_clarifications(&s(&["What time on tuesday?"]), &[], &[], &[], &[]);
+        let out = filter_clarifications(&s(&["What time on tuesday?"]), &[], &[], &[], &[], nh);
         assert_eq!(out.len(), 1, "no event placed → keep the question, got {out:?}");
+    }
+
+    #[test]
+    fn recurring_routines_become_habits() {
+        // The model routed "every day" as a single fixed event → convert to a habit.
+        let mut ev1 = ev("today", Some("16:00"), Some("17:00"));
+        ev1.title = "Violin practice".into();
+        let mut plan = ParsedPlan { events: vec![ev1], ..Default::default() };
+        route_recurring_to_habits(&mut plan, "i want to practice violin every day from 4pm to 5pm");
+        assert!(plan.events.is_empty(), "the event should be moved out");
+        assert_eq!(plan.habits.len(), 1);
+        assert_eq!(plan.habits[0].name, "Violin practice");
+        assert_eq!(plan.habits[0].duration_minutes, 60); // from the 4–5pm range
+
+        // A single recurring task is converted too, using its estimate when no range is given.
+        let mut plan = ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Fitness".into(),
+                tasks: vec![ParsedTask { title: "Exercise".into(), estimated_minutes: 45, priority: "high".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+        route_recurring_to_habits(&mut plan, "exercise daily");
+        assert_eq!(plan.habits.len(), 1);
+        assert_eq!(plan.habits[0].name, "Exercise");
+        assert_eq!(plan.habits[0].duration_minutes, 45);
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0);
+
+        // No recurrence language → leave events/tasks alone.
+        let mut plan = ParsedPlan { events: vec![ev("today", Some("16:00"), Some("17:00"))], ..Default::default() };
+        route_recurring_to_habits(&mut plan, "violin at 4pm today");
+        assert_eq!(plan.events.len(), 1);
+        assert!(plan.habits.is_empty());
+
+        // Recurrence questions are dropped once we've made a habit.
+        let habits = vec!["Violin practice".to_string()];
+        let out = filter_clarifications(&["did you mean 'every weekday'?".into()], &[], &[], &[], &[], &habits);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1346,6 +1761,120 @@ mod tests {
         assert_eq!(dur(24 * 60), 24 * 60); // a full day is allowed
         assert_eq!(dur(100_000), 60); // runaway → ignored, 60-min fallback
         assert_eq!(dur(-30), 60); // negative → ignored
+    }
+
+    #[test]
+    fn parses_multi_day_spans_and_dates() {
+        assert_eq!(find_span_days("staying in vietnam for two weeks"), Some(14));
+        assert_eq!(find_span_days("a 5 day trip"), Some(5));
+        assert_eq!(find_span_days("here for a week"), Some(7));
+        assert_eq!(find_span_days("lunch for an hour"), None); // hours aren't a day-span
+
+        let today = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+        assert_eq!(find_explicit_date("on 6/12 i go to vietnam", today), NaiveDate::from_ymd_opt(2026, 6, 12));
+        assert_eq!(find_explicit_date("trip on 12/25/2026", today), NaiveDate::from_ymd_opt(2026, 12, 25));
+        // a bare date already well past rolls to next year (a future trip)
+        assert_eq!(find_explicit_date("party on 1/3", today), NaiveDate::from_ymd_opt(2027, 1, 3));
+        assert_eq!(find_explicit_date("no date here", today), None);
+    }
+
+    #[test]
+    fn vietnam_trip_becomes_an_all_day_multi_day_event() {
+        // "on 6/12 ... staying for two weeks" → all-day event 6/12 → 6/26, not a 24h block.
+        let now = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let mut trip = ev("today", None, None);
+        trip.title = "Vietnam Trip".into();
+        trip.day = None;
+        let mut plan = ParsedPlan { events: vec![trip], ..Default::default() };
+        backfill_event_fields(&mut plan, "from 6/12 i will be staying in vietnam for two weeks", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-12"));
+        assert_eq!(plan.events[0].span_days, Some(14));
+        let (s, e) = resolve_event(now, &plan.events[0]).unwrap();
+        assert_eq!(s, NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(e, NaiveDate::from_ymd_opt(2026, 6, 26).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!((e - s).num_days(), 14);
+    }
+
+    #[test]
+    fn named_weekday_range_is_a_multi_day_span() {
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(); // a Monday
+        // "wednesday and thursday" → Wed 6/10 .. Thu 6/11 (2 days)
+        assert_eq!(find_weekday_span("orientation wednesday and thursday", mon), Some((NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(), 2)));
+        // "monday to friday" → 5 days
+        assert_eq!(find_weekday_span("class monday to friday", mon), Some((NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(), 5)));
+        // a single day is not a span
+        assert_eq!(find_weekday_span("lunch on friday", mon), None);
+
+        // End to end: the reported A&M case — one event spanning Wed+Thu becomes all-day.
+        let mut e = ev("wednesday", None, None);
+        e.title = "A&M Orientation".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        backfill_event_fields(&mut plan, "im going to A&M orientation wednesday and thursday this week", mon);
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-10"));
+        assert_eq!(plan.events[0].span_days, Some(2));
+        let (s, en) = resolve_event(mon.and_hms_opt(9, 0, 0).unwrap(), &plan.events[0]).unwrap();
+        assert_eq!(s, NaiveDate::from_ymd_opt(2026, 6, 10).unwrap().and_hms_opt(0, 0, 0).unwrap());
+        assert_eq!(en, NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(0, 0, 0).unwrap()); // covers Wed+Thu
+    }
+
+    #[test]
+    fn named_day_range_collapses_create_plus_update() {
+        // The model split "wednesday to thursday" into a create (Wed) + a same-event update
+        // (Thu). They must collapse into ONE multi-day event, dropping the redundant update.
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let mut create = ev("wednesday", None, None);
+        create.title = "A&M orientation".into();
+        let update = UpdateEvent {
+            target: "A&M orientation".into(),
+            title: None,
+            day: Some("thursday".into()),
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+        };
+        let mut plan = ParsedPlan { events: vec![create], update_events: vec![update], ..Default::default() };
+        backfill_event_fields(&mut plan, "i have a&m orientation from wednesday to thursday this week", mon);
+        assert_eq!(plan.events.len(), 1);
+        assert!(plan.update_events.is_empty(), "redundant per-day update should be dropped");
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-10"));
+        assert_eq!(plan.events[0].span_days, Some(2));
+    }
+
+    #[test]
+    fn full_day_marks_events_all_day() {
+        assert!(find_all_day("they are full day"));
+        assert!(find_all_day("make it an all-day thing"));
+        assert!(!find_all_day("at 3pm"));
+
+        // "They are full day" referring to two events → both become all-day (span 1).
+        let up = |target: &str| UpdateEvent {
+            target: target.into(),
+            title: None,
+            day: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+        };
+        let mut plan = ParsedPlan { update_events: vec![up("A&M - Wednesday"), up("A&M - Thursday")], ..Default::default() };
+        backfill_event_fields(&mut plan, "they are full day", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+        assert_eq!(plan.update_events[0].span_days, Some(1));
+        assert_eq!(plan.update_events[1].span_days, Some(1));
+    }
+
+    #[test]
+    fn unescapes_html_entities_in_titles() {
+        assert_eq!(unescape_html("A&amp;M Orientation"), "A&M Orientation");
+        assert_eq!(unescape_html("Tom &amp; Jerry &lt;3"), "Tom & Jerry <3");
+        let mut e = ev("friday", Some("12:00"), None);
+        e.title = "A&amp;M Orientation".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        unescape_plan(&mut plan);
+        assert_eq!(plan.events[0].title, "A&M Orientation");
     }
 
     #[test]

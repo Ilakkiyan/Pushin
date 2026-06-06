@@ -117,6 +117,7 @@ export interface PlanOutcome {
   createdEventTitles: string[];
   updatedEventTitles: string[];
   removedEventTitles: string[];
+  createdHabitNames: string[];
   clarifications: string[];
 }
 

@@ -13,6 +13,7 @@ import SettingsPane from "./panes/SettingsPane";
 export default function App() {
   const loaded = useStore((s) => s.loaded);
   const view = useStore((s) => s.view);
+  const calMode = useStore((s) => s.calMode);
   const load = useStore((s) => s.load);
 
   useEffect(() => {
@@ -28,9 +29,9 @@ export default function App() {
       <TopBar />
       <ConflictBanner />
       <main className="flex-1 min-h-0 flex">
-        {(view === "calendar" || view === "month") && (
+        {view === "calendar" && (
           <>
-            <div className="flex-1 min-w-0">{view === "month" ? <MonthPane /> : <CalendarPane />}</div>
+            <div className="flex-1 min-w-0">{calMode === "month" ? <MonthPane /> : <CalendarPane />}</div>
             <aside className="w-[400px] shrink-0 border-l border-white/10 flex flex-col min-h-0">
               <div className="flex-1 min-h-0 overflow-hidden">
                 <ChatPane />

@@ -1,10 +1,20 @@
 //! Habit metrics — streaks and consistency derived from a habit's set of completed days.
 //! Pure date arithmetic (no DB), so it's unit-testable without a model or a database.
 
-use crate::model::{Habit, HabitDay, HabitStats};
-use crate::scheduler::Interval;
+use crate::model::{Event, Habit, HabitDay, HabitStats};
+use crate::scheduler::{parse_dt, Interval};
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use std::collections::HashSet;
+
+/// Is this habit already on the calendar for `day`? Used so "Add to today" can only place a
+/// habit once per day instead of stacking duplicates.
+pub fn habit_already_on_day(events: &[Event], name: &str, day: NaiveDate) -> bool {
+    events.iter().any(|e| {
+        e.kind == "habit"
+            && e.title.eq_ignore_ascii_case(name)
+            && parse_dt(&e.start).map(|d| d.date()) == Some(day)
+    })
+}
 
 /// How many days of history the heatmap shows (17 weeks).
 const HISTORY_DAYS: i64 = 17 * 7;
@@ -233,6 +243,32 @@ mod tests {
     #[test]
     fn habit_slot_none_when_window_already_passed() {
         assert!(find_habit_slot(&[], dt(22, 0), dt(22, 0), 30).is_none());
+    }
+
+    #[test]
+    fn detects_habit_already_on_a_day() {
+        let mk = |title: &str, kind: &str, start: &str| Event {
+            id: 1,
+            title: title.into(),
+            start: start.into(),
+            end: "2026-06-10T21:00:00".into(),
+            kind: kind.into(),
+            source: "manual".into(),
+            created_at: String::new(),
+            provider: None,
+            external_id: None,
+            account_id: None,
+            etag: None,
+        };
+        let day = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
+        let events = vec![
+            mk("Read", "habit", "2026-06-10T20:00:00"),
+            mk("Read", "fixed", "2026-06-10T08:00:00"), // a normal event, not a habit instance
+        ];
+        assert!(habit_already_on_day(&events, "Read", day)); // same habit, same day
+        assert!(habit_already_on_day(&events, "read", day)); // case-insensitive
+        assert!(!habit_already_on_day(&events, "Stretch", day)); // different habit
+        assert!(!habit_already_on_day(&events, "Read", day.succ_opt().unwrap())); // different day
     }
 
     #[test]

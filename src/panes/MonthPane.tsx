@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { addDays, fmtTime, parseLocal, sameDay, sameMonth, startOfMonth, startOfWeek } from "../lib/time";
+import ViewToggle from "../components/ViewToggle";
 
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MAX_CHIPS = 3; // chips shown per day before the "+N more" roll-up
@@ -19,7 +20,7 @@ export default function MonthPane() {
   const blocks = useStore((s) => s.blocks);
   const tasks = useStore((s) => s.tasks);
   const projects = useStore((s) => s.projects);
-  const setView = useStore((s) => s.setView);
+  const setCalMode = useStore((s) => s.setCalMode);
   const setFocusDate = useStore((s) => s.setFocusDate);
 
   const [anchor, setAnchor] = useState(() => startOfMonth(new Date()));
@@ -35,26 +36,39 @@ export default function MonthPane() {
   const itemsByDay = useMemo(() => {
     const map = new Map<string, DayItem[]>();
     const key = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-    const push = (d: DayItem) => {
-      const k = key(d.start);
-      (map.get(k) ?? map.set(k, []).get(k)!).push(d);
+    const addToDay = (dayDate: Date, item: DayItem) => {
+      const k = key(dayDate);
+      (map.get(k) ?? map.set(k, []).get(k)!).push(item);
     };
+    const gridStart = cells[0].getTime();
+    const gridEnd = cells[41].getTime();
     for (const e of events) {
+      const s = parseLocal(e.start);
+      const en = parseLocal(e.end);
       // Habit events (kind "habit") get the green habit accent; other fixed events are rose.
-      push({ start: parseLocal(e.start), title: e.title, color: e.kind === "habit" ? "#22c55e" : "#f43f5e", kind: "event" });
+      const item: DayItem = { start: s, title: e.title, color: e.kind === "habit" ? "#22c55e" : "#f43f5e", kind: "event" };
+      const allDay = s.getHours() === 0 && s.getMinutes() === 0 && en.getHours() === 0 && en.getMinutes() === 0 && en.getTime() > s.getTime();
+      if (allDay) {
+        // A multi-day trip appears on each day it covers (clipped to the visible grid).
+        for (let d = new Date(s.getFullYear(), s.getMonth(), s.getDate()); d.getTime() < en.getTime(); d = addDays(d, 1)) {
+          if (d.getTime() >= gridStart && d.getTime() <= gridEnd) addToDay(d, item);
+        }
+      } else {
+        addToDay(s, item);
+      }
     }
     for (const b of blocks) {
       const t = taskById.get(b.taskId);
       const project = t?.projectId != null ? projectById.get(t.projectId) : undefined;
-      push({ start: parseLocal(b.start), title: t?.title ?? "Task", color: project?.color ?? "#6366f1", kind: "block" });
+      addToDay(parseLocal(b.start), { start: parseLocal(b.start), title: t?.title ?? "Task", color: project?.color ?? "#6366f1", kind: "block" });
     }
     for (const list of map.values()) list.sort((a, z) => a.start.getTime() - z.start.getTime());
     return map;
-  }, [events, blocks, taskById, projectById]);
+  }, [events, blocks, taskById, projectById, cells]);
 
   const openWeek = (day: Date) => {
     setFocusDate(`${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}T00:00:00`);
-    setView("calendar");
+    setCalMode("week");
   };
 
   const now = new Date();
@@ -63,6 +77,8 @@ export default function MonthPane() {
     <div className="h-full flex flex-col">
       {/* Toolbar */}
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4">
+        <ViewToggle />
+        <div className="w-px h-5 bg-white/10 mx-1" />
         <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() - 1, 1))} className="p-1 rounded hover:bg-white/10">
           <ChevronLeft className="size-4" />
         </button>

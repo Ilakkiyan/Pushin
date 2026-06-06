@@ -82,8 +82,8 @@ export default function SettingsPane() {
   };
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-2xl mx-auto p-6 space-y-8">
+    <div className="h-full w-full overflow-y-auto">
+      <div className="max-w-2xl mx-auto p-4 sm:p-6 space-y-8">
         {/* Working hours */}
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Calendar className="size-4 text-indigo-400" /> Working hours</h2>
@@ -93,7 +93,7 @@ export default function SettingsPane() {
           </div>
           <div>
             <span className="text-xs text-gray-400">Work days</span>
-            <div className="flex gap-1.5 mt-1">
+            <div className="flex flex-wrap gap-1.5 mt-1">
               {DAYS.map((d) => (
                 <button
                   key={d.n}
@@ -108,7 +108,7 @@ export default function SettingsPane() {
               ))}
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
             <Field label="Plan ahead (days)"><input type="number" min={1} max={60} value={form.horizonDays} onChange={(e) => update({ horizonDays: Number(e.target.value) })} className={inputCls} /></Field>
             <Field label="Buffer (min)"><input type="number" min={0} step={5} value={form.bufferMinutes} onChange={(e) => update({ bufferMinutes: Number(e.target.value) })} className={inputCls} /></Field>
             <Field label="Min block (min)"><input type="number" min={15} step={15} value={form.defaultMinChunk} onChange={(e) => update({ defaultMinChunk: Number(e.target.value) })} className={inputCls} /></Field>

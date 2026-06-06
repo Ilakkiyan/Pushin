@@ -3,7 +3,15 @@ import { ChevronLeft, ChevronRight, Lock, Plus, X } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Block, CalEvent } from "../lib/ipc";
-import { addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso } from "../lib/time";
+import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso } from "../lib/time";
+import ViewToggle from "../components/ViewToggle";
+
+/** An all-day / multi-day event runs midnight→midnight (that's how trips are stored). */
+function isAllDay(e: CalEvent): boolean {
+  const s = parseLocal(e.start);
+  const en = parseLocal(e.end);
+  return s.getHours() === 0 && s.getMinutes() === 0 && en.getHours() === 0 && en.getMinutes() === 0 && en.getTime() > s.getTime();
+}
 
 const START_HOUR = 0;
 const END_HOUR = 24;
@@ -59,6 +67,23 @@ export default function CalendarPane() {
   const taskById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
   const projectById = useMemo(() => new Map(projects.map((p) => [p.id, p])), [projects]);
 
+  // Multi-day / all-day events render as horizontal bars in a row above the time grid
+  // (spanning the day columns they cover), clipped to the visible week.
+  const allDayBars = useMemo(() => {
+    const ws = days[0];
+    const dayIdx = (d: Date) =>
+      Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() - new Date(ws.getFullYear(), ws.getMonth(), ws.getDate()).getTime()) / 86400000);
+    return events
+      .filter(isAllDay)
+      .map((e) => {
+        const startIdx = dayIdx(parseLocal(e.start));
+        const lastIdx = dayIdx(addDays(parseLocal(e.end), -1)); // end is exclusive midnight
+        return { e, startIdx, lastIdx, col0: Math.max(0, startIdx), col1: Math.min(6, lastIdx) };
+      })
+      .filter((b) => b.lastIdx >= 0 && b.startIdx <= 6)
+      .sort((a, b) => a.startIdx - b.startIdx || parseLocal(a.e.start).getTime() - parseLocal(b.e.start).getTime());
+  }, [events, days]);
+
   // Drag lifecycle.
   useEffect(() => {
     if (!drag) return;
@@ -106,6 +131,8 @@ export default function CalendarPane() {
     <div className="h-full flex flex-col">
       {/* Toolbar */}
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4">
+        <ViewToggle />
+        <div className="w-px h-5 bg-white/10 mx-1" />
         <button onClick={() => setAnchor((a) => addMinutes(a, -7 * 1440))} className="p-1 rounded hover:bg-white/10">
           <ChevronLeft className="size-4" />
         </button>
@@ -138,6 +165,33 @@ export default function CalendarPane() {
         ))}
       </div>
 
+      {/* All-day / multi-day bar */}
+      {allDayBars.length > 0 && (
+        <div className="shrink-0 border-b border-white/10 grid gap-y-0.5 py-1" style={{ gridTemplateColumns: "56px repeat(7, 1fr)" }}>
+          <div className="text-[10px] text-gray-600 self-center text-right pr-1" style={{ gridColumn: 1, gridRow: 1 }}>
+            all-day
+          </div>
+          {allDayBars.map((b, i) => (
+            <div
+              key={b.e.id}
+              onClick={(e) => e.stopPropagation()}
+              className={clsx(
+                "text-[11px] px-2 py-0.5 truncate border self-center mx-0.5",
+                b.e.kind === "habit" ? "bg-emerald-500/20 border-emerald-400/40 text-emerald-100" : "bg-rose-500/20 border-rose-400/40 text-rose-100",
+                b.startIdx >= 0 ? "rounded-l-md" : "",
+                b.lastIdx <= 6 ? "rounded-r-md" : "",
+              )}
+              style={{ gridColumn: `${b.col0 + 2} / ${b.col1 + 3}`, gridRow: i + 1 }}
+              title={b.e.title}
+            >
+              {b.startIdx < 0 ? "‹ " : ""}
+              {b.e.title}
+              {b.lastIdx > 6 ? " ›" : ""}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Scrollable grid */}
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto">
         <div ref={gridRef} className="grid relative" style={{ gridTemplateColumns: "56px repeat(7, 1fr)", height: TOTAL_MIN / 60 * PX_PER_HOUR }}>
@@ -152,7 +206,7 @@ export default function CalendarPane() {
 
           {/* Day columns */}
           {days.map((day) => {
-            const dayEvents = events.filter((e) => sameDay(parseLocal(e.start), day));
+            const dayEvents = events.filter((e) => !isAllDay(e) && sameDay(parseLocal(e.start), day));
             const dayBlocks = blocks.filter((b) => sameDay(parseLocal(b.start), day));
             return (
               <div

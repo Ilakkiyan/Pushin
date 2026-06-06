@@ -59,9 +59,9 @@ export default function BookingPane() {
   };
 
   return (
-    <div className="h-full flex">
+    <div className="h-full w-full flex">
       {/* Left: event types */}
-      <div className="w-72 shrink-0 border-r border-white/10 flex flex-col">
+      <div className="w-64 sm:w-72 shrink-0 border-r border-white/10 flex flex-col">
         <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
           <span className="text-sm font-medium">Event types</span>
           <button onClick={() => setCreating((v) => !v)} className="text-gray-400 hover:text-white"><Plus className="size-4" /></button>

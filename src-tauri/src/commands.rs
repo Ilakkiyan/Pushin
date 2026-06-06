@@ -325,6 +325,13 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
         .find(|h| h.id == id)
         .ok_or_else(|| "habit not found".to_string())?;
 
+    let events = db::list_events(&conn).map_err(err)?;
+
+    // Only add a habit to a given day once — re-plan and return without duplicating.
+    if habits::habit_already_on_day(&events, &habit.name, day_date) {
+        return reschedule_inner(&mut conn, &settings).map_err(err);
+    }
+
     // Everything already on that day becomes "busy" so the habit slots around it.
     let day_lo = day_date.and_hms_opt(0, 0, 0).unwrap();
     let day_hi = day_date.and_hms_opt(23, 59, 59).unwrap();
@@ -336,7 +343,7 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
             }
         }
     };
-    for ev in db::list_events(&conn).map_err(err)? {
+    for ev in &events {
         collect(&ev.start, &ev.end);
     }
     for b in db::list_blocks(&conn).map_err(err)? {
@@ -472,12 +479,14 @@ pub fn sync_calendar(state: State<AppState>) -> Result<usize, String> {
 // ---------- inference / model management ----------
 
 #[tauri::command]
-pub async fn llm_status(state: State<'_, AppState>) -> Result<LlmStatus, String> {
-    let (base_url, model_id, model_present) = {
+pub async fn llm_status(app: AppHandle, state: State<'_, AppState>) -> Result<LlmStatus, String> {
+    let (base_url, model_id) = {
         let conn = state.db.lock().unwrap();
         let s = db::get_settings(&conn).map_err(err)?;
-        (s.llm_base_url.clone(), s.model_id.clone(), false)
+        (s.llm_base_url.clone(), s.model_id.clone())
     };
+    // True if the configured model (or any model) is already downloaded.
+    let model_present = model_manager::is_model_present(&app, &model_id) || model_manager::first_present_model(&app).is_some();
     let reachable = llm::health(&state.http, &base_url).await;
     Ok(LlmStatus {
         reachable,

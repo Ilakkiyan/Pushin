@@ -33,6 +33,7 @@ export default function ChatPane() {
       const o = await plan(trimmed, history);
       const n = o.createdTaskIds.length;
       const ev = o.createdEventTitles.length;
+      const hab = o.createdHabitNames.length;
       const upd = o.updatedEventTitles.length;
       const rem = o.removedEventTitles.length;
 
@@ -40,6 +41,7 @@ export default function ChatPane() {
       const bits: string[] = [];
       if (n) bits.push(`${n} task${n === 1 ? "" : "s"}${o.projectNames.length ? ` to ${o.projectNames.join(", ")}` : ""}`);
       if (ev) bits.push(`${ev} event${ev === 1 ? "" : "s"} (${o.createdEventTitles.join(", ")})`);
+      if (hab) bits.push(`${hab} habit${hab === 1 ? "" : "s"} (${o.createdHabitNames.join(", ")})`);
       if (bits.length) actions.push(`Added ${bits.join(" and ")}`);
       if (upd) actions.push(`updated ${upd} event${upd === 1 ? "" : "s"} (${[...new Set(o.updatedEventTitles)].join(", ")})`);
       if (rem) actions.push(`removed ${rem} event${rem === 1 ? "" : "s"}`);
