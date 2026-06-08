@@ -20,7 +20,7 @@ and was learned the hard way.
 - **Shell:** Tauri 2 — Rust backend (`src-tauri/`), web frontend (`src/`).
 - **Frontend:** React 18 + TypeScript + Vite + Tailwind; state via **Zustand** (`src/state/store.ts`); SQLite is source of truth.
 - **Inference:** llama.cpp **`llama-server`** run as a child process, OpenAI-compatible API at `http://127.0.0.1:8080`, using **`response_format: json_schema`** for constrained JSON.
-- **Models** (`model_manager::MODELS`): Qwen2.5 **3B** (default), **7B** ("most reliable", ~4.7GB), **1.5B** (lite). 4-bit GGUF from bartowski on HuggingFace, auto-downloaded on first run.
+- **Models** (`model_manager::MODELS`): Qwen2.5 **3B** ("lite", default download, ~2GB), **7B** ("recommended", ~4.7GB), **14B** ("most powerful", ~9GB). 4-bit GGUF from bartowski on HuggingFace, auto-downloaded on first run. Default `Settings.model_id` stays the lite 3B (fast first run); the card flags 7B as recommended.
 - **DB:** SQLite via `rusqlite` (Rust) + `@tauri-apps/plugin-sql` (frontend). Lives at `~/Library/Application Support/com.pushin.app/pushin.db`.
 - Target: **macOS arm64**, **Linux x64/arm64**, **Windows x64/arm64**. The engine
   auto-download/unpack/spawn is cross-platform (`model_manager.rs`); macOS is the most-tested.
@@ -107,6 +107,33 @@ Rust core
 
 9. **Conversation history** is passed to the planner for follow-ups ("this friday at 7pm" needs the
    prior turn for context, else it hallucinates a "Meeting").
+
+10. **Task-field recovery (same philosophy as event fields).** The `deadline` field's format is
+    never shown to the model, so its deadlines are usually dropped — and it defaults task lengths to
+    60 min. `parser::backfill_task_fields` recovers both from the user's text: a single deadline
+    ("due/by/before <day|M/D>", "in 3 weeks", or — in a task-only message — a lone day word like
+    "exam **friday**") is applied to every task missing one; a lone task with an explicit length
+    ("study **about 3 hours**") gets that estimate. Both are guarded (single/unambiguous, no
+    competing event) so nothing is mis-assigned. See `find_deadline_dates`.
+
+11. **Measuring the model: the eval harness.** `src-tauri/tests/llm_eval.rs` runs a battery of
+    prompts (single/multi task, events, edits, removes, habits, dates/spans, mixed, conversational,
+    restraint) through the **real** `parser::plan` → `store_plan` path against a live `:8080` server
+    and prints a per-category scorecard. It's `#[ignore]`d + self-skips when no server is up, so
+    `cargo test` stays green. Run it after prompt/guardrail changes to see if accuracy moved:
+    `cargo test --test llm_eval -- --ignored --nocapture` (with Pushin open). This is the feedback
+    loop — tune the prompt or add a deterministic track, then re-run. **Baseline: the 3B scores
+    ~80–85% of checks, and the TOTAL bounces run-to-run (gotcha #1) — judge per-category, not the
+    total.** Deterministic, unit-tested tracks (dates, multi-event, multi-task) stay green; the noisy
+    categories (edit, habit) are model whiffs where it returns an empty plan or asks for a start time
+    — recommend the 7B there. Tracks this harness drove: positional range assignment for multi-event
+    messages (`find_time_ranges`), explicit-date trip collapse (create + self-updates → one all-day
+    span), and a phantom-duplicate guard in `store_plan` (skip a create that fuzzy-matches an event
+    just updated/removed — kills the "Dentist (original)" twin).
+    - On WSL: the harness exe is a **Windows** binary, so it reaches the app's `:8080` even though
+      `curl` from WSL can't. `cargo test --test llm_eval` fails to relink the locked `pushin.exe`
+      while the app runs, **but the test exe is still built** — run it directly:
+      `./target/debug/deps/llm_eval-*.exe --ignored --nocapture`.
 
 ## Google Calendar sync (`calendar/google.rs`)
 - **OAuth2 + PKCE via system browser + loopback `TcpListener`** (Desktop client → no redirect URI to

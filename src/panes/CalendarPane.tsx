@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Lock, Plus, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Block, CalEvent } from "../lib/ipc";
@@ -44,6 +44,20 @@ export default function CalendarPane() {
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
   const focusDateIso = useStore((s) => s.focusDateIso);
+  const settings = useStore((s) => s.settings);
+
+  // The user's sleep window + recurring blocked time / routines, drawn as a shaded background so
+  // free time reads as actual availability (not just empty space). Purely visual — the scheduler
+  // already keeps these free server-side.
+  const routineItems = useMemo<RoutineItem[]>(() => {
+    if (!settings) return [];
+    const items: RoutineItem[] = [];
+    if (settings.sleepEnabled && settings.sleepStart && settings.sleepEnd)
+      items.push({ name: "Sleep", start: settings.sleepStart, end: settings.sleepEnd, days: [], kind: "sleep" });
+    for (const c of settings.commitments ?? [])
+      if (c.start && c.end) items.push({ name: c.name || "Blocked", start: c.start, end: c.end, days: c.days ?? [], kind: c.kind || "blocked" });
+    return items;
+  }, [settings]);
 
   const [anchor, setAnchor] = useState(() => startOfWeek(focusDateIso ? parseLocal(focusDateIso) : new Date()));
 
@@ -150,6 +164,7 @@ export default function CalendarPane() {
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
+          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-slate-400/40" /> reserved</span>
           <span className="flex items-center gap-1"><Lock className="size-3" /> pinned</span>
         </div>
       </div>
@@ -219,6 +234,16 @@ export default function CalendarPane() {
                   <div key={i} className="absolute left-0 right-0 border-t border-white/5" style={{ top: i * PX_PER_HOUR }} />
                 ))}
 
+                {/* Reserved time (sleep + routines) — shaded, behind everything, click-through */}
+                {routineSegmentsForDay(day, routineItems).map((seg) => (
+                  <RoutineBlock
+                    key={seg.key}
+                    seg={seg}
+                    top={((seg.startMin - TOP_MIN) / 60) * PX_PER_HOUR}
+                    height={Math.max(12, ((seg.endMin - seg.startMin) / 60) * PX_PER_HOUR)}
+                  />
+                ))}
+
                 {/* Now line */}
                 {sameDay(day, now) && minutesFromMidnight(now) >= TOP_MIN && minutesFromMidnight(now) <= TOP_MIN + TOTAL_MIN && (
                   <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ top: top(now) }}>
@@ -278,6 +303,63 @@ export default function CalendarPane() {
       </div>
 
       {modal && <AddEventModal start={modal.start} onClose={() => setModal(null)} onSave={(title, end) => { addEvent(title, toLocalIso(modal.start), toLocalIso(end), "fixed"); setModal(null); }} />}
+    </div>
+  );
+}
+
+// --- Reserved-time (sleep + routines) overlay ---
+type RoutineItem = { name: string; start: string; end: string; days: number[]; kind: string };
+type RoutineSeg = { name: string; kind: string; startMin: number; endMin: number; key: string };
+
+function minutesOfDay(hhmm: string): number | null {
+  const [h, m] = hhmm.split(":").map(Number);
+  return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : null;
+}
+function isoWeekday(d: Date): number {
+  return ((d.getDay() + 6) % 7) + 1; // 1=Mon..7=Sun
+}
+
+/** Segments of `items` that fall within calendar day `day` (0..1440 minutes). Overnight windows
+ *  (end <= start, e.g. sleep 23:00→07:00) contribute an evening piece on their start day and a
+ *  morning piece carried over from the previous day — each respecting the item's weekdays. */
+function routineSegmentsForDay(day: Date, items: RoutineItem[]): RoutineSeg[] {
+  const wd = isoWeekday(day);
+  const prevWd = isoWeekday(addDays(day, -1));
+  const out: RoutineSeg[] = [];
+  items.forEach((it, idx) => {
+    const start = minutesOfDay(it.start);
+    const end = minutesOfDay(it.end);
+    if (start == null || end == null) return;
+    const overnight = end <= start;
+    const everyDay = it.days.length === 0;
+    if (everyDay || it.days.includes(wd)) {
+      const endMin = overnight ? 1440 : end;
+      if (endMin > start) out.push({ name: it.name, kind: it.kind, startMin: start, endMin, key: `${idx}a` });
+    }
+    if (overnight && end > 0 && (everyDay || it.days.includes(prevWd))) {
+      out.push({ name: it.name, kind: it.kind, startMin: 0, endMin: end, key: `${idx}b` });
+    }
+  });
+  return out;
+}
+
+function RoutineBlock({ seg, top, height }: { seg: RoutineSeg; top: number; height: number }) {
+  const isSleep = seg.kind === "sleep";
+  // Striped, desaturated fill so it reads as "unavailable" rather than a real event.
+  const a = isSleep ? "rgba(129,140,248,0.16)" : "rgba(148,163,184,0.13)"; // indigo-400 / slate-400
+  const b = isSleep ? "rgba(129,140,248,0.05)" : "rgba(148,163,184,0.04)";
+  return (
+    <div
+      className="absolute left-0 right-0 z-0 pointer-events-none overflow-hidden border-y border-white/5"
+      style={{ top, height, backgroundImage: `repeating-linear-gradient(45deg, ${a} 0 6px, ${b} 6px 12px)` }}
+      title={`${seg.name} — reserved`}
+    >
+      {height >= 24 && (
+        <div className="px-1.5 pt-0.5 text-[10px] text-gray-400/80 flex items-center gap-1 truncate">
+          {isSleep && <Moon className="size-2.5 shrink-0" />}
+          <span className="truncate">{seg.name}</span>
+        </div>
+      )}
     </div>
   );
 }

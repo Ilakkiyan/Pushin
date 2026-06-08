@@ -1,4 +1,4 @@
-import { CalendarDays, CalendarClock, Flame, Settings as SettingsIcon, Loader2 } from "lucide-react";
+import { CalendarDays, CalendarClock, FolderKanban, Flame, Settings as SettingsIcon, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api } from "../lib/ipc";
@@ -51,6 +51,7 @@ export default function TopBar() {
 
       <nav className="flex items-center gap-1">
         <NavButton active={view === "calendar"} onClick={() => setView("calendar")} icon={<CalendarDays className="size-4" />} label="Calendar" />
+        <NavButton active={view === "projects"} onClick={() => setView("projects")} icon={<FolderKanban className="size-4" />} label="Projects" />
         <NavButton active={view === "habits"} onClick={() => setView("habits")} icon={<Flame className="size-4" />} label="Habits" />
         <NavButton active={view === "booking"} onClick={() => setView("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
         <NavButton active={view === "settings"} onClick={() => setView("settings")} icon={<SettingsIcon className="size-4" />} label="Settings" />

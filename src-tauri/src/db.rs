@@ -9,6 +9,7 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_google.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_habits.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_habit_duration.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_project_archive.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -35,6 +36,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 4 {
         conn.execute_batch(MIGRATION_0004)?;
         conn.pragma_update(None, "user_version", 4)?;
+    }
+    if version < 5 {
+        conn.execute_batch(MIGRATION_0005)?;
+        conn.pragma_update(None, "user_version", 5)?;
     }
     Ok(())
 }
@@ -73,6 +78,7 @@ fn row_to_project(r: &Row) -> rusqlite::Result<Project> {
         name: r.get("name")?,
         color: r.get("color")?,
         created_at: r.get("created_at")?,
+        archived_at: r.get("archived_at")?,
     })
 }
 
@@ -88,6 +94,30 @@ pub fn insert_project(conn: &Connection, name: &str, color: &str) -> Result<i64>
         params![name, color, now_iso()],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Delete a project. Its tasks survive — the FK is `ON DELETE SET NULL`, so they
+/// fall back to the "No project" bucket rather than being destroyed.
+pub fn delete_project(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Mark a project complete (move to the Completed bin) or restore it to active.
+/// Completing also finishes any still-open tasks so they leave the schedule.
+pub fn set_project_archived(conn: &Connection, id: i64, archived: bool) -> Result<()> {
+    let archived_at = if archived { Some(now_iso()) } else { None };
+    conn.execute(
+        "UPDATE projects SET archived_at = ?2 WHERE id = ?1",
+        params![id, archived_at],
+    )?;
+    if archived {
+        conn.execute(
+            "UPDATE tasks SET status = 'done' WHERE project_id = ?1 AND status != 'done'",
+            params![id],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------- Tasks ----------

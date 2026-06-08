@@ -42,9 +42,14 @@ pub fn compute_stats(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate)
 /// Find when to drop a habit of `duration_min` onto a day, given that day's `busy`
 /// intervals (events + task blocks) and the awake `[window_start, window_end)` window.
 ///
-/// Strategy: place it as LATE as possible inside a free gap — so it lands "near the end of
-/// the day", but slots into the space between things if the very end is already taken. If the
-/// day is completely packed, falls back to the end of the window (a last-resort overlap).
+/// Strategy: **best-fit** — pick the *smallest* free gap the habit still fits in (ties broken
+/// toward the earliest). This tucks the habit into the awkward little gaps between existing
+/// commitments and leaves the big open stretches intact for deep-work tasks, instead of
+/// dumping it at the end of the day. Within the chosen gap it hugs an adjacent commitment:
+/// start-aligned right after the thing before it, or end-aligned right before the thing after
+/// it when the gap only touches a commitment on its later side. A wide-open day has no
+/// commitment to hug, so the habit lands at the start of the window (morning). If the day is
+/// completely packed it falls back to the end of the window (a last-resort overlap).
 /// Returns `None` only if the window itself is empty (e.g. it's already past end-of-day).
 pub fn find_habit_slot(
     busy: &[Interval],
@@ -76,9 +81,23 @@ pub fn find_habit_slot(
         gaps.push(Interval { start: cursor, end: window_end });
     }
 
-    // Latest gap that fits → end of the day, in the space between stuff.
-    if let Some(g) = gaps.iter().rev().find(|g| g.minutes() >= duration_min) {
-        return Some((g.end - dur, g.end));
+    // Best-fit: smallest gap that still fits, earliest as the tie-breaker (gaps are already
+    // in chronological order, so a stable min-by keeps the earlier one on ties).
+    let best = gaps
+        .iter()
+        .filter(|g| g.minutes() >= duration_min)
+        .min_by_key(|g| g.minutes());
+    if let Some(g) = best {
+        // Hug a real commitment: abut whatever the gap touches, preferring its earlier edge.
+        // A gap flush against the window edge on its early side (and a commitment on its late
+        // side) end-aligns; otherwise start-align (including the empty-day → morning case).
+        let touches_earlier = g.start > window_start;
+        let touches_later = g.end < window_end;
+        return Some(if !touches_earlier && touches_later {
+            (g.end - dur, g.end)
+        } else {
+            (g.start, g.start + dur)
+        });
     }
     // Packed day: last resort, pin it to the end of the window.
     Some((window_end - dur, window_end))
@@ -215,24 +234,39 @@ mod tests {
     }
 
     #[test]
-    fn habit_slot_lands_near_end_of_an_empty_day() {
-        // Empty 07:00–22:00 window, 30-min habit → ends at 22:00.
+    fn habit_slot_lands_in_the_morning_on_an_empty_day() {
+        // Empty 07:00–22:00 window: no commitment to hug, so a 30-min habit starts the day
+        // (07:00) rather than getting pinned to the end of the window.
         let slot = find_habit_slot(&[], dt(7, 0), dt(22, 0), 30).unwrap();
-        assert_eq!(slot, (dt(21, 30), dt(22, 0)));
+        assert_eq!(slot, (dt(7, 0), dt(7, 30)));
     }
 
     #[test]
-    fn habit_slot_fits_between_things_when_end_is_busy() {
-        // Evening blocked 20:00–22:00; a 60-min habit must slot into the gap before it.
+    fn habit_slot_tucks_into_the_smallest_fitting_gap() {
+        // Morning meeting 09:00–12:00 and afternoon 12:45–17:00 leave gaps of 120/45/300 min.
+        // A 30-min habit takes the tight lunch gap (best-fit) and abuts the 12:00 meeting end,
+        // keeping the long morning and evening stretches open for tasks.
+        let busy = [
+            Interval { start: dt(9, 0), end: dt(12, 0) },
+            Interval { start: dt(12, 45), end: dt(17, 0) },
+        ];
+        let slot = find_habit_slot(&busy, dt(7, 0), dt(22, 0), 30).unwrap();
+        assert_eq!(slot, (dt(12, 0), dt(12, 30)));
+    }
+
+    #[test]
+    fn habit_slot_hugs_a_later_commitment_when_the_gap_starts_at_the_window_edge() {
+        // Evening blocked 20:00–22:00; the only gap (07:00–20:00) is flush with the window's
+        // start, so a 60-min habit hugs the 20:00 commitment instead of floating at 07:00.
         let busy = [Interval { start: dt(20, 0), end: dt(22, 0) }];
         let slot = find_habit_slot(&busy, dt(7, 0), dt(22, 0), 60).unwrap();
-        assert_eq!(slot, (dt(19, 0), dt(20, 0))); // tail of the free gap before the block
+        assert_eq!(slot, (dt(19, 0), dt(20, 0)));
     }
 
     #[test]
-    fn habit_slot_picks_latest_fitting_gap() {
-        // A small late gap (21:30–22:00, 30m) is too small for a 60-min habit, so it falls
-        // back to the earlier free gap (ending 20:30).
+    fn habit_slot_skips_a_gap_too_small_to_fit() {
+        // A small late gap (21:30–22:00, 30m) can't hold a 60-min habit, so it falls back to
+        // the only other (earlier) gap, hugging the 20:30 commitment.
         let busy = [
             Interval { start: dt(20, 30), end: dt(21, 30) },
         ];

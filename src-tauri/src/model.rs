@@ -12,6 +12,8 @@ pub struct Project {
     pub name: String,
     pub color: String,
     pub created_at: String,
+    /// NULL while active; ISO timestamp once completed (moved to the Completed bin).
+    pub archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +143,24 @@ pub struct GoogleAccount {
     pub connected_at: String,
 }
 
+/// A recurring personal commitment the scheduler must keep free — a bedtime routine, a
+/// daily lunch, a standing gym slot, "no work after 6pm", etc. Times are wall-clock "HH:MM";
+/// if `end` <= `start` the window runs overnight (e.g. 22:00→06:00). An empty `days` means
+/// every day. `blocked` time and `routine` time are the same to the scheduler (both reserved);
+/// `kind` is only a UI label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Commitment {
+    pub id: String,
+    pub name: String,
+    pub start: String, // "HH:MM"
+    pub end: String,   // "HH:MM"
+    #[serde(default)]
+    pub days: Vec<u8>, // 1=Mon .. 7=Sun; empty = every day
+    #[serde(default)]
+    pub kind: String, // "routine" | "blocked" (UI label only)
+}
+
 /// User settings; persisted as a single JSON row (key = "app").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,6 +180,23 @@ pub struct Settings {
     pub google_client_id: String,
     #[serde(default)]
     pub google_client_secret: String,
+
+    // --- Personalization (collected by the first-run modal, editable in Settings) ---
+    // All `#[serde(default)]` so existing settings rows upgrade cleanly: an old user gets
+    // `onboarded=false` (sees the modal once) and `sleep_enabled=false` (no surprise blocking).
+    /// Whether the first-run personalization modal has been completed/dismissed.
+    #[serde(default)]
+    pub onboarded: bool,
+    /// Keep the user's sleep window free (and tell the LLM about it).
+    #[serde(default)]
+    pub sleep_enabled: bool,
+    #[serde(default)]
+    pub sleep_start: String, // bedtime, "HH:MM"
+    #[serde(default)]
+    pub sleep_end: String, // wake time, "HH:MM"
+    /// Recurring blocked time / routines the scheduler plans around.
+    #[serde(default)]
+    pub commitments: Vec<Commitment>,
 }
 
 impl Default for Settings {
@@ -178,6 +215,11 @@ impl Default for Settings {
             google_connected: false,
             google_client_id: String::new(),
             google_client_secret: String::new(),
+            onboarded: false,
+            sleep_enabled: true,
+            sleep_start: "23:00".into(),
+            sleep_end: "07:00".into(),
+            commitments: Vec::new(),
         }
     }
 }

@@ -62,6 +62,53 @@ fn parse_hm(s: &str) -> NaiveTime {
     NaiveTime::parse_from_str(s, "%H:%M").unwrap_or_else(|_| NaiveTime::from_hms_opt(9, 0, 0).unwrap())
 }
 
+/// Like `parse_hm` but `None` for empty/invalid input (so unset sleep/commitment times are skipped).
+fn parse_hm_opt(s: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(s.trim(), "%H:%M").ok()
+}
+
+/// Push a recurring daily window starting on `date`. If `end <= start` it spans midnight
+/// (e.g. bedtime 23:00 → wake 07:00), so the interval runs into the next day; the per-day
+/// sweep in `free_slots` clamps it correctly to each day.
+fn push_window(out: &mut Vec<Interval>, date: NaiveDate, start: NaiveTime, end: NaiveTime) {
+    let s = date.and_time(start);
+    let e = if end <= start {
+        (date + Duration::days(1)).and_time(end)
+    } else {
+        date.and_time(end)
+    };
+    if e > s {
+        out.push(Interval { start: s, end: e });
+    }
+}
+
+/// Recurring personal commitments — the user's sleep window plus blocked-time/routines —
+/// expanded into concrete busy intervals across the horizon. This is what makes the scheduler
+/// (and, via `free_slots`, the booking page) plan *around* the user's life.
+pub fn personal_busy(now: NaiveDateTime, s: &Settings) -> Vec<Interval> {
+    let today = now.date();
+    let mut out = Vec::new();
+    // Start a day early so an overnight window that began "yesterday" still carves this morning.
+    for d in -1..s.horizon_days.max(0) {
+        let date = today + Duration::days(d);
+        if s.sleep_enabled {
+            if let (Some(ss), Some(se)) = (parse_hm_opt(&s.sleep_start), parse_hm_opt(&s.sleep_end)) {
+                push_window(&mut out, date, ss, se);
+            }
+        }
+        let wd = date.weekday().number_from_monday() as u8; // 1=Mon..7=Sun
+        for c in &s.commitments {
+            if !c.days.is_empty() && !c.days.contains(&wd) {
+                continue;
+            }
+            if let (Some(cs), Some(ce)) = (parse_hm_opt(&c.start), parse_hm_opt(&c.end)) {
+                push_window(&mut out, date, cs, ce);
+            }
+        }
+    }
+    out
+}
+
 /// Round a datetime up to the next `step` minute boundary (tidy block starts).
 fn round_up(dt: NaiveDateTime, step: i64) -> NaiveDateTime {
     let zeroed = dt.with_second(0).unwrap().with_nanosecond(0).unwrap();
@@ -85,6 +132,9 @@ pub fn free_slots(now: NaiveDateTime, s: &Settings, busy: &[Interval]) -> Vec<In
         .iter()
         .map(|b| Interval { start: b.start - buf, end: b.end + buf })
         .collect();
+    // Reserve the user's sleep window and recurring commitments. These are personal time, not
+    // tasks, so they get no buffer padding around them.
+    busyx.extend(personal_busy(now, s));
     busyx.sort_by_key(|i| i.start);
 
     let mut out = Vec::new();
@@ -362,6 +412,7 @@ pub fn schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Commitment;
 
     fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, m, d)
@@ -535,6 +586,69 @@ mod tests {
         for w in ivs.windows(2) {
             assert!(w[0].end <= w[1].start, "overlap: {:?} vs {:?}", w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn sleep_window_is_kept_free() {
+        let mut s = settings(1);
+        s.work_start = "06:00".into();
+        s.work_end = "23:00".into();
+        s.sleep_enabled = true;
+        s.sleep_start = "22:00".into();
+        s.sleep_end = "07:00".into();
+        // Sleep 22:00→07:00 should carve the early morning and late evening from the work window,
+        // leaving only 07:00–22:00 free.
+        let now = dt(2026, 6, 8, 5, 0);
+        let f = free_slots(now, &s, &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].start, dt(2026, 6, 8, 7, 0));
+        assert_eq!(f[0].end, dt(2026, 6, 8, 22, 0));
+    }
+
+    #[test]
+    fn commitment_blocks_its_window() {
+        let mut s = settings(1);
+        s.sleep_enabled = false;
+        s.commitments = vec![Commitment {
+            id: "1".into(),
+            name: "Lunch".into(),
+            start: "12:00".into(),
+            end: "13:00".into(),
+            days: vec![],
+            kind: "blocked".into(),
+        }];
+        let now = dt(2026, 6, 8, 8, 0);
+        // A task big enough to span lunch — none of it may land in the 12:00–13:00 window.
+        let tasks = vec![task(1, "A", 480, None, vec![])];
+        let r = schedule(now, &s, &tasks, &[], &[]);
+        assert!(!r.blocks.is_empty());
+        for b in &r.blocks {
+            let bs = parse_dt(&b.start).unwrap();
+            let be = parse_dt(&b.end).unwrap();
+            assert!(
+                be <= dt(2026, 6, 8, 12, 0) || bs >= dt(2026, 6, 8, 13, 0),
+                "block overlaps the lunch commitment: {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn commitment_only_blocks_its_weekdays() {
+        let mut s = settings(1);
+        s.sleep_enabled = false;
+        // 2026-06-08 is a Monday; this commitment is Tuesdays-only, so Monday is untouched.
+        s.commitments = vec![Commitment {
+            id: "1".into(),
+            name: "Standup".into(),
+            start: "12:00".into(),
+            end: "13:00".into(),
+            days: vec![2],
+            kind: "blocked".into(),
+        }];
+        let now = dt(2026, 6, 8, 8, 0);
+        let f = free_slots(now, &s, &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0], Interval { start: dt(2026, 6, 8, 9, 0), end: dt(2026, 6, 8, 17, 0) });
     }
 
     #[test]

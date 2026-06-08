@@ -58,6 +58,7 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
 | 📅 **Week view** | Full 24‑hour week grid with drag‑to‑move and pin‑to‑lock; re‑plans around your changes. |
 | 🗓️ **Month view** | Google‑Calendar‑style month grid with per‑day event chips; click a day to jump to its week. |
 | 🔥 **Habit tracker** | Build habits with streaks, a consistency heatmap, and one‑click "add to today's calendar" that slots a habit into a free gap. |
+| 🌙 **Personalized routine** | A first‑run welcome captures your sleep, working hours, and recurring blocked time (meals, gym, commute); the scheduler keeps them free and the AI plans around them. |
 | ✅ **Task list** | Auto‑scheduled work blocks with status, priority, and deadlines. |
 | 🔗 **Two‑way Google Calendar sync** | Mirror events and task blocks to your primary calendar (optional). |
 | 🔒 **100% on‑device** | Inference runs locally via llama.cpp or Ollama. The app works fully offline. |
@@ -185,13 +186,17 @@ Pushin needs a local, OpenAI‑compatible inference server. Pick **one**:
 <details open>
 <summary><b>Option A — built‑in (easiest, nothing to install)</b></summary>
 
-On first launch the chat panel shows a **setup card**. Click to **download a model** (Qwen2.5 3B,
-~2 GB) — Pushin fetches the model *and* the llama.cpp engine for your OS automatically and starts
+On first launch the chat panel shows a **setup card** listing three models — pick one and click
+**Download**. Pushin fetches the model *and* the llama.cpp engine for your OS automatically and starts
 the server on `http://127.0.0.1:8080`. The status pill in the top‑right turns green ("AI ready")
 when it's up.
 
-> The 3B model is the default. For more reliable multi‑step parsing, choose the **7B** model
-> (~4.7 GB) in **Settings**. There's also a lightweight **1.5B**.
+> Three tiers, pick for your machine:
+> - **Lite — Qwen2.5 3B** (~2 GB): lightest and fastest; the default download, runs almost anywhere.
+> - **Recommended — Qwen2.5 7B** (~4.7 GB): the most reliable multi‑step parsing; needs ~6 GB RAM.
+> - **Most powerful — Qwen2.5 14B** (~9 GB): highest accuracy for a strong machine (~12 GB RAM), slowest.
+>
+> You can switch model any time in **Settings**.
 </details>
 
 <details>
@@ -218,7 +223,9 @@ That's it — type into the chat box and watch your calendar fill in.
 - *"Move the dentist to tomorrow at 3pm."* → reschedules it.
 
 **Week** — the full 24‑hour grid. Drag a task block to move it; double‑click to pin it (pinned
-blocks survive re‑planning). Click empty space to add a fixed/busy event.
+blocks survive re‑planning). Click empty space to add a fixed/busy event. Your **reserved time**
+(sleep + routines from Settings) is shaded behind the grid so the gaps read as the time you actually
+have free.
 
 **Month** — a Google‑Calendar‑style overview. Each day shows little chips for its events and task
 blocks; click any day to jump to that week.
@@ -233,29 +240,150 @@ tasks around it.
 
 **Booking** — a local mock‑up of a public booking page that reuses the scheduler's free‑slot logic.
 
-**Settings** — working hours, model choice, inference server URL, and Google Calendar connection.
+**Settings** — working hours, **your routine** (sleep window + recurring blocked time like meals,
+gym, or the commute), model choice, inference server URL, and Google Calendar connection. The
+scheduler keeps your routine free and the AI plans around it — the same questions are asked once in a
+first‑run welcome, and you can change them here anytime.
 
 ---
 
 ## Google Calendar sync (optional)
 
 Two‑way sync with your **primary** calendar: Google events are pulled in (the scheduler plans
-around them) and your events + auto‑scheduled task blocks are mirrored out. It uses your own free
-Google OAuth client (~10 minutes, one time):
+around them) and your events + auto‑scheduled task blocks are mirrored out.
 
-1. In the [Google Cloud Console → Credentials](https://console.cloud.google.com/apis/credentials),
-   create or pick a project.
-2. **Enable the Google Calendar API** (APIs & Services → Library → "Google Calendar API" → Enable).
-3. **OAuth consent screen** — set it up (External is fine) and add your own Google address under
-   *Test users* (while the app is in "testing", only listed users can authorize).
-4. **Create credentials → OAuth client ID → Application type: Desktop app.** Copy the **Client ID**
-   and **Client secret**.
-5. In Pushin → **Settings → Google Calendar**, paste them and click **Connect**. Approve in the
-   browser window that opens, and you're synced.
+There are three one‑time stages: **A.** create your own Google OAuth client, **B.** connect it in
+Pushin, and **C.** flip it to "production" so it keeps working. Budget ~10–15 minutes total. Read the
+short safety note first — the setup *looks* scarier than it is, and knowing why each step exists makes
+it obvious what's safe.
 
-> Loopback redirect + PKCE are used (no redirect URI to register for Desktop clients). Tokens are
-> stored in the local SQLite database for now — moving them to the OS keychain is a planned
-> hardening step. Pushin‑created blocks are tagged so they reconcile without duplicating.
+### Is this safe? (read this first)
+
+Yes. Here's the whole trust model in four points:
+
+- **There are no Pushin servers.** Your computer talks to Google directly. Nothing routes through us
+  or anyone else — we never see your calendar, your Google account, or your credentials.
+- **You create your own Google "app."** Rather than trust a stranger's app with your calendar, you
+  spend a few minutes making a personal OAuth client that only *you* own and control. That single fact
+  is the reason for every step below.
+- **You'll hit two scary‑looking screens — both are normal and expected:**
+  - **"Google hasn't verified this app"** during sign‑in. That's *only* because the app is yours and
+    you (correctly) never submitted it to Google for review. You click **Advanced → Go to Pushin
+    (unsafe)** to continue. This is the single most common point of confusion — it is not a real
+    warning about Pushin.
+  - **"See, edit, share, and permanently delete all the calendars you can access"** on the permission
+    screen. This is the *only* Calendar permission Google offers — there is no "just my primary
+    calendar" checkbox. Pushin only ever touches your **primary** calendar, and only on your machine.
+- **The "Client secret" isn't really a secret here.** Desktop apps can't keep secrets, so Google's
+  flow uses **PKCE** — a one‑time random proof your machine generates per sign‑in — as the actual
+  security. The "secret" is just an identifier that never leaves your computer.
+
+### Part A — Create your Google OAuth client (one time)
+
+Do this in the [Google Cloud Console](https://console.cloud.google.com/). Google has reorganized
+this UI a few times; menu names below are the current ones, with the older labels in parentheses.
+
+**1. Create (or select) a project.**
+   - Open the **project picker** in the top bar → **New Project** → give it any name (e.g. "Pushin")
+     → **Create**. Wait for it to finish, then make sure that project is selected in the top bar.
+   - *(If you already have a project you don't mind reusing, just select it.)*
+
+**2. Enable the Google Calendar API.**
+   - Go to **APIs & Services → Library**
+     ([direct link](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)),
+     search **"Google Calendar API"**, open it, and click **Enable**.
+   - If you skip this, connecting "succeeds" but every sync fails with a *Calendar API has not been
+     used / is disabled* error.
+
+**3. Configure the consent screen** (**APIs & Services → OAuth consent screen**, newer Console calls
+   this **Google Auth Platform**).
+   - **User type / Audience:** choose **External**. *(Internal only exists if you're on Google
+     Workspace and only allows people in your org.)*
+   - **App information:** an **App name** (e.g. "Pushin") and your email as the **User support email**
+     and **Developer contact**. Everything else can stay blank.
+   - **Test users** (under **Audience** in the new UI): click **Add users** and add **your own Gmail
+     address** — the exact account whose calendar you'll sync. While the app is in **Testing** mode,
+     only accounts listed here are allowed to authorize.
+   - You do **not** need to add a logo or submit the app for Google's verification review. (You *will*
+     publish it to "production" in **Part C** — that's a one‑click toggle for your own use, not the
+     verification review. Skipping Part C just means re‑connecting weekly; see below.)
+
+**4. Create the OAuth client.**
+   - Go to **APIs & Services → Credentials → Create credentials → OAuth client ID**
+     (newer UI: **Google Auth Platform → Clients → Create client**).
+   - **Application type: Desktop app.** This is important — Pushin uses a loopback redirect that only
+     Desktop clients allow, so there's **no redirect URI to fill in**. (Web‑application clients will
+     *not* work here.)
+   - Give it a name and click **Create**.
+
+**5. Copy the Client ID and Client secret.**
+   - The instant you click **Create**, a dialog pops up with your **Client ID** (ends in
+     `.apps.googleusercontent.com`) and **Client secret** (starts with `GOCSPX-`). Copy both — you'll
+     paste them into Pushin in Part B.
+   - **Closed the dialog too soon?** Nothing is lost; these values don't change. Go back to
+     **APIs & Services → Credentials** (newer UI: **Google Auth Platform → Clients**) and **click your
+     OAuth client's name** to reopen its detail page — the Client ID and secret are both shown there.
+     The **⬇ Download JSON** button gives you a file containing both as well.
+
+### Part B — Connect in Pushin
+
+**1.** Open **Settings → Google Calendar**, paste the **Client ID** and **Client secret**, and click
+   **Connect Google Calendar**. Pushin saves them and opens your browser.
+
+**2.** Pick the Google account you added as a test user.
+
+**3.** You'll see **"Google hasn't verified this app."** This is normal for an unpublished personal
+   app. Click **Advanced** (bottom‑left) → **Go to Pushin (unsafe)**. It is safe: this is the client
+   *you* just created, and the whole exchange happens locally on your machine.
+
+**4.** Approve the requested access — Pushin asks for **See, edit, share, and permanently delete all
+   the calendars you can access** (the Calendar scope) plus your email/profile. Click **Continue /
+   Allow**.
+
+**5.** The browser tab shows **"📌 Pushin is connected to Google Calendar"** — close it. Back in
+   Pushin, Settings now shows a green **● Connected** pill. Click **Sync now** for the first sync;
+   after that Pushin syncs automatically as you make changes.
+
+### Part C — Make it permanent (publish your app)
+
+A brand‑new OAuth app starts in **Testing** mode, and Google **revokes its access after 7 days** — so
+sync will quietly stop working about once a week and you'll have to reconnect. To make it permanent,
+take 30 seconds to move the app to **Production**.
+
+> **This does *not* mean publishing Pushin to the world, submitting anything to Google, or waiting for
+> a review.** "Production" here is just a status flag on *your own* OAuth app that lifts the 7‑day
+> clock. Your data and the whole flow stay exactly as private as before.
+
+**1.** Go to **APIs & Services → OAuth consent screen** (newer UI: **Google Auth Platform → Audience**).
+
+**2.** Under **Publishing status: Testing**, click **Publish app**, then **Confirm** in the dialog.
+
+**3.** The status now reads **In production** — and refresh tokens stop expiring weekly. Done.
+
+**About the verification prompt.** Because the Calendar scope is "sensitive," Google may show a note
+that the app "requires verification." **You do not need to complete it for personal use** — you can
+ignore/dismiss the prompt. Verification only does two things: it removes the "Google hasn't verified
+this app" warning, and it lets you exceed 100 users. So your app simply stays **In production
+(unverified)**: you'll click past that one warning screen the *first* time you connect (Part B,
+step 3), but your sign‑in no longer expires every 7 days.
+
+> **"…so other people can use it."** Pushin isn't a hosted service — each person runs their own copy
+> with their own OAuth client (Parts A–C above). If you want to let a *handful* of others use *your*
+> client, an **unverified Production** app allows up to **100 users** total; while in **Testing** you'd
+> instead add each of them under **Test users**. Only opening it to the general public — removing the
+> warning screen or going past 100 users — requires Google's verification review.
+
+### Good to know
+
+- **Loopback + PKCE.** Pushin listens on `http://127.0.0.1:<random‑port>` for the one‑time redirect,
+  so there's nothing to register and no secret ever leaves your machine in a URL.
+- **Scopes requested:** `…/auth/calendar` (full read/write on your calendars), `openid`, and `email`.
+- **Keep it permanent.** A **Testing**‑mode app loses access every 7 days; publishing it to
+  **Production** (Part C) stops that, with no Google review required for personal use.
+- **Where tokens live:** in Pushin's local SQLite DB for now (moving them to the OS keychain is a
+  planned hardening step). Disconnect from Settings to remove them.
+- **No duplicates:** Pushin tags the task blocks it pushes so re‑syncs reconcile them instead of
+  creating copies.
 
 ---
 
@@ -347,11 +475,16 @@ the SQLite database (`pushin.db`), downloaded models (`models/*.gguf`), and the 
 | Symptom | Fix |
 |---|---|
 | **"AI offline"** pill stays amber | Open the chat setup card and download a model, or start Ollama and set its URL in Settings. |
-| Model download is slow | The 3B model is ~2 GB; it's a one‑time download. The 1.5B model is smaller if you're bandwidth‑limited. |
+| Model download is slow | It's a one‑time download. The **lite 3B** (~2 GB) is the smallest — start there if you're bandwidth‑limited and upgrade to the 7B/14B later. |
 | Parsing is inconsistent | Small models are prompt‑sensitive — switch to the **7B** model in Settings for more reliable multi‑step parsing. |
 | `npm run tauri dev` fails to compile Rust | Re‑check the OS prerequisites above (especially the C++ build tools / `webkit2gtk` dev package). |
 | Build error about `webkit2gtk` on Linux | Install `libwebkit2gtk-4.1-dev` (Tauri 2 uses 4.1, not 4.0). |
-| Google "Connect" fails | Make sure the Calendar API is enabled and your address is added as a **test user** on the consent screen. |
+| "Google hasn't verified this app" during sign‑in | Expected for a personal unpublished app. Click **Advanced → Go to Pushin (unsafe)** — it's your own client. |
+| Sign‑in shows "Access blocked / app is being tested" | The account you're signing in with isn't a **test user**. Add it under the consent screen's **Test users / Audience**. |
+| Connect succeeds but **Sync now** errors with *Calendar API disabled* | You skipped Part A‑2 — **enable the Google Calendar API** in the Library, then Sync again. |
+| `Error 400: redirect_uri_mismatch` | Your OAuth client is the wrong type. It must be **Desktop app**, not Web application — recreate it. |
+| "no refresh_token returned" on Connect | Google only returns one once. **Disconnect**, then remove Pushin at [your Google account's app permissions](https://myaccount.google.com/permissions), and **Connect** again. |
+| Sync silently stops working after about a week | Your app is still in **Testing** mode (tokens expire every 7 days). Publish it to **Production** — see [Part C](#part-c--make-it-permanent-publish-your-app). |
 
 ---
 
@@ -368,7 +501,7 @@ Google Calendar sync.
 
 **Shell:** Tauri 2 · **Frontend:** React 18 + TypeScript + Vite + Tailwind + Zustand ·
 **Backend:** Rust (rusqlite, reqwest, chrono) · **Inference:** llama.cpp `llama-server` /
-Ollama (OpenAI‑compatible, `response_format: json_schema`) · **Models:** Qwen2.5 1.5B / 3B / 7B
+Ollama (OpenAI‑compatible, `response_format: json_schema`) · **Models:** Qwen2.5 3B / 7B / 14B
 (4‑bit GGUF).
 
 Targets macOS (arm64), Windows (x64/arm64), and Linux (x64/arm64).

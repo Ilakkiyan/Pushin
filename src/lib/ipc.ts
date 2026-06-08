@@ -1,6 +1,17 @@
 // Typed wrappers over the Rust command surface. Types mirror the serde (camelCase) structs.
 import { invoke } from "@tauri-apps/api/core";
 
+/** A recurring blocked time / routine the scheduler keeps free. `end <= start` runs overnight;
+ *  empty `days` means every day. `kind` is a UI label only ("routine" | "blocked"). */
+export interface Commitment {
+  id: string;
+  name: string;
+  start: string; // "HH:MM"
+  end: string; // "HH:MM"
+  days: number[]; // 1=Mon..7=Sun; empty = every day
+  kind: string;
+}
+
 export interface Settings {
   timezone: string;
   workStart: string; // "09:00"
@@ -15,6 +26,12 @@ export interface Settings {
   googleConnected: boolean;
   googleClientId: string;
   googleClientSecret: string;
+  // Personalization (first-run modal + Settings).
+  onboarded: boolean;
+  sleepEnabled: boolean;
+  sleepStart: string; // bedtime "HH:MM"
+  sleepEnd: string; // wake time "HH:MM"
+  commitments: Commitment[];
 }
 
 export interface SyncSummary {
@@ -29,6 +46,7 @@ export interface Project {
   name: string;
   color: string;
   createdAt: string;
+  archivedAt: string | null; // null = active; timestamp = completed (in the bin)
 }
 
 export interface Task {
@@ -176,6 +194,10 @@ export const api = {
     invoke<ScheduleResult>("create_task", { title, estimatedMinutes, deadline, priority, projectId }),
   setTaskStatus: (id: number, status: string) => invoke<ScheduleResult>("set_task_status", { id, status }),
   deleteTask: (id: number) => invoke<ScheduleResult>("delete_task", { id }),
+
+  deleteProject: (id: number) => invoke<ScheduleResult>("delete_project", { id }),
+  setProjectArchived: (id: number, archived: boolean) =>
+    invoke<ScheduleResult>("set_project_archived", { id, archived }),
 
   addEvent: (title: string, start: string, end: string, kind: string) =>
     invoke<ScheduleResult>("add_event", { title, start, end, kind }),

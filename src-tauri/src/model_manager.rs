@@ -34,27 +34,27 @@ pub struct ModelInfo {
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "qwen2.5-3b-instruct-q4_k_m",
-        name: "Qwen2.5 3B Instruct (recommended)",
+        name: "Qwen2.5 3B Instruct (lite)",
         filename: "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
         url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
         size_mb: 2020,
-        note: "Best structured-output quality at a size most machines can run.",
+        note: "Lightest download; fast and runs on most machines. Less reliable on multi-step edits and dates.",
     },
     ModelInfo {
         id: "qwen2.5-7b-instruct-q4_k_m",
-        name: "Qwen2.5 7B Instruct (most reliable)",
+        name: "Qwen2.5 7B Instruct (recommended)",
         filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         size_mb: 4680,
-        note: "Best instruction-following and accuracy; needs ~6 GB RAM and is slower.",
+        note: "Recommended — the most reliable multi-step parsing; needs ~6 GB RAM and is a bit slower.",
     },
     ModelInfo {
-        id: "qwen2.5-1.5b-instruct-q4_k_m",
-        name: "Qwen2.5 1.5B Instruct (lite)",
-        filename: "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-        url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-        size_mb: 1010,
-        note: "For weaker machines; lighter and faster, slightly less reliable.",
+        id: "qwen2.5-14b-instruct-q4_k_m",
+        name: "Qwen2.5 14B Instruct (most powerful)",
+        filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        url: "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        size_mb: 8990,
+        note: "Highest accuracy for a strong machine; needs ~12 GB RAM and is the slowest.",
     },
 ];
 

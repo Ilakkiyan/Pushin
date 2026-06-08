@@ -17,8 +17,13 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "habits" | "booking" | "settings";
+type View = "calendar" | "projects" | "habits" | "booking" | "settings";
 type CalMode = "week" | "month";
+
+// One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
+// conversation survives navigating away from the calendar; it lives only for the session and
+// is gone when the app closes.
+export type ChatMsg = { role: "user" | "ai"; text: string };
 
 interface State {
   loaded: boolean;
@@ -40,6 +45,10 @@ interface State {
   focusDateIso: string | null;
   habits: HabitStats[];
 
+  // Chat transcript, persisted for the session so it isn't lost on page/settings changes.
+  chatMessages: ChatMsg[];
+  setChatMessages: (m: ChatMsg[] | ((prev: ChatMsg[]) => ChatMsg[])) => void;
+
   setView: (v: View) => void;
   setCalMode: (m: CalMode) => void;
   setFocusDate: (iso: string | null) => void;
@@ -54,9 +63,11 @@ interface State {
   scheduleHabit: (id: number, day?: string | null) => Promise<void>;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
-  createTask: (title: string, minutes: number, deadline: string | null, priority: number) => Promise<void>;
+  createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
   setTaskStatus: (id: number, status: string) => Promise<void>;
   deleteTask: (id: number) => Promise<void>;
+  deleteProject: (id: number) => Promise<void>;
+  setProjectArchived: (id: number, archived: boolean) => Promise<void>;
   addEvent: (title: string, start: string, end: string, kind: string) => Promise<void>;
   deleteEvent: (id: number) => Promise<void>;
   moveBlock: (id: number, start: string, end: string) => Promise<void>;
@@ -125,6 +136,9 @@ export const useStore = create<State>((set, get) => {
     calMode: "week",
     focusDateIso: null,
     habits: [],
+    chatMessages: [],
+
+    setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
 
     setView: (v) => set({ view: v }),
     setCalMode: (m) => set({ calMode: m }),
@@ -172,10 +186,12 @@ export const useStore = create<State>((set, get) => {
       }
     },
 
-    createTask: (title, minutes, deadline, priority) =>
-      mutate(() => api.createTask(title, minutes, deadline, priority, null)),
+    createTask: (title, minutes, deadline, priority, projectId = null) =>
+      mutate(() => api.createTask(title, minutes, deadline, priority, projectId)),
     setTaskStatus: (id, status) => mutate(() => api.setTaskStatus(id, status)),
     deleteTask: (id) => mutate(() => api.deleteTask(id)),
+    deleteProject: (id) => mutate(() => api.deleteProject(id)),
+    setProjectArchived: (id, archived) => mutate(() => api.setProjectArchived(id, archived)),
     addEvent: (title, start, end, kind) => mutate(() => api.addEvent(title, start, end, kind)),
     deleteEvent: (id) => mutate(() => api.deleteEvent(id)),
     moveBlock: (id, start, end) => mutate(() => api.lockBlock(id, true, start, end)),

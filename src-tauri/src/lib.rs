@@ -1,12 +1,14 @@
 mod booking;
 mod calendar;
 mod commands;
-mod db;
+// Public so the LLM-evaluation harness (`tests/llm_eval.rs`) can drive the real parsing
+// pipeline against a live llama-server. No external consumers otherwise.
+pub mod db;
 mod habits;
 mod llm;
-mod model;
+pub mod model;
 mod model_manager;
-mod parser;
+pub mod parser;
 mod scheduler;
 
 use commands::AppState;
@@ -43,6 +45,8 @@ pub fn run() {
             commands::create_task,
             commands::set_task_status,
             commands::delete_task,
+            commands::delete_project,
+            commands::set_project_archived,
             commands::add_event,
             commands::delete_event,
             commands::lock_block,

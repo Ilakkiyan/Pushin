@@ -4,17 +4,20 @@ import TopBar from "./components/TopBar";
 import ConflictBanner from "./components/ConflictBanner";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
+import ProjectsPane from "./panes/ProjectsPane";
 import HabitsPane from "./panes/HabitsPane";
 import ChatPane from "./panes/ChatPane";
 import TaskListPane from "./panes/TaskListPane";
 import BookingPane from "./panes/BookingPane";
 import SettingsPane from "./panes/SettingsPane";
+import OnboardingModal from "./components/OnboardingModal";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
   const view = useStore((s) => s.view);
   const calMode = useStore((s) => s.calMode);
   const load = useStore((s) => s.load);
+  const onboarded = useStore((s) => s.settings?.onboarded ?? true);
 
   useEffect(() => {
     load();
@@ -42,10 +45,12 @@ export default function App() {
             </aside>
           </>
         )}
+        {view === "projects" && <ProjectsPane />}
         {view === "habits" && <HabitsPane />}
         {view === "booking" && <BookingPane />}
         {view === "settings" && <SettingsPane />}
       </main>
+      {!onboarded && <OnboardingModal />}
     </div>
   );
 }

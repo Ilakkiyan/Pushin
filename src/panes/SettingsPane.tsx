@@ -1,8 +1,40 @@
 import { useState } from "react";
-import { Calendar, Check, Cpu, RefreshCw } from "lucide-react";
+import { BookOpen, Calendar, Check, Cpu, ExternalLink, Github, Moon, RefreshCw } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { type Settings } from "../lib/ipc";
+import { CommitmentList, SleepFields } from "../components/Personalization";
+
+const REPO_URL = "https://github.com/Ilakkiyan/Pushin";
+const DOCS = {
+  repo: REPO_URL,
+  googleSetup: `${REPO_URL}#google-calendar-sync-optional`,
+  troubleshooting: `${REPO_URL}#troubleshooting`,
+};
+
+/** Open a URL in the user's default browser (Tauri opener), with a web fallback for `vite` preview. */
+function openExternal(url: string) {
+  openUrl(url).catch(() => window.open(url, "_blank", "noopener,noreferrer"));
+}
+
+/** Anchor that opens externally via the OS browser instead of navigating the app webview. */
+function ExtLink({ href, className, children }: { href: string; className?: string; children: React.ReactNode }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(e) => {
+        e.preventDefault();
+        openExternal(href);
+      }}
+      className={className}
+    >
+      {children}
+    </a>
+  );
+}
 
 const DAYS = [
   { n: 1, l: "Mon" },
@@ -115,6 +147,19 @@ export default function SettingsPane() {
           </div>
         </section>
 
+        {/* Personal routine: sleep + recurring blocked time the scheduler & AI plan around */}
+        <section className="space-y-4">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><Moon className="size-4 text-indigo-400" /> Your routine</h2>
+          <p className="text-xs text-gray-500">
+            Time the scheduler keeps free and the AI plans around. Sleep, meals, gym, commute — whatever's yours.
+          </p>
+          <SleepFields enabled={form.sleepEnabled} start={form.sleepStart} end={form.sleepEnd} onChange={update} />
+          <div className="space-y-2">
+            <span className="text-xs text-gray-400">Routines & blocked time</span>
+            <CommitmentList items={form.commitments} onChange={(commitments) => update({ commitments })} />
+          </div>
+        </section>
+
         {/* AI model */}
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Cpu className="size-4 text-fuchsia-400" /> On-device AI</h2>
@@ -144,11 +189,24 @@ export default function SettingsPane() {
 
           {!form.googleConnected && (
             <>
-              <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-[11px] text-gray-400 leading-relaxed">
-                <span className="text-gray-200">One-time setup:</span> in{" "}
-                <a className="text-sky-400 underline" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud Console</a>{" "}
-                → enable the <span className="text-gray-300">Google Calendar API</span>, configure the OAuth consent screen (add yourself as a
-                test user), then create an <span className="text-gray-300">OAuth client ID → Desktop app</span>. Paste the Client ID/secret below.
+              <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-[11px] text-gray-400 leading-relaxed space-y-1.5">
+                <p className="text-gray-200">One-time setup in the{" "}
+                  <ExtLink className="text-sky-400 underline" href="https://console.cloud.google.com/">Google Cloud Console</ExtLink>:</p>
+                <ol className="list-decimal pl-4 space-y-1">
+                  <li>Create or pick a project.</li>
+                  <li>Enable the <span className="text-gray-300">Google Calendar API</span> (APIs &amp; Services → Library).</li>
+                  <li>Configure the OAuth consent screen: <span className="text-gray-300">External</span>, and add your Gmail under <span className="text-gray-300">Test users</span>.</li>
+                  <li>Create credentials → OAuth client ID → <span className="text-gray-300">Application type: Desktop app</span> (not Web).</li>
+                  <li>Copy the Client ID &amp; secret into the fields below.</li>
+                  <li>After connecting, <span className="text-gray-300">Publish app</span> (consent screen → Production) so sync doesn't expire after 7 days.</li>
+                </ol>
+                <p className="pt-0.5">
+                  When the browser opens, you'll see <span className="text-gray-300">"Google hasn't verified this app"</span> — that's expected for your own
+                  app. Click <span className="text-gray-300">Advanced → Go to Pushin (unsafe)</span> to continue. It's safe: this is the client <em>you</em> just
+                  created, and the exchange happens locally on your machine.
+                </p>
+                <p className="text-gray-500">Full walkthrough &amp; troubleshooting in the{" "}
+                  <ExtLink className="text-sky-400 underline" href={DOCS.googleSetup}>project README</ExtLink>.</p>
               </div>
               <Field label="OAuth Client ID">
                 <input value={form.googleClientId} onChange={(e) => update({ googleClientId: e.target.value })} placeholder="xxxxx.apps.googleusercontent.com" className={inputCls} />
@@ -178,6 +236,25 @@ export default function SettingsPane() {
 
           {googleMsg && <p className="text-xs text-gray-400">{googleMsg}</p>}
           {syncMsg && <p className="text-xs text-gray-400">{syncMsg}</p>}
+        </section>
+
+        {/* Documentation */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><BookOpen className="size-4 text-emerald-400" /> Documentation</h2>
+          <p className="text-xs text-gray-500">
+            Setup guides, the full Google Calendar walkthrough, and troubleshooting live on GitHub — they open in your browser.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <ExtLink href={DOCS.repo} className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
+              <Github className="size-3.5" /> GitHub repository
+            </ExtLink>
+            <ExtLink href={DOCS.googleSetup} className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
+              <ExternalLink className="size-3.5" /> Google Calendar setup
+            </ExtLink>
+            <ExtLink href={DOCS.troubleshooting} className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
+              <ExternalLink className="size-3.5" /> Troubleshooting
+            </ExtLink>
+          </div>
         </section>
 
         <div className="flex items-center gap-3 pt-2">

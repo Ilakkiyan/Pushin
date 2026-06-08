@@ -189,6 +189,24 @@ pub fn delete_task(state: State<AppState>, id: i64) -> Result<ScheduleResult, St
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
+// ---------- projects ----------
+
+#[tauri::command]
+pub fn delete_project(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    db::delete_project(&conn, id).map_err(err)?;
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_project_archived(state: State<AppState>, id: i64, archived: bool) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    db::set_project_archived(&conn, id, archived).map_err(err)?;
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
 // ---------- events & blocks ----------
 
 #[tauri::command]
@@ -303,9 +321,9 @@ pub fn update_habit(
     habit_stats(&conn).map_err(err)
 }
 
-/// Drop a habit onto the calendar for a day (default today), slotting it into a free gap
-/// near the end of the day. Creates a `kind = "habit"` event so the task scheduler plans
-/// around it, then re-plans.
+/// Drop a habit onto the calendar for a day (default today), tucking it into the best-fitting
+/// free gap around existing events/blocks (see `habits::find_habit_slot`). Creates a
+/// `kind = "habit"` event so the task scheduler plans around it, then re-plans.
 #[tauri::command]
 pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<ScheduleResult, String> {
     const DAY_START_H: u32 = 7;

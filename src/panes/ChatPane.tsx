@@ -3,8 +3,6 @@ import { Send, Sparkles } from "lucide-react";
 import { useStore } from "../state/store";
 import InferenceSetup from "../components/InferenceSetup";
 
-type Msg = { role: "user" | "ai"; text: string };
-
 const EXAMPLES = [
   "Launch a side project in 3 weeks: design a logo, build a landing page, write 3 blog posts, set up analytics.",
   "Prep for my exam next Friday: review 4 chapters, do 2 practice tests, make a cheat sheet.",
@@ -14,7 +12,9 @@ export default function ChatPane() {
   const llm = useStore((s) => s.llm);
   const busy = useStore((s) => s.busy);
   const plan = useStore((s) => s.plan);
-  const [messages, setMessages] = useState<Msg[]>([]);
+  // Transcript lives in the store so it persists across page/settings changes (cleared on app close).
+  const messages = useStore((s) => s.chatMessages);
+  const setMessages = useStore((s) => s.setChatMessages);
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 

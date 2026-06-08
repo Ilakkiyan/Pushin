@@ -260,7 +260,42 @@ fn fmt_dur(mins: i64) -> String {
     }
 }
 
-fn system_prompt(events: &[Event]) -> String {
+/// Short, human-readable summary of the user's sleep + recurring commitments, so the model
+/// knows what time is already spoken for. The deterministic scheduler enforces these; this just
+/// gives the model context (e.g. so it won't propose a 3am meeting or re-ask about lunch).
+fn routine_summary(s: &Settings) -> String {
+    const ABBR: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut lines: Vec<String> = Vec::new();
+    if s.sleep_enabled && !s.sleep_start.is_empty() && !s.sleep_end.is_empty() {
+        lines.push(format!("- Sleep {}-{}", s.sleep_start, s.sleep_end));
+    }
+    for c in &s.commitments {
+        if c.start.is_empty() || c.end.is_empty() {
+            continue;
+        }
+        let when = if c.days.is_empty() {
+            "daily".to_string()
+        } else {
+            c.days
+                .iter()
+                .filter_map(|d| ABBR.get((*d as usize).wrapping_sub(1)).copied())
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        let name = if c.name.is_empty() { "Blocked" } else { &c.name };
+        lines.push(format!("- {} {}-{} ({})", name, c.start, c.end, when));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "The user's routine — already reserved, plan around it and never schedule work here:\n{}\n",
+            lines.join("\n")
+        )
+    }
+}
+
+fn system_prompt(events: &[Event], settings: &Settings) -> String {
     let now = Local::now().naive_local();
 
     // Show the model what's already on the calendar — with each event's day, time range,
@@ -318,6 +353,7 @@ If no day is given, assume today; don't ask.\n\
 - Never output the same item twice.\n\
 - Only output items from THIS message. The examples below are formatting samples — never copy \
 their titles (e.g. \"Blog\", \"Pick platform\") unless the user actually mentions them.\n\
+{routine}\
 Events already on the calendar (reference these to change or remove them):\n\
 {calendar}\n\
 Examples:\n\
@@ -330,6 +366,7 @@ user: exercise daily → {{\"habits\":[{{\"name\":\"Exercise\",\"durationMinutes
 user: plan a blog - pick platform, write posts → {{\"projects\":[{{\"name\":\"Blog\",\"tasks\":[{{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}}]}}]}}",
         now = now.format("%Y-%m-%d %H:%M"),
         weekday = now.format("%A"),
+        routine = routine_summary(settings),
         calendar = calendar,
     )
 }
@@ -343,7 +380,7 @@ pub async fn plan(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<ParsedPlan> {
-    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt(current_events) })];
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt(current_events, settings) })];
     for turn in history.iter().rev().take(6).rev() {
         let role = if turn.role == "assistant" { "assistant" } else { "user" };
         messages.push(json!({ "role": role, "content": turn.content }));
@@ -360,9 +397,11 @@ pub async fn plan(
     .await?;
 
     let mut parsed: ParsedPlan = serde_json::from_value(raw)?;
+    let today = Local::now().naive_local().date();
     unescape_plan(&mut parsed);
     resolve_task_deadlines(&mut parsed);
-    backfill_event_fields(&mut parsed, user_text, Local::now().naive_local().date());
+    backfill_task_fields(&mut parsed, user_text, today);
+    backfill_event_fields(&mut parsed, user_text, today);
     route_recurring_to_habits(&mut parsed, user_text);
     Ok(parsed)
 }
@@ -666,6 +705,42 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
         }
     }
 
+    // Explicit-date trip ("from 6/12 … for two weeks"): the model often emits the create PLUS
+    // several self-updates of the same event, which makes the single-event span logic below bail.
+    // Collapse to one all-day spanning event and drop the redundant updates. (Named-weekday ranges
+    // are handled by the block above; this covers numeric spans with an explicit/own date.)
+    if let Some(sp) = span.filter(|_| single_subject && weekday_span.is_none()) {
+        if !plan.events.is_empty() {
+            let title = {
+                let ev = &mut plan.events[0];
+                ev.span_days = Some(sp);
+                if let Some(d) = &date_str {
+                    ev.date = Some(d.clone());
+                }
+                ev.title.clone()
+            };
+            let mut seen = HashSet::new();
+            plan.events.retain(|e| seen.insert(e.title.to_lowercase()));
+            plan.update_events.retain(|u| !event_matches(&title, &u.target));
+        }
+    }
+
+    // Multiple events, each with its OWN range in reading order ("lunch 12-2 and a party 6-10")
+    // → assign ranges to events positionally. The single-target logic below bails on multiple
+    // events, so without this each collapses to the 60-min default. Gated to equal counts (and no
+    // edits/removes) so a stray time can't shift the mapping.
+    let all_ranges = find_time_ranges(user_text);
+    if plan.update_events.is_empty() && plan.remove_events.is_empty() && plan.events.len() >= 2 && plan.events.len() == all_ranges.len() {
+        for (ev, (start_norm, end_raw)) in plan.events.iter_mut().zip(all_ranges.iter()) {
+            if unset(&ev.start_time) {
+                ev.start_time = Some(start_norm.format("%H:%M").to_string());
+            }
+            if unset(&ev.end_time) {
+                ev.end_time = Some(end_raw.clone());
+            }
+        }
+    }
+
     // Only act when there's a single, unambiguous target, so a range/length is never
     // mis-assigned across multiple events in one message. (Counts reflect the collapse above.)
     let single_create = plan.events.len() == 1 && plan.update_events.is_empty() && plan.remove_events.is_empty();
@@ -773,6 +848,91 @@ fn resolve_task_deadlines(plan: &mut ParsedPlan) {
                 .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
                 .and_then(parse_dt)
                 .map(fmt_dt);
+        }
+    }
+}
+
+/// Deadline dates stated in the user's text, resolved in Rust (the model is unreliable at dates,
+/// and the `deadline` field's format is never shown to it, so its values are usually dropped).
+/// Recognizes a keyword ("due/by/before/deadline") followed within a few words by a day word or
+/// `M/D` date, plus relative forms ("in 3 weeks", "within 5 days"). Distinct + sorted.
+fn find_deadline_dates(text: &str, today: NaiveDate) -> Vec<NaiveDate> {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '/').filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<NaiveDate> = Vec::new();
+
+    for (i, tok) in toks.iter().enumerate() {
+        if !matches!(*tok, "due" | "by" | "before" | "deadline") {
+            continue;
+        }
+        // Look a few tokens ahead for the first day word or explicit date.
+        for t in toks.iter().skip(i + 1).take(4) {
+            if let Some(d) = resolve_day(today, t).or_else(|| find_explicit_date(t, today)) {
+                out.push(d);
+                break;
+            }
+        }
+    }
+    // Relative deadlines: "in 3 weeks", "within 5 days", "in a week".
+    for w in toks.windows(3) {
+        if w[0] == "in" || w[0] == "within" {
+            if let Some(n) = w[1].parse::<i64>().ok().or_else(|| word_number(w[1])) {
+                let days = match w[2] {
+                    "day" | "days" => Some(n),
+                    "week" | "weeks" => Some(n * 7),
+                    _ => None,
+                };
+                if let Some(d) = days.filter(|d| *d > 0 && *d <= 365) {
+                    out.push(today + Duration::days(d));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Recover the task fields the small model gets wrong, the same way we recover event fields —
+/// from the user's own words, deterministically:
+///   • **Deadline** — a single deadline stated in the text applies to every task that lacks one
+///     ("prep for the exam friday: review chapters, do practice tests" → both due Friday).
+///   • **Estimate** — for a lone task, an explicit length in the text ("study about 3 hours")
+///     overrides the model's guess (which defaults to 60). Gated to a single task with no
+///     competing event so a duration is never mis-assigned.
+fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
+    let total: usize = plan.projects.iter().map(|p| p.tasks.len()).sum();
+    if total == 0 {
+        return;
+    }
+    let task_only = plan.events.is_empty() && plan.update_events.is_empty();
+    let mut deadlines = find_deadline_dates(text, today);
+    // Fallback: in a message that's purely about tasks, a lone day word is the deadline
+    // ("prep for my exam friday: review chapters…" → due Friday). Gated to task-only + exactly
+    // one day so an event's day is never mistaken for a deadline.
+    if deadlines.is_empty() && task_only {
+        let days = find_day_phrases(text);
+        if days.len() == 1 {
+            if let Some(d) = resolve_day(today, &days[0]) {
+                deadlines.push(d);
+            }
+        }
+    }
+    if deadlines.len() == 1 {
+        let dl = fmt_dt(deadlines[0].and_hms_opt(23, 59, 0).unwrap());
+        for proj in &mut plan.projects {
+            for t in &mut proj.tasks {
+                if t.deadline.as_deref().and_then(parse_dt).is_none() {
+                    t.deadline = Some(dl.clone());
+                }
+            }
+        }
+    }
+    if total == 1 && plan.events.is_empty() && plan.update_events.is_empty() {
+        if let Some(d) = find_duration_minutes(text) {
+            if let Some(t) = plan.projects.iter_mut().flat_map(|p| p.tasks.iter_mut()).next() {
+                t.estimated_minutes = d;
+            }
         }
     }
 }
@@ -902,10 +1062,11 @@ fn parse_time_at(chars: &[char], start: usize) -> Option<TimeTok> {
     })
 }
 
-/// Find a time RANGE ("12-2", "2pm to 4pm", "3:30–5") in free text.
-/// Returns (start normalized to 24h, the verbatim end slice). The end is returned raw so
-/// the existing `compute_end` PM-recovery still handles "12-2" → 14:00, overnight, etc.
-fn find_time_range(text: &str) -> Option<(NaiveTime, String)> {
+/// Find ALL time ranges ("12-2", "2pm to 4pm", "3:30–5") in free text, in reading order.
+/// Each is (start normalized to 24h, the verbatim end slice). The end is returned raw so the
+/// existing `compute_end` PM-recovery still handles "12-2" → 14:00, overnight, etc. Both ends of
+/// a matched range are consumed, so "lunch 12-2 and a party 6-10" yields two distinct ranges.
+fn find_time_ranges(text: &str) -> Vec<(NaiveTime, String)> {
     let chars: Vec<char> = strip_iso_dates(text).chars().collect();
     let mut toks: Vec<TimeTok> = Vec::new();
     let mut i = 0;
@@ -919,13 +1080,23 @@ fn find_time_range(text: &str) -> Option<(NaiveTime, String)> {
         }
         i += 1;
     }
-    for w in toks.windows(2) {
-        let gap: String = chars[w[0].end..w[1].start].iter().collect();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k + 1 < toks.len() {
+        let gap: String = chars[toks[k].end..toks[k + 1].start].iter().collect();
         if is_range_gap(&gap) {
-            return Some((w[0].norm, w[1].raw.clone()));
+            out.push((toks[k].norm, toks[k + 1].raw.clone()));
+            k += 2; // consume both ends so the next range starts fresh
+        } else {
+            k += 1;
         }
     }
-    None
+    out
+}
+
+/// The first time range in the text (the common single-event case).
+fn find_time_range(text: &str) -> Option<(NaiveTime, String)> {
+    find_time_ranges(text).into_iter().next()
 }
 
 /// Fuzzy match an existing event title against a user-provided needle (bidirectional
@@ -1322,6 +1493,12 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         if ev.title.trim().is_empty() || habit_lc.contains(&ev.title.trim().to_lowercase()) {
             continue;
         }
+        // Phantom-duplicate guard: the 3B sometimes both edits an event AND emits a near-duplicate
+        // create (e.g. updates "Dentist" but also creates "Dentist (original)"). If this create
+        // fuzzy-matches something we just updated or removed this turn, drop it.
+        if updated_event_titles.iter().chain(removed_event_titles.iter()).any(|t| event_matches(&ev.title, t)) {
+            continue;
+        }
         // Edit routed as a create: same title exists → merge the change in (keep unspecified fields).
         if let Some(existing) = current.iter_mut().find(|x| x.title.eq_ignore_ascii_case(&ev.title)) {
             let (t, s, e) = merge_event(existing, now, ev.day.as_deref(), ev.date.as_deref(), ev.start_time.as_deref(), ev.end_time.as_deref(), ev.duration_minutes, ev.span_days, None);
@@ -1529,6 +1706,36 @@ mod tests {
     }
 
     #[test]
+    fn multi_event_ranges_assigned_positionally() {
+        let now = NaiveDate::from_ymd_opt(2026, 6, 3).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let dur = |e: &ParsedEvent| {
+            let (s, en) = resolve_event(now, e).unwrap();
+            (en - s).num_minutes()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+
+        // Two events + two ranges, model dropped both end times → assign in reading order.
+        let mut lunch = ev("friday", Some("12:00"), None);
+        lunch.title = "Lunch with mom".into();
+        let mut party = ev("friday", Some("18:00"), None);
+        party.title = "Graduation party".into();
+        let mut plan = ParsedPlan { events: vec![lunch, party], ..Default::default() };
+        backfill_event_fields(&mut plan, "lunch with mom friday 12-2 and a graduation party from 6-10", today);
+        assert_eq!(dur(&plan.events[0]), 120); // 12–2
+        assert_eq!(dur(&plan.events[1]), 240); // 6–10
+
+        // Count mismatch (two events, one range) → ambiguous, leave both alone.
+        let mut a = ev("friday", Some("12:00"), None);
+        a.title = "Lunch".into();
+        let mut b = ev("friday", Some("15:00"), None);
+        b.title = "Call".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        backfill_event_fields(&mut plan, "lunch 12-2 and a call", today);
+        assert_eq!(plan.events[0].end_time, None);
+        assert_eq!(plan.events[1].end_time, None);
+    }
+
+    #[test]
     fn event_duration_handles_pm_less_end() {
         let now = NaiveDate::from_ymd_opt(2026, 6, 3).unwrap().and_hms_opt(9, 0, 0).unwrap();
         let dur = |st, et| {
@@ -1540,6 +1747,103 @@ mod tests {
         assert_eq!(dur("12:00", Some("14:00")), 120); // clean end stays correct
         assert_eq!(dur("18:00", Some("10pm")), 240); // "10pm" parsed directly
         assert_eq!(dur("12:00", None), 60); // no end → 60min default
+    }
+
+    #[test]
+    fn finds_deadlines_in_text() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(); // a Monday
+        let thu = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
+        assert_eq!(find_deadline_dates("review 4 chapters due thursday", today), vec![thu]);
+        assert_eq!(find_deadline_dates("finish the slides before friday", today), vec![NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()]);
+        assert_eq!(find_deadline_dates("submit by 6/15", today), vec![NaiveDate::from_ymd_opt(2026, 6, 15).unwrap()]);
+        assert_eq!(find_deadline_dates("launch in 3 weeks", today), vec![today + Duration::days(21)]);
+        assert_eq!(find_deadline_dates("ship within 5 days", today), vec![today + Duration::days(5)]);
+        // No deadline keyword / not a date → nothing.
+        assert_eq!(find_deadline_dates("write three blog posts", today), Vec::<NaiveDate>::new());
+        assert_eq!(find_deadline_dates("meet me by the door", today), Vec::<NaiveDate>::new());
+        // Two distinct deadlines are surfaced (caller decides not to guess).
+        assert_eq!(find_deadline_dates("X due tuesday and Y due friday", today).len(), 2);
+    }
+
+    #[test]
+    fn backfill_applies_single_deadline_to_all_tasks() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let mk = |titles: &[&str]| ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Exam".into(),
+                tasks: titles.iter().map(|t| ParsedTask { title: (*t).into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() }).collect(),
+            }],
+            ..Default::default()
+        };
+
+        // One deadline phrase → every task inherits it (end of that day).
+        let mut plan = mk(&["Review chapters", "Practice test"]);
+        backfill_task_fields(&mut plan, "prep for the exam: review chapters and a practice test, all due friday", today);
+        let fri = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        for t in &plan.projects[0].tasks {
+            assert_eq!(t.deadline.as_deref().and_then(parse_dt), Some(fri));
+        }
+
+        // A deadline the model already set correctly is left untouched.
+        let mut plan = mk(&["A", "B"]);
+        plan.projects[0].tasks[0].deadline = Some("2026-06-10T17:00:00".into());
+        backfill_task_fields(&mut plan, "do these by friday", today);
+        assert_eq!(plan.projects[0].tasks[0].deadline.as_deref(), Some("2026-06-10T17:00:00")); // kept
+        assert!(plan.projects[0].tasks[1].deadline.is_some()); // filled
+
+        // Two conflicting deadlines in the message → don't guess, set none.
+        let mut plan = mk(&["A", "B"]);
+        backfill_task_fields(&mut plan, "A due tuesday and B due friday", today);
+        assert!(plan.projects[0].tasks.iter().all(|t| t.deadline.is_none()));
+
+        // Keyword-less but task-only with a lone day word → that day is the deadline.
+        let mut plan = mk(&["Review chapters", "Practice test"]);
+        backfill_task_fields(&mut plan, "prep for my exam friday: review chapters and a practice test", today);
+        let fri = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        assert!(plan.projects[0].tasks.iter().all(|t| t.deadline.as_deref().and_then(parse_dt) == Some(fri)));
+
+        // …but a day word alongside an EVENT is not a task deadline (it's the event's day).
+        let mut plan = mk(&["Finish slides"]);
+        plan.events.push(ev("friday", Some("14:00"), Some("15:00")));
+        backfill_task_fields(&mut plan, "dentist friday at 2pm and finish the slides", today);
+        assert!(plan.projects[0].tasks[0].deadline.is_none());
+    }
+
+    #[test]
+    fn backfill_sets_single_task_estimate_from_text() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let one = || ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Study".into(),
+                tasks: vec![ParsedTask { title: "Study for exam".into(), estimated_minutes: 60, priority: "high".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+
+        // Lone task + explicit length → trust the user's number over the model's 60-min default.
+        let mut plan = one();
+        backfill_task_fields(&mut plan, "study for the exam, about 3 hours", today);
+        assert_eq!(plan.projects[0].tasks[0].estimated_minutes, 180);
+
+        // Two tasks → ambiguous, don't reassign a single duration.
+        let mut plan = ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "P".into(),
+                tasks: vec![
+                    ParsedTask { title: "A".into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() },
+                    ParsedTask { title: "B".into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() },
+                ],
+            }],
+            ..Default::default()
+        };
+        backfill_task_fields(&mut plan, "spend 2 hours total on these", today);
+        assert!(plan.projects[0].tasks.iter().all(|t| t.estimated_minutes == 60));
+
+        // A competing event in the same message → leave the task estimate alone.
+        let mut plan = one();
+        plan.events.push(ev("today", Some("15:00"), Some("16:00")));
+        backfill_task_fields(&mut plan, "meeting 3-4pm and study for 2 hours", today);
+        assert_eq!(plan.projects[0].tasks[0].estimated_minutes, 60);
     }
 
     #[test]
@@ -1816,6 +2120,39 @@ mod tests {
         let (s, en) = resolve_event(mon.and_hms_opt(9, 0, 0).unwrap(), &plan.events[0]).unwrap();
         assert_eq!(s, NaiveDate::from_ymd_opt(2026, 6, 10).unwrap().and_hms_opt(0, 0, 0).unwrap());
         assert_eq!(en, NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(0, 0, 0).unwrap()); // covers Wed+Thu
+    }
+
+    #[test]
+    fn explicit_date_trip_collapses_create_plus_self_updates() {
+        // The reported live failure: "from 6/12 … for two weeks" → the model emitted one create
+        // plus several self-updates of the same event, defeating the single-event span logic.
+        let now = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let mut trip = ev("today", None, None);
+        trip.title = "Stay in Vietnam".into();
+        trip.day = None;
+        let upd = |t: &str| UpdateEvent {
+            target: t.into(),
+            title: None,
+            day: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+        };
+        let mut plan = ParsedPlan {
+            events: vec![trip],
+            update_events: vec![upd("Stay in Vietnam"), upd("Stay in Vietnam"), upd("Stay in Vietnam")],
+            ..Default::default()
+        };
+        backfill_event_fields(&mut plan, "from 6/12 i will be staying in vietnam for two weeks", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+
+        assert_eq!(plan.events.len(), 1);
+        assert!(plan.update_events.is_empty(), "redundant self-updates should be dropped");
+        assert_eq!(plan.events[0].span_days, Some(14));
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-12"));
+        let (s, e) = resolve_event(now, &plan.events[0]).unwrap();
+        assert_eq!((e - s).num_days(), 14); // all-day, two weeks
     }
 
     #[test]
