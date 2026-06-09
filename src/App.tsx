@@ -6,6 +6,7 @@ import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
 import HabitsPane from "./panes/HabitsPane";
+import HermesPane from "./panes/HermesPane";
 import ChatPane from "./panes/ChatPane";
 import TaskListPane from "./panes/TaskListPane";
 import BookingPane from "./panes/BookingPane";
@@ -47,6 +48,7 @@ export default function App() {
         )}
         {view === "projects" && <ProjectsPane />}
         {view === "habits" && <HabitsPane />}
+        {view === "hermes" && <HermesPane />}
         {view === "booking" && <BookingPane />}
         {view === "settings" && <SettingsPane />}
       </main>

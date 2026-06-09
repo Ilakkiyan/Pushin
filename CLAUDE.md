@@ -37,7 +37,8 @@ Rust core
   ├─ scheduler     : the IP — dependency DAG + EDF/priority greedy + chunking + conflicts; parse_dt/fmt_dt
   ├─ calendar/google : OAuth(PKCE loopback) + token refresh + two-way sync
   ├─ booking       : availability via scheduler free-slots (booking-page seam)
-  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings
+  ├─ hermes        : memory layer ("second brain") — note embeddings + cosine/keyword recall
+  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes
        │ spawns child process              │ OAuth + HTTPS
        ▼                                    ▼
   llama-server (GGUF, Metal)          Google Calendar API v3 (optional)
@@ -148,6 +149,35 @@ Rust core
   API enabled; self added as test user). Steps are in `README.md`. **This was built but NOT tested
   live** (no credentials in dev) — first connect is the real test; likely first snags are missing
   test-user or un-enabled Calendar API (readable errors surface in Settings).
+
+---
+
+## Hermes — the memory layer / "second brain" (`hermes.rs`, `notes` table)
+The user's chosen direction: grow Pushin into a second brain. **v1 (built) = notes + recall.** Design
+follows the locked decisions (on-device, deterministic core):
+- **Storage:** `notes` table (migration `0006_notes.sql`); embeddings are little-endian f32 BLOBs in
+  the `embedding` column, NULL until indexed. `Note` never serializes the vector to the frontend
+  (just an `indexed` flag, plus a `score` on recall results).
+- **Embeddings = all-in-one, zero setup:** Pushin runs a **second `llama-server` in `--embeddings`
+  mode** on `EMBED_PORT` (8181), serving a tiny auto-downloaded model (`EMBED_MODEL` =
+  bge-small-en-v1.5 Q8, ~37 MB, 384-dim). `ensure_embeddings` (idempotent, best-effort) downloads it
+  + spawns the server; it's triggered from `store.load()`, after "Start the AI", and on opening the
+  Hermes pane. Second child lives in `AppState.embed_server`, killed on exit alongside the chat one.
+  Hermes embeds via `model_manager::embed_base_url()` (NOT `llm_base_url`); `Settings.embed_model` is
+  just the (cosmetic) request name, empty = semantic off.
+- **Recall = graceful degradation:** `hermes_recall` embeds the query and ranks indexed notes by
+  **cosine**; if embeddings are unavailable/none indexed it falls back to **keyword** overlap. The
+  result carries `mode: "semantic" | "keyword"` so the UI shows which ran. Notes are always usable.
+- **Async + DB lock:** `hermes_add_note`/`hermes_recall` are async (HTTP). Read settings in a scoped
+  lock, drop it, `await` the embed, then re-lock to write (gotcha #8). Embedding is **best-effort** —
+  a note always saves even if embedding fails (stored unindexed).
+- **Pure + tested:** `cosine`, `keyword_score`, and the f32↔BLOB codec are pure (`cargo test --lib
+  hermes`). The embed HTTP client mirrors `llm.rs` (can't be unit-tested offline).
+- **UI:** `HermesPane` (TopBar "Hermes" 🧠) — capture, recall search (shows mode + % match), notes
+  list with an indexed dot. Embedding model is set in Settings → On-device AI.
+- **Next steps (not built):** auto-recall relevant notes into the planner's context; extract durable
+  facts/preferences from chats; semantic search across tasks/events; re-index notes created before
+  the embed server was up (they stay keyword-only until then).
 
 ---
 

@@ -7,8 +7,8 @@ use crate::model::*;
 use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
 use crate::scheduler::{self, Interval};
-use crate::{db, habits, llm};
-use chrono::{Local, NaiveDate, Timelike};
+use crate::{db, habits, hermes, llm};
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -20,6 +20,8 @@ pub struct AppState {
     pub db: Mutex<Connection>,
     pub http: reqwest::Client,
     pub server: Mutex<Option<Child>>,
+    /// The second llama-server, in embeddings mode, powering Hermes semantic recall.
+    pub embed_server: Mutex<Option<Child>>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -274,9 +276,21 @@ pub fn delete_event_type(state: State<AppState>, id: i64) -> Result<(), String> 
 
 // ---------- habits ----------
 
-/// Load every active habit with its derived streak/consistency metrics.
+/// Load every active habit with its derived streak/consistency metrics, plus how many days from
+/// today forward it's currently dropped on the calendar (drives the "Add to calendar" toggle).
 fn habit_stats(conn: &Connection) -> anyhow::Result<Vec<HabitStats>> {
     let today = Local::now().naive_local().date();
+    // Future habit placements per habit name → distinct day count.
+    let events = db::list_events(conn)?;
+    let scheduled_days = |name: &str| -> i64 {
+        let days: HashSet<NaiveDate> = events
+            .iter()
+            .filter(|e| e.kind == "habit" && e.title.eq_ignore_ascii_case(name))
+            .filter_map(|e| scheduler::parse_dt(&e.start).map(|d| d.date()))
+            .filter(|d| *d >= today)
+            .collect();
+        days.len() as i64
+    };
     db::list_habits(conn)?
         .iter()
         .map(|h| {
@@ -284,7 +298,9 @@ fn habit_stats(conn: &Connection) -> anyhow::Result<Vec<HabitStats>> {
                 .iter()
                 .filter_map(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
                 .collect();
-            Ok(habits::compute_stats(h, &done, today))
+            let mut stat = habits::compute_stats(h, &done, today);
+            stat.scheduled_days = scheduled_days(&h.name);
+            Ok(stat)
         })
         .collect()
 }
@@ -321,33 +337,18 @@ pub fn update_habit(
     habit_stats(&conn).map_err(err)
 }
 
-/// Drop a habit onto the calendar for a day (default today), tucking it into the best-fitting
-/// free gap around existing events/blocks (see `habits::find_habit_slot`). Creates a
-/// `kind = "habit"` event so the task scheduler plans around it, then re-plans.
-#[tauri::command]
-pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<ScheduleResult, String> {
-    const DAY_START_H: u32 = 7;
-    const DAY_END_H: u32 = 22;
+/// Awake window habits are slotted into.
+const HABIT_DAY_START_H: u32 = 7;
+const HABIT_DAY_END_H: u32 = 22;
 
-    let mut conn = state.db.lock().unwrap();
-    let settings = db::get_settings(&conn).map_err(err)?;
-    let now = Local::now().naive_local();
-    let day_date = day
-        .as_deref()
-        .and_then(|s| NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").ok())
-        .unwrap_or_else(|| now.date());
-
-    let habit = db::list_habits(&conn)
-        .map_err(err)?
-        .into_iter()
-        .find(|h| h.id == id)
-        .ok_or_else(|| "habit not found".to_string())?;
-
-    let events = db::list_events(&conn).map_err(err)?;
-
-    // Only add a habit to a given day once — re-plan and return without duplicating.
+/// Drop a habit into the best free gap on `day_date` as a `kind="habit"` event, so the task
+/// scheduler plans around it. No-ops (returns false) if it's already on that day or the day is
+/// too full to fit; returns true when it actually placed one. Does NOT re-plan — the caller
+/// batches a single `reschedule_inner` after placing one or many days.
+fn place_habit_on_day(conn: &Connection, habit: &Habit, day_date: NaiveDate, now: NaiveDateTime) -> anyhow::Result<bool> {
+    let events = db::list_events(conn)?;
     if habits::habit_already_on_day(&events, &habit.name, day_date) {
-        return reschedule_inner(&mut conn, &settings).map_err(err);
+        return Ok(false);
     }
 
     // Everything already on that day becomes "busy" so the habit slots around it.
@@ -364,16 +365,17 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
     for ev in &events {
         collect(&ev.start, &ev.end);
     }
-    for b in db::list_blocks(&conn).map_err(err)? {
+    for b in db::list_blocks(conn)? {
         collect(&b.start, &b.end);
     }
+    drop(collect);
 
     // Awake window for the day; never place in the past when it's today.
-    let mut window_start = day_date.and_hms_opt(DAY_START_H, 0, 0).unwrap();
-    let window_end = day_date.and_hms_opt(DAY_END_H, 0, 0).unwrap();
+    let mut window_start = day_date.and_hms_opt(HABIT_DAY_START_H, 0, 0).unwrap();
+    let window_end = day_date.and_hms_opt(HABIT_DAY_END_H, 0, 0).unwrap();
     if day_date == now.date() {
         let rounded = ((now.hour() as i64 * 60 + now.minute() as i64) + 14) / 15 * 15;
-        let candidate = day_lo + chrono::Duration::minutes(rounded);
+        let candidate = day_lo + Duration::minutes(rounded);
         if candidate > window_start {
             window_start = candidate.min(window_end);
         }
@@ -381,9 +383,63 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
 
     match habits::find_habit_slot(&busy, window_start, window_end, habit.duration_minutes) {
         Some((s, e)) => {
-            db::insert_event(&conn, &habit.name, &scheduler::fmt_dt(s), &scheduler::fmt_dt(e), "habit").map_err(err)?;
+            db::insert_event(conn, &habit.name, &scheduler::fmt_dt(s), &scheduler::fmt_dt(e), "habit")?;
+            Ok(true)
         }
-        None => return Err("No room left in the day to schedule this habit — try another day.".into()),
+        None => Ok(false),
+    }
+}
+
+fn find_habit(conn: &Connection, id: i64) -> Result<Habit, String> {
+    db::list_habits(conn)
+        .map_err(err)?
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| "habit not found".to_string())
+}
+
+/// Drop a habit onto the calendar for a single day (default today), then re-plan.
+#[tauri::command]
+pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    let now = Local::now().naive_local();
+    let day_date = day
+        .as_deref()
+        .and_then(|s| NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").ok())
+        .unwrap_or_else(|| now.date());
+
+    let habit = find_habit(&conn, id)?;
+    let already = habits::habit_already_on_day(&db::list_events(&conn).map_err(err)?, &habit.name, day_date);
+    if !already && !place_habit_on_day(&conn, &habit, day_date, now).map_err(err)? {
+        return Err("No room left in the day to schedule this habit — try another day.".into());
+    }
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
+/// Toggle a habit on/off the calendar across the whole planning period. On: place it in a free
+/// gap on every day from today through the horizon (skipping days it's already on or that are
+/// full). Off: remove its instances from today forward (past days stay as history). Re-plans once.
+#[tauri::command]
+pub fn set_habit_scheduled(state: State<AppState>, id: i64, scheduled: bool) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    let now = Local::now().naive_local();
+    let habit = find_habit(&conn, id)?;
+
+    if scheduled {
+        let horizon = settings.horizon_days.max(1);
+        for d in 0..horizon {
+            let day = now.date() + Duration::days(d);
+            place_habit_on_day(&conn, &habit, day, now).map_err(err)?;
+        }
+    } else {
+        for ev in db::list_events(&conn).map_err(err)? {
+            let future = scheduler::parse_dt(&ev.start).map(|s| s.date() >= now.date()).unwrap_or(false);
+            if ev.kind == "habit" && ev.title.eq_ignore_ascii_case(&habit.name) && future {
+                db::delete_event(&conn, ev.id).map_err(err)?;
+            }
+        }
     }
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
@@ -585,4 +641,143 @@ pub async fn ensure_inference(app: AppHandle, state: State<'_, AppState>) -> Res
         }
         Err(e) => Err(format!("Couldn't start the inference server: {e}")),
     }
+}
+
+// ---------- Hermes (on-device memory layer) ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallResult {
+    /// "semantic" (embedding cosine) or "keyword" (fallback) — so the UI can show which ran.
+    mode: String,
+    notes: Vec<Note>,
+}
+
+#[tauri::command]
+pub fn hermes_list_notes(state: State<AppState>) -> Result<Vec<Note>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_notes(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn hermes_delete_note(state: State<AppState>, id: i64) -> Result<Vec<Note>, String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_note(&conn, id).map_err(err)?;
+    db::list_notes(&conn).map_err(err)
+}
+
+/// Save a note, embedding it on-device (best effort) so it's available for semantic recall. If the
+/// backend has no embeddings endpoint the note is stored unindexed and still found via keyword.
+#[tauri::command]
+pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Result<Vec<Note>, String> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("Note is empty.".into());
+    }
+    // Short lock to read embedding config; dropped before the network call (gotcha #8).
+    let base = model_manager::embed_base_url();
+    let model = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?.embed_model
+    };
+    let blob = if model.trim().is_empty() {
+        None
+    } else {
+        hermes::embed_text(&state.http, &base, &model, &content).await.ok().map(|v| hermes::vec_to_blob(&v))
+    };
+    let conn = state.db.lock().unwrap();
+    db::insert_note(&conn, &content, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
+    db::list_notes(&conn).map_err(err)
+}
+
+/// Recall the notes most relevant to `query`: semantic cosine when embeddings exist, else keyword.
+#[tauri::command]
+pub async fn hermes_recall(state: State<'_, AppState>, query: String, k: Option<i64>) -> Result<RecallResult, String> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(RecallResult { mode: "keyword".into(), notes: vec![] });
+    }
+    let k = k.unwrap_or(5).clamp(1, 50) as usize;
+    let base = model_manager::embed_base_url();
+    let model = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?.embed_model
+    };
+    let qvec = if model.trim().is_empty() {
+        None
+    } else {
+        hermes::embed_text(&state.http, &base, &model, &query).await.ok()
+    };
+    let notes = {
+        let conn = state.db.lock().unwrap();
+        db::notes_for_recall(&conn).map_err(err)?
+    };
+
+    let has_vectors = notes.iter().any(|(_, e)| e.is_some());
+    let (mode, mut ranked): (&str, Vec<Note>) = match (&qvec, has_vectors) {
+        // Semantic: rank the indexed notes by cosine similarity to the query vector.
+        (Some(qv), true) => {
+            let mut scored: Vec<Note> = notes
+                .into_iter()
+                .filter_map(|(mut n, emb)| {
+                    emb.map(|b| {
+                        n.score = Some(hermes::cosine(qv, &hermes::blob_to_vec(&b)));
+                        n
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            ("semantic", scored)
+        }
+        // Keyword fallback: score by term overlap, drop the zero-matches.
+        _ => {
+            let mut scored: Vec<Note> = notes
+                .into_iter()
+                .map(|(mut n, _)| {
+                    n.score = Some(hermes::keyword_score(&n.content, &query));
+                    n
+                })
+                .filter(|n| n.score.unwrap_or(0.0) > 0.0)
+                .collect();
+            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            ("keyword", scored)
+        }
+    };
+    ranked.truncate(k);
+    Ok(RecallResult { mode: mode.into(), notes: ranked })
+}
+
+/// Make Hermes' semantic recall work with zero setup: ensure the small embedding model is
+/// downloaded and the second (embeddings) llama-server is running. Idempotent and safe to call
+/// blindly — callers treat failure as "stay on keyword recall". Downloads happen outside any lock.
+#[tauri::command]
+pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let base = model_manager::embed_base_url();
+    if llm::health(&state.http, &base).await {
+        return Ok("Memory engine ready.".into());
+    }
+    // Reuse the same engine binary as the chat server; fetch the (tiny) embedding model if missing.
+    model_manager::ensure_server_binary(&app, &state.http).await.map_err(err)?;
+    if !model_manager::is_model_present(&app, model_manager::EMBED_MODEL.id) {
+        let _ = app.emit("inference-status", "Setting up memory (one-time ~37 MB)…");
+        model_manager::download_model(app.clone(), state.http.clone(), model_manager::EMBED_MODEL.id.to_string(), String::new())
+            .await
+            .map_err(err)?;
+    }
+    // Spawn the embeddings server if it isn't already running (guard dropped before the await loop).
+    {
+        let mut guard = state.embed_server.lock().unwrap();
+        if guard.is_none() {
+            let child = model_manager::spawn_embed_server(&app).map_err(|e| format!("couldn't start the memory engine: {e}"))?;
+            *guard = Some(child);
+        }
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        if llm::health(&state.http, &base).await {
+            let _ = app.emit("inference-status", "Memory engine ready.");
+            return Ok("Memory engine ready.".into());
+        }
+    }
+    Err("Memory engine is taking a while to start — give it a moment.".into())
 }

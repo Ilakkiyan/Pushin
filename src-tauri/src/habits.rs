@@ -35,6 +35,7 @@ pub fn compute_stats(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate)
         longest_streak: longest_streak(done),
         completion_rate: completion_rate(habit, done, today),
         total_done: done.len() as i64,
+        scheduled_days: 0, // filled in by commands::habit_stats (needs the events table)
         history: history(done, today),
     }
 }

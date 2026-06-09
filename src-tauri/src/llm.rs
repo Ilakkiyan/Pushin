@@ -27,9 +27,9 @@ pub async fn chat_json(
     schema: Value,
 ) -> Result<Value> {
     let base = base_url.trim_end_matches('/');
-    let body = json!({
+    let mut body = json!({
         "model": model,
-        "temperature": 0.1,
+        "temperature": 0.0,
         "max_tokens": 1536,
         // Anti-degeneration: stop the small model from looping a phrase until it overruns
         // the token budget (which truncates the JSON). repeat_penalty is llama.cpp-native;
@@ -45,9 +45,13 @@ pub async fn chat_json(
         }
     });
 
-    // Retry once: degeneration is stochastic, so a second sample usually succeeds.
+    // First pass is greedy (temperature 0): the argmax decode is both the most accurate for a
+    // constrained extraction and deterministic run-to-run (no more "flips between runs"). If it
+    // degenerates/fails, retry with temperature — at 0 the retry would just reproduce the same
+    // bad sample, so we escalate to break the loop.
     let mut last_err = None;
-    for _ in 0..2 {
+    for temp in [0.0_f64, 0.4] {
+        body["temperature"] = json!(temp);
         match try_once(client, base, &body).await {
             Ok(v) => return Ok(v),
             Err(e) => last_err = Some(e),

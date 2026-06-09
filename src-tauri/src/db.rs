@@ -10,6 +10,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_google.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_habits.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_habit_duration.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_project_archive.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_notes.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -40,6 +41,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 5 {
         conn.execute_batch(MIGRATION_0005)?;
         conn.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        conn.execute_batch(MIGRATION_0006)?;
+        conn.pragma_update(None, "user_version", 6)?;
     }
     Ok(())
 }
@@ -535,4 +540,57 @@ pub fn insert_booking(
     )?;
     tx.commit()?;
     Ok(id)
+}
+
+// ---------- Notes (Hermes memory layer) ----------
+
+fn row_to_note(r: &Row, indexed: bool) -> rusqlite::Result<Note> {
+    Ok(Note {
+        id: r.get("id")?,
+        content: r.get("content")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        indexed,
+        score: None,
+    })
+}
+
+/// All notes, newest first. Carries no embedding payload (the `indexed` flag tells the UI whether
+/// one exists); use `notes_for_recall` when the vectors are actually needed.
+pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_note(r, indexed)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn insert_note(conn: &Connection, content: &str, embedding: Option<&[u8]>, model: Option<&str>) -> Result<i64> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO notes(content, embedding, embedding_model, created_at, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?4)",
+        params![content, embedding, model, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn delete_note(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Notes paired with their raw embedding bytes (None when not indexed), for recall ranking.
+pub fn notes_for_recall(conn: &Connection) -> Result<Vec<(Note, Option<Vec<u8>>)>> {
+    let mut stmt = conn.prepare("SELECT id, content, created_at, updated_at, embedding FROM notes")?;
+    let rows = stmt.query_map([], |r| {
+        let emb: Option<Vec<u8>> = r.get("embedding")?;
+        let note = row_to_note(r, emb.is_some())?;
+        Ok((note, emb))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

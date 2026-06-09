@@ -124,6 +124,9 @@ pub struct HabitStats {
     pub longest_streak: i64,
     pub completion_rate: f64, // fraction of the last 30 days completed (0..1)
     pub total_done: i64,
+    /// How many days from today forward this habit is dropped onto the calendar. 0 = not on the
+    /// calendar; drives the "Add to calendar" toggle. Populated by `commands::habit_stats`.
+    pub scheduled_days: i64,
     pub history: Vec<HabitDay>, // contiguous days, oldest → today, for the heatmap
 }
 
@@ -141,6 +144,21 @@ pub struct GoogleAccount {
     pub refresh_token: Option<String>,
     pub token_expiry: Option<String>,
     pub connected_at: String,
+}
+
+/// A note in Hermes, the on-device memory layer. `indexed` = an embedding exists for semantic
+/// recall; `score` is populated only on recall results (relevance of this note to the query).
+/// The embedding vector itself stays in the DB and is never serialized to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Note {
+    pub id: i64,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub indexed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
 }
 
 /// A recurring personal commitment the scheduler must keep free — a bedtime routine, a
@@ -197,6 +215,18 @@ pub struct Settings {
     /// Recurring blocked time / routines the scheduler plans around.
     #[serde(default)]
     pub commitments: Vec<Commitment>,
+
+    /// Hermes (memory layer): the embedding model name sent to Pushin's managed embeddings server
+    /// (`model_manager::embed_base_url()`), which is auto-downloaded and run on-device — no setup.
+    /// Defaults to the bundled `EMBED_MODEL` (the request name is cosmetic to llama-server). Empty =
+    /// semantic off (recall falls back to keyword search).
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+}
+
+/// Keep in sync with `model_manager::EMBED_MODEL.id`.
+fn default_embed_model() -> String {
+    "bge-small-en-v1.5-q8_0".into()
 }
 
 impl Default for Settings {
@@ -210,7 +240,10 @@ impl Default for Settings {
             buffer_minutes: 0,
             default_min_chunk: 30,
             default_max_chunk: 120,
-            model_id: "qwen2.5-3b-instruct-q4_k_m".into(),
+            // Default to the 7B: the 3B misroutes edits/recurrence and relative dates too often
+            // (it's the documented reliability ceiling). The 7B is the "most reliable" model; users
+            // on light hardware can still pick the 3B/1.5B in Settings. ~4.7GB first-run download.
+            model_id: "qwen2.5-7b-instruct-q4_k_m".into(),
             llm_base_url: "http://127.0.0.1:8080".into(),
             google_connected: false,
             google_client_id: String::new(),
@@ -220,6 +253,7 @@ impl Default for Settings {
             sleep_start: "23:00".into(),
             sleep_end: "07:00".into(),
             commitments: Vec::new(),
+            embed_model: default_embed_model(),
         }
     }
 }

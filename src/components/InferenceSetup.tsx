@@ -74,6 +74,8 @@ export default function InferenceSetup() {
     try {
       const r = await api.ensureInference();
       setMsg(r);
+      // Bring Hermes' memory engine online in the background (auto-downloads its tiny embedder).
+      api.ensureEmbeddings().catch(() => {});
     } catch (e) {
       setMsg(String(e));
     } finally {

@@ -9,15 +9,17 @@ import {
   type EventType,
   type HabitStats,
   type LlmStatus,
+  type Note,
   type PlanOutcome,
   type Project,
+  type RecallResult,
   type ScheduleResult,
   type Settings,
   type SyncSummary,
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "projects" | "habits" | "booking" | "settings";
+type View = "calendar" | "projects" | "habits" | "hermes" | "booking" | "settings";
 type CalMode = "week" | "month";
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
@@ -45,6 +47,9 @@ interface State {
   focusDateIso: string | null;
   habits: HabitStats[];
 
+  // Hermes (memory layer): the user's notes.
+  notes: Note[];
+
   // Chat transcript, persisted for the session so it isn't lost on page/settings changes.
   chatMessages: ChatMsg[];
   setChatMessages: (m: ChatMsg[] | ((prev: ChatMsg[]) => ChatMsg[])) => void;
@@ -61,6 +66,12 @@ interface State {
   toggleHabit: (id: number, day?: string | null) => Promise<void>;
   deleteHabit: (id: number) => Promise<void>;
   scheduleHabit: (id: number, day?: string | null) => Promise<void>;
+  setHabitScheduled: (id: number, scheduled: boolean) => Promise<void>;
+
+  loadNotes: () => Promise<void>;
+  addNote: (content: string) => Promise<void>;
+  deleteNote: (id: number) => Promise<void>;
+  recallNotes: (query: string, k?: number) => Promise<RecallResult>;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
@@ -136,6 +147,7 @@ export const useStore = create<State>((set, get) => {
     calMode: "week",
     focusDateIso: null,
     habits: [],
+    notes: [],
     chatMessages: [],
 
     setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
@@ -158,6 +170,13 @@ export const useStore = create<State>((set, get) => {
           /* no model yet → the setup card prompts a download */
         }
         await get().refreshLlm();
+      }
+      // Once the chat AI is set up, bring Hermes' memory engine online too (auto-downloads the
+      // tiny embedding model on first run + spawns its server). Best-effort and in the background —
+      // if it's not ready, recall just uses keyword search. Skipped until a chat model exists so we
+      // don't download anything before the user has opted into the AI.
+      if (get().llm?.reachable) {
+        api.ensureEmbeddings().catch(() => {});
       }
     },
 
@@ -208,6 +227,18 @@ export const useStore = create<State>((set, get) => {
     deleteHabit: async (id) => set({ habits: await api.deleteHabit(id) }),
     // Scheduling a habit creates a calendar event + re-plans, so refresh app data via mutate.
     scheduleHabit: (id, day = null) => mutate(() => api.scheduleHabit(id, day)),
+    // Toggling a habit across the planning period changes both the calendar (mutate) and the
+    // habits' scheduled-day counts (loadHabits) — refresh both.
+    setHabitScheduled: async (id, scheduled) => {
+      await mutate(() => api.setHabitScheduled(id, scheduled));
+      await get().loadHabits();
+    },
+
+    // Hermes note commands return the full list, so we just store the result. Recall is read-only.
+    loadNotes: async () => set({ notes: await api.hermesListNotes() }),
+    addNote: async (content) => set({ notes: await api.hermesAddNote(content) }),
+    deleteNote: async (id) => set({ notes: await api.hermesDeleteNote(id) }),
+    recallNotes: (query, k) => api.hermesRecall(query, k),
 
     saveSettings: async (s) => {
       await api.saveSettings(s);

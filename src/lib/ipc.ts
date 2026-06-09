@@ -32,6 +32,7 @@ export interface Settings {
   sleepStart: string; // bedtime "HH:MM"
   sleepEnd: string; // wake time "HH:MM"
   commitments: Commitment[];
+  embedModel: string; // Hermes embedding model ("" = keyword-only recall)
 }
 
 export interface SyncSummary {
@@ -178,7 +179,24 @@ export interface HabitStats {
   longestStreak: number;
   completionRate: number; // 0..1 over the last 30 days
   totalDone: number;
+  scheduledDays: number; // # of upcoming days this habit is on the calendar (0 = not scheduled)
   history: HabitDay[]; // contiguous days, oldest → today
+}
+
+/** A Hermes memory note. `indexed` = an embedding exists (semantic recall available); `score` is
+ *  set only on recall results (higher = more relevant). */
+export interface Note {
+  id: number;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+  indexed: boolean;
+  score?: number;
+}
+
+export interface RecallResult {
+  mode: "semantic" | "keyword";
+  notes: Note[];
 }
 
 // ---- commands ----
@@ -223,6 +241,13 @@ export const api = {
   deleteHabit: (id: number) => invoke<HabitStats[]>("delete_habit", { id }),
   scheduleHabit: (id: number, day: string | null) => invoke<ScheduleResult>("schedule_habit", { id, day }),
 
+  // Hermes (memory layer)
+  hermesListNotes: () => invoke<Note[]>("hermes_list_notes"),
+  hermesAddNote: (content: string) => invoke<Note[]>("hermes_add_note", { content }),
+  hermesDeleteNote: (id: number) => invoke<Note[]>("hermes_delete_note", { id }),
+  hermesRecall: (query: string, k?: number) => invoke<RecallResult>("hermes_recall", { query, k: k ?? null }),
+  setHabitScheduled: (id: number, scheduled: boolean) => invoke<ScheduleResult>("set_habit_scheduled", { id, scheduled }),
+
   connectGoogle: () => invoke<string>("connect_google"),
   disconnectGoogle: () => invoke<void>("disconnect_google"),
   syncGoogle: () => invoke<SyncSummary>("sync_google"),
@@ -233,4 +258,6 @@ export const api = {
   modelPresent: (id: string) => invoke<boolean>("model_present", { id }),
   downloadModel: (id: string, sha256?: string) => invoke<string>("download_model", { id, sha256: sha256 ?? null }),
   ensureInference: () => invoke<string>("ensure_inference"),
+  // Hermes: auto-download the embedding model + start the embeddings server (idempotent).
+  ensureEmbeddings: () => invoke<string>("ensure_embeddings"),
 };

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { CalendarPlus, Check, Flame, Plus, Trash2, TrendingUp, Trophy } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
@@ -98,15 +98,14 @@ function HabitCard({ habit }: { habit: HabitStats }) {
   const toggleHabit = useStore((s) => s.toggleHabit);
   const deleteHabit = useStore((s) => s.deleteHabit);
   const updateHabit = useStore((s) => s.updateHabit);
-  const scheduleHabit = useStore((s) => s.scheduleHabit);
+  const setHabitScheduled = useStore((s) => s.setHabitScheduled);
 
   const [dur, setDur] = useState(habit.durationMinutes);
-  const [scheduled, setScheduled] = useState(false);
-  const timer = useRef<number | null>(null);
+  const [pending, setPending] = useState(false);
+  const onCalendar = habit.scheduledDays > 0;
 
   // Keep the local input in sync if the habit changes underneath us.
   useEffect(() => setDur(habit.durationMinutes), [habit.durationMinutes]);
-  useEffect(() => () => { if (timer.current) window.clearTimeout(timer.current); }, []);
 
   const commitDuration = () => {
     const d = Math.max(5, dur || 0);
@@ -114,11 +113,13 @@ function HabitCard({ habit }: { habit: HabitStats }) {
     else setDur(habit.durationMinutes);
   };
 
-  const addToCalendar = async () => {
-    await scheduleHabit(habit.id);
-    setScheduled(true);
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => setScheduled(false), 2500);
+  const toggleCalendar = async () => {
+    setPending(true);
+    try {
+      await setHabitScheduled(habit.id, !onCalendar);
+    } finally {
+      setPending(false);
+    }
   };
 
   return (
@@ -167,19 +168,24 @@ function HabitCard({ habit }: { habit: HabitStats }) {
           <span className="text-xs text-gray-500">min</span>
         </div>
 
-        {/* Add to calendar (today) */}
+        {/* Calendar toggle — on/off for every day in the planning period */}
         <button
-          onClick={addToCalendar}
-          title="Slot this habit into a free space on today's calendar"
+          onClick={toggleCalendar}
+          disabled={pending}
+          title={
+            onCalendar
+              ? `On your calendar for ${habit.scheduledDays} day${habit.scheduledDays === 1 ? "" : "s"} — click to remove`
+              : "Slot this habit into a free space on every day in the planning period"
+          }
           className={clsx(
-            "flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md border transition shrink-0",
-            scheduled
+            "flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md border transition shrink-0 disabled:opacity-50",
+            onCalendar
               ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
               : "border-white/10 text-gray-300 hover:bg-white/10",
           )}
         >
-          {scheduled ? <Check className="size-3.5" /> : <CalendarPlus className="size-3.5" />}
-          {scheduled ? "Added" : "Add to today"}
+          {onCalendar ? <Check className="size-3.5" /> : <CalendarPlus className="size-3.5" />}
+          {onCalendar ? `On calendar · ${habit.scheduledDays}d` : "Add to calendar"}
         </button>
 
         <button onClick={() => deleteHabit(habit.id)} className="text-gray-600 hover:text-rose-400 transition shrink-0" title="Delete habit">

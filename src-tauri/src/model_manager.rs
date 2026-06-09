@@ -58,8 +58,31 @@ pub const MODELS: &[ModelInfo] = &[
     },
 ];
 
+/// The dedicated embedding model for Hermes (semantic memory recall). Auto-downloaded and served
+/// by a SECOND `llama-server` instance in `--embeddings` mode, so semantic recall works with zero
+/// setup — no Ollama, no manual steps. BERT-class and tiny (384-dim, ~37 MB) so the extra download
+/// and RAM are negligible next to the chat model. Not in `MODELS` so it never shows in the picker.
+pub const EMBED_MODEL: ModelInfo = ModelInfo {
+    id: "bge-small-en-v1.5-q8_0",
+    name: "BGE Small EN v1.5 (embeddings)",
+    filename: "bge-small-en-v1.5-q8_0.gguf",
+    url: "https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q8_0.gguf",
+    size_mb: 37,
+    note: "On-device embeddings for Hermes memory recall.",
+};
+
+/// Port for Pushin's managed embeddings server (the chat server is on 8080).
+pub const EMBED_PORT: u16 = 8181;
+
+/// Base URL of Pushin's managed embeddings server.
+pub fn embed_base_url() -> String {
+    format!("http://127.0.0.1:{EMBED_PORT}")
+}
+
+/// Look up a model by id — chat models (the picker list) plus the hidden embedding model, so
+/// download/spawn/presence checks all work for the embedder too.
 pub fn model_info(id: &str) -> Option<&'static ModelInfo> {
-    MODELS.iter().find(|m| m.id == id)
+    MODELS.iter().find(|m| m.id == id).or_else(|| (EMBED_MODEL.id == id).then_some(&EMBED_MODEL))
 }
 
 pub fn models_dir(app: &AppHandle) -> Result<PathBuf> {
@@ -360,29 +383,40 @@ fn port_from_url(url: &str) -> u16 {
         .unwrap_or(8080)
 }
 
-/// Spawn a local `llama-server` for `model_id` bound to the port in `base_url`.
+/// Spawn a local `llama-server` for `model_id` (chat) bound to the port in `base_url`.
 pub fn spawn_server(app: &AppHandle, model_id: &str, base_url: &str) -> Result<Child> {
-    let bin = resolve_server_binary(app)
-        .ok_or_else(|| anyhow!("no `llama-server` binary found (install llama.cpp or drop the binary in the app's bin/ folder)"))?;
     let info = model_info(model_id).ok_or_else(|| anyhow!("unknown model id"))?;
     let model = model_file_path(app, info.filename)?;
     if !model.exists() {
         return Err(anyhow!("model not downloaded yet"));
     }
-    let port = port_from_url(base_url);
+    spawn_llama(app, &model, port_from_url(base_url), false)
+}
+
+/// Spawn the SECOND `llama-server` in embeddings mode (Hermes memory) on `EMBED_PORT`.
+pub fn spawn_embed_server(app: &AppHandle) -> Result<Child> {
+    let model = model_file_path(app, EMBED_MODEL.filename)?;
+    if !model.exists() {
+        return Err(anyhow!("embedding model not downloaded yet"));
+    }
+    spawn_llama(app, &model, EMBED_PORT, true)
+}
+
+/// Shared `llama-server` launcher. `embeddings` enables the `/v1/embeddings` endpoint (and a
+/// smaller context) for the memory server; chat servers leave it off.
+fn spawn_llama(app: &AppHandle, model: &std::path::Path, port: u16, embeddings: bool) -> Result<Child> {
+    let bin = resolve_server_binary(app)
+        .ok_or_else(|| anyhow!("no `llama-server` binary found (install llama.cpp or drop the binary in the app's bin/ folder)"))?;
+    let model_s = model.to_str().ok_or_else(|| anyhow!("model path is not valid UTF-8"))?;
+    let port_s = port.to_string();
+    let ctx = if embeddings { "512" } else { "4096" };
+
     let mut cmd = Command::new(&bin);
-    cmd.args([
-        "-m",
-        model.to_str().unwrap(),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-        "-c",
-        "4096",
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    cmd.args(["-m", model_s, "--host", "127.0.0.1", "--port", &port_s, "-c", ctx]);
+    if embeddings {
+        cmd.arg("--embeddings");
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
     // The engine's shared libs sit next to the binary. macOS/Windows resolve those
     // automatically (@loader_path rpath / the exe's own dir); Linux only does so if the

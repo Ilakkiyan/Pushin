@@ -158,7 +158,7 @@ fn response_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "title": { "type": "string", "maxLength": 100 },
+                        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
                         "day": { "type": ["string", "null"], "enum": ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", null] },
                         "date": { "type": ["string", "null"] },
                         "startTime": { "type": ["string", "null"] },
@@ -175,7 +175,7 @@ fn response_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "match": { "type": "string", "maxLength": 100 },
+                        "match": { "type": "string", "minLength": 1, "maxLength": 100 },
                         "title": { "type": ["string", "null"], "maxLength": 100 },
                         "day": { "type": ["string", "null"], "enum": ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", null] },
                         "startTime": { "type": ["string", "null"] },
@@ -188,7 +188,7 @@ fn response_schema() -> Value {
             "removeEvents": {
                 "type": "array",
                 "maxItems": 15,
-                "items": { "type": "string", "maxLength": 100 }
+                "items": { "type": "string", "minLength": 1, "maxLength": 100 }
             },
             "projects": {
                 "type": "array",
@@ -197,7 +197,7 @@ fn response_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "name": { "type": "string", "maxLength": 80 },
+                        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
                         "tasks": {
                             "type": "array",
                             "maxItems": 25,
@@ -205,11 +205,11 @@ fn response_schema() -> Value {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "properties": {
-                                    "title": { "type": "string", "maxLength": 100 },
+                                    "title": { "type": "string", "minLength": 1, "maxLength": 100 },
                                     "estimated_minutes": { "type": "integer" },
                                     "deadline": { "type": ["string", "null"] },
                                     "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
-                                    "depends_on": { "type": "array", "maxItems": 12, "items": { "type": "string", "maxLength": 100 } },
+                                    "depends_on": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 100 } },
                                     "chunkable": { "type": "boolean" }
                                 },
                                 "required": ["title", "estimated_minutes", "priority"]
@@ -226,7 +226,7 @@ fn response_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "name": { "type": "string", "maxLength": 80 },
+                        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
                         "durationMinutes": { "type": ["integer", "null"] }
                     },
                     "required": ["name"]
@@ -381,9 +381,14 @@ pub async fn plan(
     user_text: &str,
 ) -> Result<ParsedPlan> {
     let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt(current_events, settings) })];
-    for turn in history.iter().rev().take(6).rev() {
-        let role = if turn.role == "assistant" { "assistant" } else { "user" };
-        messages.push(json!({ "role": role, "content": turn.content }));
+    // Only feed prior turns to a genuine follow-up. Handing history to a fresh, self-contained
+    // request is what lets a stale entity bleed in (a new "surgery" coming back titled "Study"
+    // from an earlier turn). See `needs_history`.
+    if needs_history(user_text) {
+        for turn in history.iter().rev().take(6).rev() {
+            let role = if turn.role == "assistant" { "assistant" } else { "user" };
+            messages.push(json!({ "role": role, "content": turn.content }));
+        }
     }
     messages.push(json!({ "role": "user", "content": user_text }));
 
@@ -406,6 +411,34 @@ pub async fn plan(
     Ok(parsed)
 }
 
+/// Does this message lean on the prior conversation (a follow-up/edit), so the planner needs
+/// history? We feed history *only* to genuine follow-ups — passing it to a fresh, self-contained
+/// request is what lets a stale entity bleed in (the "surgery" → "Study" contamination). Biased
+/// toward keeping history when unsure: a missed follow-up (lost context, hallucinated subject)
+/// hurts more than a redundant one. A standalone request ("on 6/12 I have a surgery at 10am")
+/// hits none of the cues and goes in cold; "move it to 9pm" / "this friday at 7pm" keep context.
+fn needs_history(text: &str) -> bool {
+    let lc = text.to_lowercase();
+    let words: HashSet<&str> = lc.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    // Pronouns / demonstratives that point back at an earlier turn.
+    const REF_WORDS: &[&str] =
+        &["it", "its", "that", "this", "those", "them", "they", "same", "instead", "again", "earlier", "one", "ones"];
+    // Verbs implying an item that already exists (an edit, not a creation).
+    const EDIT_WORDS: &[&str] = &[
+        "move", "reschedule", "change", "rename", "push", "cancel", "cancelled", "canceled", "delete", "remove",
+        "update", "postpone",
+    ];
+    if REF_WORDS.iter().chain(EDIT_WORDS.iter()).any(|w| words.contains(w)) {
+        return true;
+    }
+    // Continuation openers ("and also at 6pm…", "no, make it Tuesday").
+    const OPENERS: &[&str] = &["and", "also", "but", "then", "actually", "no", "wait", "plus", "instead"];
+    lc.split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .map(|first| OPENERS.contains(&first))
+        .unwrap_or(false)
+}
+
 /// Daily-recurrence language. Recurring routines become habits, not one-off events/tasks.
 fn daily_recurrence(text: &str) -> bool {
     let t = text.to_lowercase();
@@ -422,31 +455,120 @@ fn range_minutes(text: &str) -> Option<i64> {
     (mins > 0).then_some(mins)
 }
 
+/// Do two titles plausibly name the same thing, ignoring word order? ("Practice violin" vs the
+/// "Violin practice" habit). Token-overlap, since `event_matches` is substring-only and misses
+/// reordered words. Used to suppress the one-off the model double-emits next to a habit.
+fn titles_refer_same(a: &str, b: &str) -> bool {
+    const FILLER: &[&str] = &["the", "and", "for", "with", "session", "time"];
+    let toks = |s: &str| -> HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 && !FILLER.contains(w))
+            .map(str::to_string)
+            .collect()
+    };
+    let (ta, tb) = (toks(a), toks(b));
+    if ta.is_empty() || tb.is_empty() {
+        return a.trim().eq_ignore_ascii_case(b.trim());
+    }
+    ta.intersection(&tb).next().is_some()
+}
+
+/// Pull a habit name out of free text when the model emitted nothing to convert — strip the
+/// intent lead-in, recurrence words, and any duration/time tokens, and keep the activity.
+/// "Exercise daily for 30 minutes" → "Exercise"; "...practice violin every day from 4-5pm" →
+/// "Practice violin". Returns `None` if nothing sensible is left (so we don't invent garbage).
+fn synthesize_habit_name(text: &str) -> Option<String> {
+    let mut s = format!(" {} ", text.to_lowercase());
+    for p in [
+        " i want to ", " i'd like to ", " i would like to ", " i need to ", " i'm going to ",
+        " i am going to ", " i will ", " i wanna ", " let me ", " remind me to ", " i should ", " please ",
+    ] {
+        s = s.replace(p, " ");
+    }
+    for p in [
+        " every day ", " everyday ", " each day ", " daily ", " every morning ", " every evening ",
+        " every night ", " each morning ", " each evening ", " each night ", " every week ", " weekly ",
+    ] {
+        s = s.replace(p, " ");
+    }
+    // Drop connectors, duration/time units, and any numeric/clock token ("30", "4pm", "5:30").
+    const DROP: &[&str] = &[
+        "for", "at", "from", "to", "minutes", "minute", "mins", "min", "hours", "hour", "hrs", "hr",
+        "h", "m", "am", "pm", "a", "an", "the", "my", "of", "on", "in",
+    ];
+    let words: Vec<String> = s
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| {
+            !w.is_empty()
+                && !w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                && !DROP.contains(&w.as_str())
+        })
+        .collect();
+    let name = words.join(" ");
+    let name = name.trim();
+    if name.is_empty() || name.split_whitespace().count() > 5 {
+        return None;
+    }
+    let mut chars = name.chars();
+    chars.next().map(|f| f.to_uppercase().collect::<String>() + chars.as_str())
+}
+
 /// Route recurring routines to the habit tracker. The model is told to emit `habits` directly,
-/// but as a deterministic safety net we also convert a single recurring event/task it created
-/// (e.g. "practice violin every day" routed as one event) into a habit. Always dedupes.
+/// but as a deterministic safety net we (a) convert a single recurring event/task it routed as a
+/// one-off, (b) synthesize a habit from the text when it emitted nothing usable, and (c) suppress
+/// any one-off event/task it double-emitted next to the habit. Always dedupes.
 fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
-    if daily_recurrence(user_text) && plan.habits.is_empty() {
+    if daily_recurrence(user_text) {
         let dur = find_duration_minutes(user_text).or_else(|| range_minutes(user_text));
         let total_tasks: usize = plan.projects.iter().map(|p| p.tasks.len()).sum();
 
-        if plan.events.len() == 1 && total_tasks == 0 && plan.update_events.is_empty() {
-            let ev = plan.events.remove(0);
-            let d = dur.or(ev.duration_minutes).unwrap_or(60);
-            plan.habits.push(ParsedHabit { name: ev.title, duration_minutes: d });
-        } else if plan.events.is_empty() && total_tasks == 1 {
-            let mut taken = None;
-            for proj in &mut plan.projects {
-                if let Some(t) = proj.tasks.pop() {
-                    taken = Some(t);
-                    break;
+        if plan.habits.is_empty() {
+            if plan.events.len() == 1 && total_tasks == 0 && plan.update_events.is_empty() {
+                // Routed as one fixed event → make it the habit.
+                let ev = plan.events.remove(0);
+                let d = dur.or(ev.duration_minutes).unwrap_or(60);
+                plan.habits.push(ParsedHabit { name: ev.title, duration_minutes: d });
+            } else if plan.events.is_empty() && total_tasks == 1 {
+                // …or as a single task.
+                let mut taken = None;
+                for proj in &mut plan.projects {
+                    if let Some(t) = proj.tasks.pop() {
+                        taken = Some(t);
+                        break;
+                    }
+                }
+                plan.projects.retain(|p| !p.tasks.is_empty());
+                if let Some(t) = taken {
+                    let d = dur.unwrap_or_else(|| t.estimated_minutes.max(15));
+                    plan.habits.push(ParsedHabit { name: t.title, duration_minutes: d });
+                }
+            } else if plan.events.is_empty()
+                && total_tasks == 0
+                && plan.update_events.is_empty()
+                && plan.remove_events.is_empty()
+            {
+                // …or the model produced nothing (it just asked "what time?") — synthesize, so a
+                // clear recurring routine isn't silently dropped.
+                if let Some(name) = synthesize_habit_name(user_text) {
+                    plan.habits.push(ParsedHabit { name, duration_minutes: dur.unwrap_or(30) });
                 }
             }
-            plan.projects.retain(|p| !p.tasks.is_empty());
-            if let Some(t) = taken {
-                let d = dur.unwrap_or_else(|| t.estimated_minutes.max(15));
-                plan.habits.push(ParsedHabit { name: t.title, duration_minutes: d });
+        }
+
+        // A daily routine IS the habit — it must not also linger as a one-off event/update/task.
+        // The model often double-emits ("Practice violin" event beside the "Violin practice"
+        // habit); drop creates/updates/tasks that name the same thing (order-insensitive).
+        if !plan.habits.is_empty() {
+            let names: Vec<String> = plan.habits.iter().map(|h| h.name.clone()).collect();
+            let dup = |title: &str| names.iter().any(|n| titles_refer_same(n, title));
+            plan.events.retain(|e| !dup(&e.title));
+            plan.update_events.retain(|u| !dup(&u.target));
+            for proj in &mut plan.projects {
+                proj.tasks.retain(|t| !dup(&t.title));
             }
+            plan.projects.retain(|p| !p.tasks.is_empty());
         }
     }
 
@@ -1197,6 +1319,28 @@ fn sane_duration(mins: i64) -> Option<i64> {
     (1..=24 * 60).contains(&mins).then_some(mins)
 }
 
+/// Reject a title the small model emitted as filler rather than a real name. Two failure modes
+/// we've seen leak straight onto the calendar / task list as un-actionable junk:
+///   - **blank / glyphless** — empty, whitespace, or only punctuation/symbols that render as
+///     nothing (e.g. `<>`, `--`, a stray zero-width char) → no alphanumeric content at all;
+///   - **template placeholders** — the model parrots a schema slot like `<NAME>`, `[task]`,
+///     `{title}`, or a bare word like "untitled"/"tbd"/"n/a".
+/// Used to gate task titles, project names, and event titles before we persist them.
+fn is_placeholder_title(s: &str) -> bool {
+    let t = s.trim();
+    if !t.chars().any(|c| c.is_alphanumeric()) {
+        return true; // blank, or only brackets/punctuation/zero-width — nothing to show
+    }
+    // Strip wrapping template brackets (<name>, [task], {title}) before matching bare words.
+    let inner = t.trim_matches(|c: char| "<>[]{}()".contains(c)).trim().to_lowercase();
+    matches!(
+        inner.as_str(),
+        "name" | "title" | "untitled" | "task" | "subtask" | "event" | "item"
+            | "todo" | "to-do" | "tbd" | "n/a" | "na" | "none" | "null" | "placeholder"
+            | "example" | "description" | "task name" | "event name" | "your task"
+    )
+}
+
 /// Derive an event's end from its start + an optional end-time string.
 /// Handles the model dropping PM ("12 - 2" → end "02:00" → 14:00) and overnight ranges
 /// ("8pm - 8am" → 08:00 next day) via up to two +12h bumps.
@@ -1414,19 +1558,26 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             .iter()
             .filter(|t| {
                 let lc = t.title.trim().to_lowercase();
-                !lc.is_empty() && !habit_lc.contains(&lc) && !existing_task_lc.contains(&lc) && seen_titles.insert(lc)
+                !is_placeholder_title(&t.title) && !habit_lc.contains(&lc) && !existing_task_lc.contains(&lc) && seen_titles.insert(lc)
             })
             .collect();
         if new_tasks.is_empty() {
             continue; // don't create an empty/duplicate project
         }
-        let pid = crate::db::insert_project(conn, &proj.name, "#6366f1")?;
-        project_names.push(proj.name.clone());
+        // A junk project name ("<NAME>", blank) still gets its genuine tasks kept — just
+        // unassigned ("No project") instead of spawning a garbage project header.
+        let pid = if is_placeholder_title(&proj.name) {
+            None
+        } else {
+            let id = crate::db::insert_project(conn, &proj.name, "#6366f1")?;
+            project_names.push(proj.name.clone());
+            Some(id)
+        };
         for t in new_tasks {
             let min_chunk = if t.chunkable { settings.default_min_chunk } else { t.estimated_minutes.max(15) };
             let id = crate::db::insert_task(
                 conn,
-                Some(pid),
+                pid,
                 &t.title,
                 &t.notes,
                 t.estimated_minutes.max(15),
@@ -1488,9 +1639,9 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
     let mut current = crate::db::list_events(conn)?;
     let mut created_event_titles = Vec::new();
     for ev in &plan.events {
-        // Guardrail: never persist a blank-titled event (the schema allows ""), it'd show as
-        // an empty block the user can't address. Also skip anything we just made a habit.
-        if ev.title.trim().is_empty() || habit_lc.contains(&ev.title.trim().to_lowercase()) {
+        // Guardrail: never persist a blank or placeholder-titled event ("<NAME>", "", "event"),
+        // it'd show as an un-addressable block. Also skip anything we just made a habit.
+        if is_placeholder_title(&ev.title) || habit_lc.contains(&ev.title.trim().to_lowercase()) {
             continue;
         }
         // Phantom-duplicate guard: the 3B sometimes both edits an event AND emits a near-duplicate
@@ -1565,6 +1716,42 @@ mod tests {
             end_time: et.map(String::from),
             duration_minutes: None,
             span_days: None,
+        }
+    }
+
+    #[test]
+    fn history_only_for_followups() {
+        // Self-contained requests go in cold — no history to contaminate them.
+        for standalone in [
+            "on 6/12 i have a surgery at 10 am",
+            "tomorrow i am going to study for 2 hours starting from 1 pm",
+            "lunch with Sam friday at noon",
+            "i need to write the report by friday",
+        ] {
+            assert!(!needs_history(standalone), "{standalone:?} should NOT pull history");
+        }
+        // Follow-ups / edits lean on prior turns — keep context.
+        for followup in [
+            "move it to 9pm",
+            "this friday at 7pm",
+            "actually make that 2 hours",
+            "no, reschedule the meeting to Tuesday",
+            "and also block 6-7pm",
+            "cancel that",
+        ] {
+            assert!(needs_history(followup), "{followup:?} SHOULD pull history");
+        }
+    }
+
+    #[test]
+    fn rejects_blank_and_placeholder_titles() {
+        // Real names the model should keep.
+        for good in ["Surgery", "study for class", "Pick up the mail", "1:1 with Sam", "Gym 💪"] {
+            assert!(!is_placeholder_title(good), "{good:?} should be kept");
+        }
+        // Junk the model parrots — blank, glyphless, or a template slot — must be dropped.
+        for junk in ["", "   ", "<NAME>", "<name>", "[task]", "{title}", "()", "--", "...", "untitled", "TBD", "N/A", "Task Name"] {
+            assert!(is_placeholder_title(junk), "{junk:?} should be rejected");
         }
     }
 
@@ -2025,6 +2212,50 @@ mod tests {
         let habits = vec!["Violin practice".to_string()];
         let out = filter_clarifications(&["did you mean 'every weekday'?".into()], &[], &[], &[], &[], &habits);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn recurrence_suppresses_the_duplicate_event_beside_the_habit() {
+        // The model double-emits: a "Violin practice" habit AND a "Practice violin" event/update
+        // for the same daily routine. The event/update (reordered words) must be suppressed.
+        let mut ev1 = ev("today", Some("16:00"), Some("17:00"));
+        ev1.title = "Practice violin".into();
+        let mut plan = ParsedPlan {
+            events: vec![ev1],
+            update_events: vec![UpdateEvent {
+                target: "Practice violin".into(),
+                title: None,
+                day: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                date: None,
+                span_days: None,
+            }],
+            habits: vec![ParsedHabit { name: "Violin practice".into(), duration_minutes: 60 }],
+            ..Default::default()
+        };
+        route_recurring_to_habits(&mut plan, "i want to practice violin every day from 4 to 5pm");
+        assert!(plan.events.is_empty(), "duplicate event should be suppressed");
+        assert!(plan.update_events.is_empty(), "duplicate update should be suppressed");
+        assert_eq!(plan.habits.len(), 1);
+        assert_eq!(plan.habits[0].name, "Violin practice");
+    }
+
+    #[test]
+    fn recurrence_synthesizes_a_habit_when_the_model_emits_nothing() {
+        // "Exercise daily for 30 minutes" — the model returned only a "what time?" clarification.
+        // We synthesize the habit from the text rather than dropping the routine.
+        let mut plan = ParsedPlan::default();
+        route_recurring_to_habits(&mut plan, "Exercise daily for 30 minutes");
+        assert_eq!(plan.habits.len(), 1);
+        assert_eq!(plan.habits[0].name, "Exercise");
+        assert_eq!(plan.habits[0].duration_minutes, 30);
+
+        // But genuinely empty/ambiguous recurrence doesn't invent a habit.
+        let mut plan = ParsedPlan::default();
+        route_recurring_to_habits(&mut plan, "every day");
+        assert!(plan.habits.is_empty());
     }
 
     #[test]

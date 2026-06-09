@@ -8,6 +8,8 @@ dist-ssr/
 
 # Rust / Tauri build output
 src-tauri/target/
+# Isolated target dir for running the LLM eval harness while the app holds target/ (locked .exe).
+src-tauri/target-eval/
 src-tauri/gen/
 
 # Downloaded models & inference engine (fetched at runtime, large)

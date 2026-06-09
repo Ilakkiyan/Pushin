@@ -165,6 +165,11 @@ fn all_tasks_have_deadline(_o: &PlanOutcome, c: &Connection) -> Vec<(String, boo
 fn created_nothing(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
     vec![chk("didn't fabricate an event/task", o.created_event_titles.is_empty() && o.created_task_ids.is_empty())]
 }
+fn study_not_overdecomposed(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
+    // The 3B/7B loves to explode a plain "study for 2h" into a project with invented subtasks
+    // ("Pick platform"). A single study item is fine; fabricating extras is the failure.
+    vec![chk("didn't fabricate extra tasks (≤1)", o.created_task_ids.len() <= 1)]
+}
 
 // ---------------- the battery ----------------
 
@@ -283,6 +288,16 @@ fn cases() -> Vec<Case> {
             prompt: "Exercise daily for 30 minutes.",
             expect: E { habits: Some(1), events: Some(0), habit_has: &["exercise"], ..Default::default() },
         },
+        Case {
+            // Screenshot 1: "exercise every day at 10pm" stacked duplicate events. A daily routine
+            // with a fixed time must still become one habit, not a (stack of) one-off event(s).
+            name: "daily routine with a fixed time → habit, no duplicate event",
+            category: "habit",
+            history: &[],
+            seed: &[],
+            prompt: "I'm going to exercise for an hour every day at 10pm.",
+            expect: E { habits: Some(1), events: Some(0), habit_has: &["exercise"], ..Default::default() },
+        },
         // ---- dates / spans ----
         Case {
             name: "explicit date + multi-week span",
@@ -318,6 +333,20 @@ fn cases() -> Vec<Case> {
             prompt: "This Friday at 7pm.",
             expect: E { events: Some(1), ..Default::default() },
         },
+        Case {
+            // Screenshot 3: a fresh, self-contained request must NOT inherit a stale subject from
+            // earlier turns (the new "surgery" came back titled "Study"). History gating drops the
+            // prior Study turns, so the event is titled from the actual request.
+            name: "fresh request ignores stale history (no contamination)",
+            category: "context",
+            history: &[
+                ("user", "Help me study for my chemistry final this week."),
+                ("assistant", "Added a Study project with tasks, and re-planned your calendar."),
+            ],
+            seed: &[],
+            prompt: "On 6/12 I have a surgery at 10am.",
+            expect: E { min_events: Some(1), title_has: &["surg"], ..Default::default() },
+        },
         // ---- restraint on vague input ----
         Case {
             name: "vague input → no hallucination",
@@ -326,6 +355,16 @@ fn cases() -> Vec<Case> {
             seed: &[],
             prompt: "I have some stuff going on next week.",
             expect: E { custom: Some(created_nothing), ..Default::default() },
+        },
+        Case {
+            // Screenshot 2: "study for 2h starting at 1pm" got exploded into a project with an
+            // invented "Pick platform" task. One study item is fine; fabricating extras is not.
+            name: "simple study block isn't over-decomposed",
+            category: "restraint",
+            history: &[],
+            seed: &[],
+            prompt: "Tomorrow I'm going to study for 2 hours starting at 1pm.",
+            expect: E { custom: Some(study_not_overdecomposed), ..Default::default() },
         },
     ]
 }

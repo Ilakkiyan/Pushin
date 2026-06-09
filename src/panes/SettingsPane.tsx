@@ -177,6 +177,13 @@ export default function SettingsPane() {
             Status: {llm?.reachable ? <span className="text-emerald-400">reachable</span> : <span className="text-amber-400">offline</span>}. Point this at a local
             llama-server or an Ollama server (<code>http://127.0.0.1:11434</code>).
           </p>
+          <Field label="Embedding model — Hermes recall">
+            <input value={form.embedModel} onChange={(e) => update({ embedModel: e.target.value })} placeholder="bge-small-en-v1.5-q8_0" className={inputCls} />
+          </Field>
+          <p className="text-[11px] text-gray-500">
+            Powers semantic memory recall in <span className="text-gray-300">Hermes</span>. Pushin downloads a small embedding model
+            (~37 MB) and runs it on-device automatically — no setup. Leave blank to use keyword-only recall.
+          </p>
         </section>
 
         {/* Google Calendar two-way sync */}
