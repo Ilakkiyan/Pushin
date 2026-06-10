@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, Local, NaiveDateTime};
+use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, Timelike};
 use pushin_lib::db;
 use pushin_lib::model::{Event, Settings};
 use pushin_lib::parser::{self, ChatTurn, PlanOutcome};
@@ -37,12 +37,29 @@ struct Expect {
     tasks: Option<usize>,      // exact count of created tasks
     min_tasks: Option<usize>,
     habits: Option<usize>,
+    min_habits: Option<usize>,
     min_updated: Option<usize>,
     min_removed: Option<usize>,
     /// Each needle must appear in some created/updated event title.
     title_has: &'static [&'static str],
     /// Each needle must appear in some created habit name.
     habit_has: &'static [&'static str],
+    /// Each needle must appear in some REMOVED event title (selective deletes).
+    removed_has: &'static [&'static str],
+    /// (needle, minutes) — the matching event's duration ≈ minutes.
+    event_minutes: &'static [(&'static str, i64)],
+    /// (needle, hour, minute) — the matching event starts at exactly h:m (AM/PM/noon correctness).
+    event_start_hm: &'static [(&'static str, u32, u32)],
+    /// (needle, day_offset) — the matching event's start date == today + offset (relative dates).
+    event_day_offset: &'static [(&'static str, i64)],
+    /// Titles that must STILL exist after (e.g. a sibling event a selective remove must spare).
+    survives: &'static [&'static str],
+    /// Each value must match some created task's estimate (±5 min).
+    task_estimates: &'static [i64],
+    /// Each value (1 low .. 4 urgent) must appear among created tasks' priorities.
+    priorities: &'static [i64],
+    /// At least one created task has a dependency.
+    has_task_dep: bool,
     /// Bespoke checks needing the resulting calendar/tasks (durations, spans, deadlines…).
     custom: Option<fn(&PlanOutcome, &Connection) -> Vec<(String, bool)>>,
 }
@@ -84,6 +101,23 @@ fn near(actual: Option<i64>, want: i64) -> bool {
     actual.map(|a| (a - want).abs() <= 1).unwrap_or(false)
 }
 
+/// (start, end) of the first event whose title contains `needle`.
+fn ev_span(conn: &Connection, needle: &str) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let n = needle.to_lowercase();
+    let e = db::list_events(conn).ok()?.into_iter().find(|e| e.title.to_lowercase().contains(&n))?;
+    Some((parse(&e.start)?, parse(&e.end)?))
+}
+fn ev_start_hm(conn: &Connection, needle: &str) -> Option<(u32, u32)> {
+    ev_span(conn, needle).map(|(s, _)| (s.hour(), s.minute()))
+}
+fn ev_start_date(conn: &Connection, needle: &str) -> Option<NaiveDate> {
+    ev_span(conn, needle).map(|(s, _)| s.date())
+}
+fn ev_exists(conn: &Connection, needle: &str) -> bool {
+    let n = needle.to_lowercase();
+    db::list_events(conn).map(|v| v.iter().any(|e| e.title.to_lowercase().contains(&n))).unwrap_or(false)
+}
+
 fn title_in(o: &PlanOutcome, needle: &str) -> bool {
     let n = needle.to_lowercase();
     o.created_event_titles.iter().chain(o.updated_event_titles.iter()).any(|t| t.to_lowercase().contains(&n))
@@ -118,6 +152,38 @@ fn evaluate(e: &Expect, o: &PlanOutcome, conn: &Connection) -> Vec<(String, bool
     for needle in e.habit_has {
         let n = needle.to_lowercase();
         out.push(chk(format!("habit ~ \"{needle}\""), o.created_habit_names.iter().any(|h| h.to_lowercase().contains(&n))));
+    }
+    if let Some(n) = e.min_habits {
+        out.push(chk(format!("≥{n} habit(s)"), o.created_habit_names.len() >= n));
+    }
+    for needle in e.removed_has {
+        let n = needle.to_lowercase();
+        out.push(chk(format!("removed ~ \"{needle}\""), o.removed_event_titles.iter().any(|t| t.to_lowercase().contains(&n))));
+    }
+    for (needle, mins) in e.event_minutes {
+        out.push(chk(format!("{needle} ≈ {mins}m"), near(ev_minutes(conn, needle), *mins)));
+    }
+    for (needle, h, m) in e.event_start_hm {
+        out.push(chk(format!("{needle} starts {h:02}:{m:02}"), ev_start_hm(conn, needle) == Some((*h, *m))));
+    }
+    for (needle, off) in e.event_day_offset {
+        let want = Local::now().naive_local().date() + ChronoDuration::days(*off);
+        out.push(chk(format!("{needle} on day {off:+}"), ev_start_date(conn, needle) == Some(want)));
+    }
+    for needle in e.survives {
+        out.push(chk(format!("\"{needle}\" still exists"), ev_exists(conn, needle)));
+    }
+    for est in e.task_estimates {
+        let ok = db::list_tasks(conn).map(|ts| ts.iter().any(|t| (t.estimated_minutes - est).abs() <= 5)).unwrap_or(false);
+        out.push(chk(format!("a task ≈ {est}m"), ok));
+    }
+    for p in e.priorities {
+        let ok = db::list_tasks(conn).map(|ts| ts.iter().any(|t| t.priority == *p)).unwrap_or(false);
+        out.push(chk(format!("a task priority={p}"), ok));
+    }
+    if e.has_task_dep {
+        let ok = db::list_tasks(conn).map(|ts| ts.iter().any(|t| !t.depends_on.is_empty())).unwrap_or(false);
+        out.push(chk("a task has a dependency", ok));
     }
     if let Some(f) = e.custom {
         out.extend(f(o, conn));
@@ -169,6 +235,18 @@ fn study_not_overdecomposed(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bo
     // The 3B/7B loves to explode a plain "study for 2h" into a project with invented subtasks
     // ("Pick platform"). A single study item is fine; fabricating extras is the failure.
     vec![chk("didn't fabricate extra tasks (≤1)", o.created_task_ids.len() <= 1)]
+}
+fn passport_on_the_25th(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // Day-of-month with no month ("on the 25th") — Rust resolves M/D, not "the 25th", so this is a
+    // known date-resolution stretch. The check documents whether the model lands the right day.
+    vec![chk("lands on the 25th", ev_start_date(c, "passport").map(|d| d.day()) == Some(25))]
+}
+fn one_task_not_event(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
+    // "Spend Saturday afternoon cleaning the garage" is work (a task), not a fixed event, and is one
+    // activity (not a decomposed project).
+    vec![
+        chk("is a task, not an event", o.created_task_ids.len() == 1 && o.created_event_titles.is_empty()),
+    ]
 }
 
 // ---------------- the battery ----------------
@@ -365,6 +443,389 @@ fn cases() -> Vec<Case> {
             seed: &[],
             prompt: "Tomorrow I'm going to study for 2 hours starting at 1pm.",
             expect: E { custom: Some(study_not_overdecomposed), ..Default::default() },
+        },
+
+        // ============================================================================
+        //  AMBITIOUS / LONG-TAIL — harder phrasings to find where the model breaks.
+        // ============================================================================
+
+        // ---- harder single events: time normalization (noon/AM/short durations) ----
+        Case {
+            name: "noon + explicit duration",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Team sync at noon tomorrow for 45 minutes.",
+            expect: E { events: Some(1), event_start_hm: &[("sync", 12, 0)], event_minutes: &[("sync", 45)], ..Default::default() },
+        },
+        Case {
+            name: "explicit morning beats assume-PM",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Gym tomorrow at 6 in the morning.",
+            expect: E { events: Some(1), event_start_hm: &[("gym", 6, 0)], ..Default::default() },
+        },
+        Case {
+            name: "short 15-minute call",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Quick 15 minute call with the bank at 3pm today.",
+            expect: E { events: Some(1), event_start_hm: &[("call", 15, 0)], event_minutes: &[("call", 15)], ..Default::default() },
+        },
+        Case {
+            name: "location noise + half-hour range",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Lunch at Chipotle with Sam tomorrow 12:30 to 1:15.",
+            expect: E { events: Some(1), event_start_hm: &[("lunch", 12, 30)], event_minutes: &[("lunch", 45)], ..Default::default() },
+        },
+        Case {
+            name: "overnight cross-midnight range",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Movie night tonight 11pm to 1am.",
+            expect: E { events: Some(1), event_minutes: &[("movie", 120)], ..Default::default() },
+        },
+        Case {
+            name: "three back-to-back events in one line",
+            category: "hard-event",
+            history: &[],
+            seed: &[],
+            prompt: "Tomorrow: standup 9-9:15, design review 11-12, and a 1:1 at 3-3:30.",
+            // (The 1:1 often gets titled "One-on-one meeting", so we assert the two stable needles
+            // plus the 3-event structure rather than needle-matching the third.)
+            expect: E { events: Some(3), event_minutes: &[("standup", 15), ("design", 60)], ..Default::default() },
+        },
+
+        // ---- harder dates ----
+        Case {
+            name: "named day next week",
+            category: "hard-date",
+            history: &[],
+            seed: &[],
+            prompt: "Doctor's appointment next Tuesday at 9am.",
+            expect: E { events: Some(1), event_start_hm: &[("doctor", 9, 0)], ..Default::default() },
+        },
+        Case {
+            // Day-of-month with no month — a known Rust date-resolution gap; documents the model's pick.
+            name: "day-of-month (the 25th)",
+            category: "hard-date",
+            history: &[],
+            seed: &[],
+            prompt: "Renew my passport on the 25th at 10am.",
+            expect: E { events: Some(1), custom: Some(passport_on_the_25th), ..Default::default() },
+        },
+
+        // ---- harder tasks: dependencies, varied estimates, priorities, task-vs-event ----
+        Case {
+            name: "sequential dependencies",
+            category: "hard-task",
+            history: &[],
+            seed: &[],
+            prompt: "To launch the app I need to fix the login bug, then write tests, then deploy to prod.",
+            expect: E { min_tasks: Some(3), has_task_dep: true, ..Default::default() },
+        },
+        Case {
+            name: "two tasks, distinct estimates",
+            category: "hard-task",
+            history: &[],
+            seed: &[],
+            prompt: "Write the quarterly report, about 90 minutes, and email it to the team, 10 minutes.",
+            expect: E { min_tasks: Some(2), task_estimates: &[90, 10], ..Default::default() },
+        },
+        Case {
+            name: "mixed priorities",
+            category: "hard-task",
+            history: &[],
+            seed: &[],
+            prompt: "Urgent: file the tax forms by tomorrow. Also, low priority — organize the old photos sometime.",
+            expect: E { min_tasks: Some(2), priorities: &[4, 1], ..Default::default() },
+        },
+        Case {
+            name: "single chore is a task, not an event",
+            category: "hard-task",
+            history: &[],
+            seed: &[],
+            prompt: "Spend Saturday afternoon cleaning out the garage.",
+            expect: E { custom: Some(one_task_not_event), ..Default::default() },
+        },
+
+        // ---- harder habits ----
+        Case {
+            name: "morning meditation habit",
+            category: "hard-habit",
+            history: &[],
+            seed: &[],
+            prompt: "Meditate for 10 minutes every morning.",
+            expect: E { min_habits: Some(1), events: Some(0), habit_has: &["medit"], ..Default::default() },
+        },
+        Case {
+            name: "habit with no stated duration",
+            category: "hard-habit",
+            history: &[],
+            seed: &[],
+            prompt: "Read every night before bed.",
+            expect: E { min_habits: Some(1), events: Some(0), habit_has: &["read"], ..Default::default() },
+        },
+        Case {
+            // Known limitation: habits are daily-only, so weekly recurrence ("every Monday and
+            // Wednesday") has no clean home. Documents what the model does with it.
+            name: "weekly recurrence (known gap)",
+            category: "hard-habit",
+            history: &[],
+            seed: &[],
+            prompt: "Go to the gym every Monday and Wednesday.",
+            expect: E { min_habits: Some(1), events: Some(0), habit_has: &["gym"], ..Default::default() },
+        },
+
+        // ---- harder edits (relative time/day math against a seeded calendar) ----
+        Case {
+            name: "rename an event",
+            category: "hard-edit",
+            history: &[],
+            seed: &[("Gym session", 1, (7, 0), 1, (8, 0))],
+            prompt: "Rename my gym session to Morning workout.",
+            expect: E { min_updated: Some(1), events: Some(0), title_has: &["workout"], ..Default::default() },
+        },
+        Case {
+            name: "push back an hour (relative time math)",
+            category: "hard-edit",
+            history: &[],
+            seed: &[("Dentist", 1, (14, 0), 1, (15, 0))],
+            prompt: "Push my dentist appointment back an hour.",
+            expect: E { min_updated: Some(1), event_start_hm: &[("dentist", 15, 0)], ..Default::default() },
+        },
+        Case {
+            name: "shorten to one hour",
+            category: "hard-edit",
+            history: &[],
+            seed: &[("Workshop", 1, (10, 0), 1, (12, 0))],
+            prompt: "Make the workshop only one hour.",
+            expect: E { min_updated: Some(1), event_minutes: &[("workshop", 60)], ..Default::default() },
+        },
+        Case {
+            name: "move to tomorrow (day shift)",
+            category: "hard-edit",
+            history: &[],
+            seed: &[("Standup", 0, (9, 0), 0, (9, 30))],
+            prompt: "Move standup to tomorrow.",
+            expect: E { min_updated: Some(1), events: Some(0), event_day_offset: &[("standup", 1)], ..Default::default() },
+        },
+
+        // ---- harder removes (selective / plural) ----
+        Case {
+            name: "selective remove spares the sibling",
+            category: "hard-remove",
+            history: &[],
+            seed: &[("Lunch with mom", 1, (12, 0), 1, (13, 0)), ("Lunch with Dan", 1, (15, 0), 1, (16, 0))],
+            prompt: "Cancel lunch with Dan.",
+            expect: E { min_removed: Some(1), removed_has: &["Dan"], survives: &["with mom"], ..Default::default() },
+        },
+        Case {
+            name: "remove all of a kind",
+            category: "hard-remove",
+            history: &[],
+            seed: &[("Sleepover at Jake's", 2, (20, 0), 3, (8, 0)), ("Sleepover at Mia's", 4, (20, 0), 5, (8, 0))],
+            prompt: "Cancel all my sleepovers.",
+            expect: E { min_removed: Some(2), ..Default::default() },
+        },
+
+        // ---- multi-intent: combinations in one message ----
+        Case {
+            name: "event + habit together",
+            category: "multi-intent",
+            history: &[],
+            seed: &[],
+            prompt: "Book a haircut Saturday at 11am, and remind me to stretch every morning.",
+            expect: E { min_events: Some(1), min_habits: Some(1), title_has: &["haircut"], habit_has: &["stretch"], ..Default::default() },
+        },
+        Case {
+            name: "remove + create together",
+            category: "multi-intent",
+            history: &[],
+            seed: &[("Old sync", 1, (10, 0), 1, (10, 30))],
+            prompt: "Cancel the old sync and schedule a team lunch Friday at noon.",
+            expect: E { min_removed: Some(1), min_events: Some(1), title_has: &["lunch"], event_start_hm: &[("lunch", 12, 0)], ..Default::default() },
+        },
+        Case {
+            name: "task + event + habit triple",
+            category: "multi-intent",
+            history: &[],
+            seed: &[],
+            prompt: "Finish the essay, about 2 hours, by Friday; dinner with my parents Sunday at 6pm; and journal every night.",
+            expect: E { min_tasks: Some(1), min_events: Some(1), min_habits: Some(1), title_has: &["dinner"], habit_has: &["journal"], ..Default::default() },
+        },
+        Case {
+            name: "edit + create together",
+            category: "multi-intent",
+            history: &[],
+            seed: &[("Lunch", 0, (12, 0), 0, (13, 0))],
+            prompt: "Move lunch to 1pm and add a coffee break at 3pm.",
+            expect: E { min_updated: Some(1), min_events: Some(1), title_has: &["coffee"], event_start_hm: &[("coffee", 15, 0)], ..Default::default() },
+        },
+
+        // ---- restraint: queries, greetings, past-tense, venting (must create nothing) ----
+        Case {
+            name: "calendar query is not a command",
+            category: "restraint",
+            history: &[],
+            seed: &[],
+            prompt: "What's on my calendar tomorrow?",
+            expect: E { custom: Some(created_nothing), ..Default::default() },
+        },
+        Case {
+            name: "greeting creates nothing",
+            category: "restraint",
+            history: &[],
+            seed: &[],
+            prompt: "Hey! How's it going today?",
+            expect: E { custom: Some(created_nothing), ..Default::default() },
+        },
+        Case {
+            name: "past-tense is not a new task",
+            category: "restraint",
+            history: &[],
+            seed: &[],
+            prompt: "I already finished the laundry earlier.",
+            expect: E { custom: Some(created_nothing), ..Default::default() },
+        },
+        Case {
+            name: "venting creates nothing",
+            category: "restraint",
+            history: &[],
+            seed: &[],
+            prompt: "Honestly I'm feeling pretty overwhelmed this week.",
+            expect: E { custom: Some(created_nothing), ..Default::default() },
+        },
+
+        // ---- context: a follow-up edit referring to the prior turn ----
+        Case {
+            name: "follow-up edit via history",
+            category: "context",
+            history: &[("user", "Add a dentist appointment Friday at 2pm."), ("assistant", "Added Dentist on Friday at 2pm.")],
+            seed: &[("Dentist", 2, (14, 0), 2, (15, 0))],
+            prompt: "Actually, make it 3pm instead.",
+            expect: E { min_updated: Some(1), event_start_hm: &[("dentist", 15, 0)], ..Default::default() },
+        },
+
+        // ============================================================================
+        //  WAVE 2 — push harder: relative dates, odd time formats, messy input, multi-edits.
+        // ============================================================================
+
+        // ---- relative dates beyond weekday (likely a deterministic-track target) ----
+        Case {
+            name: "the day after tomorrow",
+            category: "rel-date",
+            history: &[],
+            seed: &[],
+            prompt: "Lunch the day after tomorrow at 1pm.",
+            expect: E { events: Some(1), event_day_offset: &[("lunch", 2)], event_start_hm: &[("lunch", 13, 0)], ..Default::default() },
+        },
+        Case {
+            name: "in two weeks",
+            category: "rel-date",
+            history: &[],
+            seed: &[],
+            prompt: "Schedule a project review in two weeks at 2pm.",
+            expect: E { events: Some(1), event_day_offset: &[("review", 14)], ..Default::default() },
+        },
+
+        // ---- odd / military time formats ----
+        Case {
+            name: "military time",
+            category: "odd-time",
+            history: &[],
+            seed: &[],
+            prompt: "Flight tomorrow at 1400.",
+            expect: E { events: Some(1), event_start_hm: &[("flight", 14, 0)], ..Default::default() },
+        },
+        Case {
+            name: "leading-zero 24h range",
+            category: "odd-time",
+            history: &[],
+            seed: &[],
+            prompt: "Block 0900-1030 for deep work tomorrow.",
+            expect: E { events: Some(1), event_start_hm: &[("deep", 9, 0)], event_minutes: &[("deep", 90)], ..Default::default() },
+        },
+        Case {
+            name: "duration-only break",
+            category: "odd-time",
+            history: &[],
+            seed: &[],
+            prompt: "Take a 30 minute break at 2pm today.",
+            expect: E { events: Some(1), event_start_hm: &[("break", 14, 0)], event_minutes: &[("break", 30)], ..Default::default() },
+        },
+
+        // ---- messy / sms-speak ----
+        Case {
+            name: "sms-speak appointment",
+            category: "messy",
+            history: &[],
+            seed: &[],
+            prompt: "dr appt tmrw 3p",
+            expect: E { events: Some(1), event_day_offset: &[("", 1)], event_start_hm: &[("", 15, 0)], ..Default::default() },
+        },
+        Case {
+            name: "abbreviated meeting",
+            category: "messy",
+            history: &[],
+            seed: &[],
+            prompt: "mtg w/ sarah mon 10a",
+            expect: E { events: Some(1), event_start_hm: &[("", 10, 0)], ..Default::default() },
+        },
+
+        // ---- "weekly" wording that is actually ONE event, not a habit ----
+        Case {
+            name: "weekly sync is a single event, not a habit",
+            category: "routing",
+            history: &[],
+            seed: &[],
+            prompt: "Set up our weekly sync this Thursday at 2pm.",
+            expect: E { events: Some(1), habits: Some(0), event_start_hm: &[("sync", 14, 0)], ..Default::default() },
+        },
+
+        // ---- multiple edits in one message ----
+        Case {
+            name: "two edits at once",
+            category: "multi-edit",
+            history: &[],
+            seed: &[("Dentist", 1, (14, 0), 1, (15, 0)), ("Workshop", 1, (10, 0), 1, (11, 0))],
+            prompt: "Move the dentist to 3pm and make the workshop 2 hours.",
+            expect: E { min_updated: Some(2), event_start_hm: &[("dentist", 15, 0)], event_minutes: &[("workshop", 120)], ..Default::default() },
+        },
+
+        // ---- mid-sentence self-correction → ONE event at the corrected time ----
+        Case {
+            name: "self-correction keeps the final value",
+            category: "correction",
+            history: &[],
+            seed: &[],
+            prompt: "Schedule a call at 3pm today, actually make it 4pm.",
+            expect: E { events: Some(1), event_start_hm: &[("call", 16, 0)], ..Default::default() },
+        },
+
+        // ---- per-task distinct deadlines ----
+        Case {
+            name: "two tasks, two different deadlines",
+            category: "hard-task",
+            history: &[],
+            seed: &[],
+            prompt: "Finish chapter 1 by Monday and chapter 2 by Wednesday.",
+            expect: E { min_tasks: Some(2), custom: Some(all_tasks_have_deadline), ..Default::default() },
+        },
+
+        // ---- a long, mixed brain-dump: event + task + habit + remove in one message ----
+        Case {
+            name: "long mixed brain-dump",
+            category: "multi-intent",
+            history: &[],
+            seed: &[("Old standup", 1, (9, 0), 1, (9, 30))],
+            prompt: "Ok my week: dentist Monday at 9am, finish the budget report (about 3 hours) by Wednesday, go for a run every morning, and cancel the old standup.",
+            expect: E { min_events: Some(1), min_tasks: Some(1), min_habits: Some(1), min_removed: Some(1), title_has: &["dentist"], habit_has: &["run"], ..Default::default() },
         },
     ]
 }

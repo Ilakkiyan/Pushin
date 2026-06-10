@@ -149,10 +149,18 @@ pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
     let mut stmt = conn.prepare("SELECT * FROM tasks ORDER BY created_at")?;
     let mut tasks: Vec<Task> = stmt.query_map([], row_to_task)?.collect::<rusqlite::Result<_>>()?;
 
-    let mut dep_stmt = conn.prepare("SELECT depends_on_task_id FROM task_deps WHERE task_id = ?1")?;
+    // All deps in a single query, grouped by task — avoids an N+1 query-per-task.
+    let mut by_task: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    let mut dep_stmt = conn.prepare("SELECT task_id, depends_on_task_id FROM task_deps")?;
+    let rows = dep_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (task_id, dep) = row?;
+        by_task.entry(task_id).or_default().push(dep);
+    }
     for t in &mut tasks {
-        let deps = dep_stmt.query_map(params![t.id], |r| r.get::<_, i64>(0))?;
-        t.depends_on = deps.collect::<rusqlite::Result<_>>()?;
+        if let Some(deps) = by_task.remove(&t.id) {
+            t.depends_on = deps;
+        }
     }
     Ok(tasks)
 }
@@ -297,6 +305,27 @@ pub fn set_block_locked(conn: &Connection, id: i64, locked: bool, start: &str, e
 }
 
 // ---------- Google account ----------
+//
+// OAuth tokens live in the OS keychain (`crate::secrets`), never in plaintext SQLite. The
+// `calendar_accounts` row keeps only non-secret metadata; the token columns stay NULL on modern
+// installs and exist solely as a graceful fallback when the keychain is unavailable (and as the
+// source for the one-time migration of legacy plaintext tokens in `get_google_account`).
+
+const KC_ACCESS: &str = "google-access-token";
+const KC_REFRESH: &str = "google-refresh-token";
+
+/// Resolve a token: prefer the keychain; otherwise migrate a legacy plaintext column value into
+/// the keychain (nulling the column) or, if the keychain is unavailable, return the column value.
+fn resolve_token(conn: &Connection, id: i64, kc_key: &str, null_col_sql: &str, legacy: Option<String>) -> Option<String> {
+    if let Some(v) = crate::secrets::get(kc_key) {
+        return Some(v);
+    }
+    let v = legacy.filter(|s| !s.is_empty())?;
+    if crate::secrets::set(kc_key, &v) {
+        let _ = conn.execute(null_col_sql, params![id]); // migrated in → drop the plaintext copy
+    }
+    Some(v)
+}
 
 pub fn get_google_account(conn: &Connection) -> Result<Option<GoogleAccount>> {
     let row = conn
@@ -318,7 +347,22 @@ pub fn get_google_account(conn: &Connection) -> Result<Option<GoogleAccount>> {
             },
         )
         .ok();
-    Ok(row)
+    let Some(mut acct) = row else { return Ok(None) };
+    acct.access_token = resolve_token(
+        conn,
+        acct.id,
+        KC_ACCESS,
+        "UPDATE calendar_accounts SET access_token = NULL WHERE id = ?1",
+        acct.access_token.take(),
+    );
+    acct.refresh_token = resolve_token(
+        conn,
+        acct.id,
+        KC_REFRESH,
+        "UPDATE calendar_accounts SET refresh_token = NULL WHERE id = ?1",
+        acct.refresh_token.take(),
+    );
+    Ok(Some(acct))
 }
 
 /// Replace the single Google account with fresh tokens after a successful OAuth.
@@ -331,18 +375,22 @@ pub fn save_google_account(
     token_expiry: &str,
 ) -> Result<()> {
     conn.execute("DELETE FROM calendar_accounts WHERE provider = 'google'", [])?;
+    // Tokens to the keychain; only write the DB column if the keychain is unavailable.
+    let db_access = (!crate::secrets::set(KC_ACCESS, access_token)).then_some(access_token);
+    let db_refresh = (!crate::secrets::set(KC_REFRESH, refresh_token)).then_some(refresh_token);
     conn.execute(
         "INSERT INTO calendar_accounts(provider, email, calendar_id, access_token, refresh_token, token_expiry, sync_token, connected_at)
          VALUES('google', ?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-        params![email, calendar_id, access_token, refresh_token, token_expiry, now_iso()],
+        params![email, calendar_id, db_access, db_refresh, token_expiry, now_iso()],
     )?;
     Ok(())
 }
 
 pub fn update_google_tokens(conn: &Connection, id: i64, access_token: &str, token_expiry: &str) -> Result<()> {
+    let db_access = (!crate::secrets::set(KC_ACCESS, access_token)).then_some(access_token);
     conn.execute(
         "UPDATE calendar_accounts SET access_token = ?2, token_expiry = ?3 WHERE id = ?1",
-        params![id, access_token, token_expiry],
+        params![id, db_access, token_expiry],
     )?;
     Ok(())
 }
@@ -356,6 +404,8 @@ pub fn update_google_sync_token(conn: &Connection, id: i64, sync_token: Option<&
 }
 
 pub fn delete_google_account(conn: &Connection) -> Result<()> {
+    crate::secrets::clear(KC_ACCESS);
+    crate::secrets::clear(KC_REFRESH);
     conn.execute("DELETE FROM calendar_accounts WHERE provider = 'google'", [])?;
     Ok(())
 }

@@ -2,15 +2,16 @@
 //! **day phrase + time** (which it does well); Rust computes the actual calendar date
 //! (which the model does badly). Dates are never trusted from the model.
 
-use crate::llm;
 use crate::model::{Event, Settings};
 use crate::scheduler::{fmt_dt, parse_dt};
+use crate::{hermes, llm, model_manager};
 use anyhow::Result;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// One prior chat turn, passed in for conversational context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +91,10 @@ pub struct UpdateEvent {
     pub date: Option<String>,
     #[serde(default)]
     pub span_days: Option<i64>,
+    /// A relative time shift in minutes ("push back an hour" → +60, "move up 30 min" → −30),
+    /// resolved in Rust and applied to the existing event's current start. Never from the model.
+    #[serde(default)]
+    pub shift_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,32 +300,35 @@ fn routine_summary(s: &Settings) -> String {
     }
 }
 
+/// The calendar the model sees — each event's day, time range, and length — so it can recognize an
+/// event and change/remove it without re-asking. Shared by the union prompt and the router/extractors.
+fn calendar_listing(events: &[Event]) -> String {
+    let now = Local::now().naive_local();
+    if events.is_empty() {
+        return "(the calendar is currently empty)".to_string();
+    }
+    events
+        .iter()
+        .take(30)
+        .map(|e| match (parse_dt(&e.start), parse_dt(&e.end)) {
+            (Some(s), Some(en)) => format!(
+                "- {} — {} {}-{} ({})",
+                e.title,
+                day_phrase(now.date(), s.date()),
+                s.format("%H:%M"),
+                en.format("%H:%M"),
+                fmt_dur((en - s).num_minutes().max(0)),
+            ),
+            (Some(s), None) => format!("- {} — {} {}", e.title, day_phrase(now.date(), s.date()), s.format("%H:%M")),
+            _ => format!("- {} ({})", e.title, e.start),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn system_prompt(events: &[Event], settings: &Settings) -> String {
     let now = Local::now().naive_local();
-
-    // Show the model what's already on the calendar — with each event's day, time range,
-    // and length — so it can recognize an event and change/remove it without re-asking.
-    let calendar = if events.is_empty() {
-        "(the calendar is currently empty)".to_string()
-    } else {
-        events
-            .iter()
-            .take(30)
-            .map(|e| match (parse_dt(&e.start), parse_dt(&e.end)) {
-                (Some(s), Some(en)) => format!(
-                    "- {} — {} {}-{} ({})",
-                    e.title,
-                    day_phrase(now.date(), s.date()),
-                    s.format("%H:%M"),
-                    en.format("%H:%M"),
-                    fmt_dur((en - s).num_minutes().max(0)),
-                ),
-                (Some(s), None) => format!("- {} — {} {}", e.title, day_phrase(now.date(), s.date()), s.format("%H:%M")),
-                _ => format!("- {} ({})", e.title, e.start),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let calendar = calendar_listing(events);
 
     format!(
         "Convert the user's message (use the whole conversation for context) into JSON with \
@@ -371,8 +379,11 @@ user: plan a blog - pick platform, write posts → {{\"projects\":[{{\"name\":\"
     )
 }
 
-/// Call the model with conversation context. Resolves task deadlines (event dates are
-/// resolved later, in `store_plan`). Holds no DB lock.
+/// NL → structured plan. **Router pass (Tier 2):** a cheap first call classifies the message into
+/// intents, then a narrow extractor runs per intent (events-only, tasks-only, …). A small model is
+/// far more reliable extracting one known type than juggling the whole union schema at once, which
+/// is what caused task-vs-event and recurrence misrouting. The deterministic recovery layer and
+/// `store_plan` are unchanged — they operate on the assembled `ParsedPlan`. Holds no DB lock.
 pub async fn plan(
     client: &reqwest::Client,
     settings: &Settings,
@@ -380,28 +391,18 @@ pub async fn plan(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<ParsedPlan> {
-    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt(current_events, settings) })];
-    // Only feed prior turns to a genuine follow-up. Handing history to a fresh, self-contained
-    // request is what lets a stale entity bleed in (a new "surgery" coming back titled "Study"
-    // from an earlier turn). See `needs_history`.
-    if needs_history(user_text) {
-        for turn in history.iter().rev().take(6).rev() {
-            let role = if turn.role == "assistant" { "assistant" } else { "user" };
-            messages.push(json!({ "role": role, "content": turn.content }));
+    let mut parsed = match route_intents(client, settings, current_events, history, user_text).await {
+        // Router classified the message → run only the relevant narrow extractors.
+        Ok(intents) if !intents.is_empty() => {
+            extract_by_intents(client, settings, current_events, history, user_text, &intents).await?
         }
-    }
-    messages.push(json!({ "role": "user", "content": user_text }));
+        // Router saw nothing actionable ("none") → respect it (don't fabricate; keeps restraint).
+        Ok(_) => ParsedPlan::default(),
+        // Router call itself failed (network/parse) → fall back to the single union call so a clear
+        // request never silently does nothing.
+        Err(_) => union_extract(client, settings, current_events, history, user_text).await?,
+    };
 
-    let raw = llm::chat_json(
-        client,
-        &settings.llm_base_url,
-        &settings.model_id,
-        Value::Array(messages),
-        response_schema(),
-    )
-    .await?;
-
-    let mut parsed: ParsedPlan = serde_json::from_value(raw)?;
     let today = Local::now().naive_local().date();
     unescape_plan(&mut parsed);
     resolve_task_deadlines(&mut parsed);
@@ -409,6 +410,388 @@ pub async fn plan(
     backfill_event_fields(&mut parsed, user_text, today);
     route_recurring_to_habits(&mut parsed, user_text);
     Ok(parsed)
+}
+
+// ---------------- Router pass + narrow per-intent extractors (Tier 2) ----------------
+
+/// An actionable thing the user's message asks for. "none"/unknown router outputs map to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    CreateEvent,
+    EditEvent,
+    RemoveEvent,
+    CreateTask,
+    CreateHabit,
+}
+
+fn intent_from_str(s: &str) -> Option<Intent> {
+    Some(match s {
+        "createEvent" => Intent::CreateEvent,
+        "editEvent" => Intent::EditEvent,
+        "removeEvent" => Intent::RemoveEvent,
+        "createTask" => Intent::CreateTask,
+        "createHabit" => Intent::CreateHabit,
+        _ => return None,
+    })
+}
+
+/// Build the chat messages, feeding prior turns only to genuine follow-ups (see `needs_history`).
+fn build_messages(system: String, history: &[ChatTurn], user_text: &str) -> Value {
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    if needs_history(user_text) {
+        for turn in history.iter().rev().take(6).rev() {
+            let role = if turn.role == "assistant" { "assistant" } else { "user" };
+            messages.push(json!({ "role": role, "content": turn.content }));
+        }
+    }
+    messages.push(json!({ "role": "user", "content": user_text }));
+    Value::Array(messages)
+}
+
+/// Now + routine (+ optional calendar) context shared by the router and extractor prompts.
+fn ctx_block(events: &[Event], settings: &Settings, with_calendar: bool) -> String {
+    let now = Local::now().naive_local();
+    let mut s = format!("Now is {} ({}).\n{}", now.format("%Y-%m-%d %H:%M"), now.format("%A"), routine_summary(settings));
+    if with_calendar {
+        s.push_str(&format!("Current calendar (reference for edits/removes):\n{}\n", calendar_listing(events)));
+    }
+    s
+}
+
+/// Stage 1: classify the message into the actions it needs.
+async fn route_intents(
+    client: &reqwest::Client,
+    settings: &Settings,
+    events: &[Event],
+    history: &[ChatTurn],
+    user_text: &str,
+) -> Result<Vec<Intent>> {
+    let system = format!(
+        "Classify what the user wants done with their calendar. Output {{\"intents\":[...]}} using ONLY:\n\
+- createEvent: a NEW thing at a set time (lunch, meeting, appointment, call, party, trip).\n\
+- editEvent: change an EXISTING calendar item (move, rename, make longer/shorter).\n\
+- removeEvent: delete or cancel an EXISTING calendar item.\n\
+- createTask: work to do with NO fixed time (study, write, build, plan, finish, read).\n\
+- createHabit: a recurring routine (\"every day\", \"daily\", \"each morning\", \"every night\").\n\
+- none: a greeting, or a vague/unactionable message.\n\
+Pick ALL that apply — one message can need several (e.g. an event AND a task). Output ONLY the intents array.\n\
+{}",
+        ctx_block(events, settings, true)
+    );
+    let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, build_messages(system, history, user_text), router_schema()).await?;
+    let mut out: Vec<Intent> = Vec::new();
+    if let Some(arr) = raw["intents"].as_array() {
+        for v in arr {
+            if let Some(i) = v.as_str().and_then(intent_from_str) {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Run one narrow extractor and deserialize its slice into a `ParsedPlan` (other fields stay empty).
+async fn run_extractor(
+    client: &reqwest::Client,
+    settings: &Settings,
+    system: String,
+    history: &[ChatTurn],
+    user_text: &str,
+    schema: Value,
+) -> Result<ParsedPlan> {
+    let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, build_messages(system, history, user_text), schema).await?;
+    Ok(serde_json::from_value(raw).unwrap_or_default())
+}
+
+/// Stage 2: run the relevant extractor for each routed intent and merge the slices.
+// ---- Dynamic few-shot: retrieve the exemplars most similar to the user's message (Tier 2) ----
+// Instead of a fixed example per extractor, we keep a small bank of (intent, utterance, gold-JSON)
+// exemplars, embed it once on-device via the bge server, and inject the top-k most similar to the
+// actual input. This kills example-parroting and gives the model an example shaped like its task
+// (e.g. a dependency exemplar surfaces for "fix bug then test then deploy"). Falls back to the first
+// exemplars of the intent when embeddings are unavailable — so it never regresses below static few-shot.
+
+struct Exemplar {
+    intent: Intent,
+    text: &'static str,
+    output: &'static str,
+}
+
+const EXEMPLARS: &[Exemplar] = &[
+    // createEvent — single thing → ONE event; multiple only when several are listed.
+    Exemplar { intent: Intent::CreateEvent, text: "gym tomorrow at 6 in the morning", output: "{\"events\":[{\"title\":\"Gym\",\"day\":\"tomorrow\",\"startTime\":\"06:00\"}]}" },
+    Exemplar { intent: Intent::CreateEvent, text: "coffee with alex friday at 3pm", output: "{\"events\":[{\"title\":\"Coffee with Alex\",\"day\":\"friday\",\"startTime\":\"15:00\"}]}" },
+    Exemplar { intent: Intent::CreateEvent, text: "team sync at noon for 45 minutes", output: "{\"events\":[{\"title\":\"Team sync\",\"startTime\":\"12:00\",\"durationMinutes\":45}]}" },
+    Exemplar { intent: Intent::CreateEvent, text: "lunch with mom friday 12-2 and a graduation party from 6-10", output: "{\"events\":[{\"title\":\"Lunch with mom\",\"day\":\"friday\",\"startTime\":\"12:00\",\"endTime\":\"14:00\"},{\"title\":\"Graduation party\",\"day\":\"friday\",\"startTime\":\"18:00\",\"endTime\":\"22:00\"}]}" },
+    // createTask — single activity → ONE task; explicit steps decompose; sequential → depends_on.
+    Exemplar { intent: Intent::CreateTask, text: "study for the exam, about 4 hours", output: "{\"projects\":[{\"name\":\"Exam\",\"tasks\":[{\"title\":\"Study for the exam\",\"estimated_minutes\":240,\"priority\":\"high\"}]}]}" },
+    Exemplar { intent: Intent::CreateTask, text: "plan a blog - pick platform, write 3 posts", output: "{\"projects\":[{\"name\":\"Blog\",\"tasks\":[{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"medium\"},{\"title\":\"Write 3 posts\",\"estimated_minutes\":180,\"priority\":\"medium\"}]}]}" },
+    Exemplar { intent: Intent::CreateTask, text: "to launch the app I need to fix the login bug, then write tests, then deploy", output: "{\"projects\":[{\"name\":\"Launch\",\"tasks\":[{\"title\":\"Fix the login bug\",\"estimated_minutes\":60,\"priority\":\"high\"},{\"title\":\"Write tests\",\"estimated_minutes\":60,\"priority\":\"high\",\"depends_on\":[\"Fix the login bug\"]},{\"title\":\"Deploy\",\"estimated_minutes\":30,\"priority\":\"high\",\"depends_on\":[\"Write tests\"]}]}]}" },
+    Exemplar { intent: Intent::CreateTask, text: "write the report, about 90 minutes, and email it, 10 minutes", output: "{\"projects\":[{\"name\":\"Report\",\"tasks\":[{\"title\":\"Write the report\",\"estimated_minutes\":90,\"priority\":\"medium\"},{\"title\":\"Email the report\",\"estimated_minutes\":10,\"priority\":\"medium\"}]}]}" },
+    // createHabit
+    Exemplar { intent: Intent::CreateHabit, text: "practice violin every day from 4 to 5pm", output: "{\"habits\":[{\"name\":\"Violin practice\",\"durationMinutes\":60}]}" },
+    Exemplar { intent: Intent::CreateHabit, text: "meditate for 10 minutes every morning", output: "{\"habits\":[{\"name\":\"Meditate\",\"durationMinutes\":10}]}" },
+    // editEvent
+    Exemplar { intent: Intent::EditEvent, text: "make the meeting 2 hours instead of 1", output: "{\"updateEvents\":[{\"match\":\"Meeting\",\"durationMinutes\":120}]}" },
+    Exemplar { intent: Intent::EditEvent, text: "move the dentist to 3pm", output: "{\"updateEvents\":[{\"match\":\"Dentist\",\"startTime\":\"15:00\"}]}" },
+    Exemplar { intent: Intent::EditEvent, text: "rename my gym session to morning workout", output: "{\"updateEvents\":[{\"match\":\"Gym session\",\"title\":\"Morning workout\"}]}" },
+    // removeEvent
+    Exemplar { intent: Intent::RemoveEvent, text: "remove all sleepovers", output: "{\"removeEvents\":[\"sleepover\"]}" },
+    Exemplar { intent: Intent::RemoveEvent, text: "cancel lunch with dan", output: "{\"removeEvents\":[\"lunch with Dan\"]}" },
+];
+
+/// Embed the exemplar bank once per process (one batch call) and cache it. `None` if the embed
+/// server isn't available — callers then fall back to static exemplars.
+async fn bank_embeddings(client: &reqwest::Client, base: &str, model: &str) -> Option<&'static [Vec<f32>]> {
+    static BANK: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+    if let Some(b) = BANK.get() {
+        return Some(b.as_slice());
+    }
+    let inputs: Vec<&str> = EXEMPLARS.iter().map(|e| e.text).collect();
+    let embs = hermes::embed_batch(client, base, model, &inputs).await.ok()?;
+    if embs.len() != EXEMPLARS.len() {
+        return None;
+    }
+    let _ = BANK.set(embs);
+    BANK.get().map(|b| b.as_slice())
+}
+
+/// Top-k exemplars of `intent` by cosine to the query embedding.
+fn select_exemplars(query: &[f32], bank: &[Vec<f32>], intent: Intent, k: usize) -> Vec<&'static Exemplar> {
+    let mut scored: Vec<(f32, &'static Exemplar)> = EXEMPLARS
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.intent == intent)
+        .map(|(i, e)| (hermes::cosine(query, &bank[i]), e))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(k).map(|(_, e)| e).collect()
+}
+
+/// The first `k` exemplars of an intent — the static fallback when embeddings are unavailable.
+fn default_exemplars(intent: Intent, k: usize) -> Vec<&'static Exemplar> {
+    EXEMPLARS.iter().filter(|e| e.intent == intent).take(k).collect()
+}
+
+fn exemplar_block(ex: &[&Exemplar]) -> String {
+    let mut s = String::from("Examples →\n");
+    for e in ex {
+        s.push_str(&format!("user: {} → {}\n", e.text, e.output));
+    }
+    s
+}
+
+async fn extract_by_intents(
+    client: &reqwest::Client,
+    settings: &Settings,
+    events: &[Event],
+    history: &[ChatTurn],
+    user_text: &str,
+    intents: &[Intent],
+) -> Result<ParsedPlan> {
+    let now = Local::now().naive_local();
+
+    // Embed the query + bank once (on-device, best-effort). If unavailable, `pick` falls back to
+    // static exemplars, so this never regresses below the fixed-example behavior.
+    let (qvec, bank): (Option<Vec<f32>>, Option<&'static [Vec<f32>]>) = if settings.embed_model.trim().is_empty() {
+        (None, None)
+    } else {
+        let base = model_manager::embed_base_url();
+        let bank = bank_embeddings(client, &base, &settings.embed_model).await;
+        let q = hermes::embed_text(client, &base, &settings.embed_model, user_text).await.ok();
+        match (q, bank) {
+            (Some(q), Some(_)) => (Some(q), bank),
+            _ => (None, None),
+        }
+    };
+    let pick = |intent: Intent| -> String {
+        let ex = match (&qvec, bank) {
+            (Some(q), Some(b)) => select_exemplars(q, b, intent, 2),
+            _ => default_exemplars(intent, 2),
+        };
+        exemplar_block(&ex)
+    };
+
+    let mut plan = ParsedPlan::default();
+    for intent in intents {
+        match intent {
+            Intent::CreateEvent => {
+                let system = format!(
+                    "Extract the NEW event(s) the user is scheduling into {{\"events\":[...]}}. Each event: \
+`title`, `day` (the EXACT word \"today\"/\"tomorrow\"/a weekday — NEVER a computed date), `startTime`, \
+`endTime` (24-hour \"HH:MM\"). If a time RANGE is given you MUST fill BOTH. \"12-2\" → 12:00/14:00; assume \
+PM for ambiguous hours unless clearly morning; overnight is fine (\"8pm to 8am\"). One day can cover several \
+events. Output exactly the events stated in THIS message — never invent extra ones.\n\
+Now is {now} ({wd}).\n\
+{examples}",
+                    now = now.format("%Y-%m-%d %H:%M"), wd = now.format("%A"), examples = pick(Intent::CreateEvent),
+                );
+                let p = run_extractor(client, settings, system, history, user_text, events_schema()).await?;
+                plan.events.extend(p.events);
+            }
+            Intent::CreateTask => {
+                let system = format!(
+                    "Extract the work the user needs to do into {{\"projects\":[{{\"name\":...,\"tasks\":[...]}}]}}. \
+Each task: `title`, `estimated_minutes`, `priority` (low/medium/high/urgent), optional `depends_on` (titles \
+of tasks that must finish first — use it for sequenced work like \"X then Y then Z\"). Tasks are work with NO \
+fixed time. Group related tasks under one short project name.\n\
+- A SINGLE activity is exactly ONE task — even with a duration or time (\"study for 2 hours\"). NEVER break \
+it into invented sub-steps.\n\
+- Output MULTIPLE tasks ONLY when the user explicitly lists several distinct steps.\n\
+Output only tasks from THIS message — never invent extra tasks.\n\
+Now is {now}.\n\
+{examples}",
+                    now = now.format("%Y-%m-%d %H:%M"), examples = pick(Intent::CreateTask),
+                );
+                let p = run_extractor(client, settings, system, history, user_text, projects_schema()).await?;
+                plan.projects.extend(p.projects);
+            }
+            Intent::CreateHabit => {
+                let system = format!(
+                    "Extract the recurring routine(s) into {{\"habits\":[{{\"name\":...,\"durationMinutes\":...}}]}}. \
+A habit is something done regularly (daily, every morning, every night). Don't ask which weekdays. Output \
+only routines from THIS message.\n\
+{examples}",
+                    examples = pick(Intent::CreateHabit),
+                );
+                let p = run_extractor(client, settings, system, history, user_text, habits_schema()).await?;
+                plan.habits.extend(p.habits);
+            }
+            Intent::EditEvent => {
+                let system = format!(
+                    "The user wants to CHANGE an existing calendar item. Output {{\"updateEvents\":[{{\"match\":<the \
+existing title or a word from it>, ...only the fields that change...}}]}}. Settable: `title`, `day`, \
+`startTime`, `endTime`, `durationMinutes`. To change only the LENGTH set `durationMinutes` and leave the \
+start. Times are 24-hour \"HH:MM\"; `day` is a day word, never a date. Match against the calendar below.\n\
+{ctx}\n\
+{examples}",
+                    ctx = ctx_block(events, settings, true), examples = pick(Intent::EditEvent),
+                );
+                let p = run_extractor(client, settings, system, history, user_text, update_schema()).await?;
+                plan.update_events.extend(p.update_events);
+            }
+            Intent::RemoveEvent => {
+                let system = format!(
+                    "The user wants to DELETE/cancel an existing calendar item. Output {{\"removeEvents\":[<title or a \
+word from it>]}}. Match against the calendar below; if several items share a word, prefer the most specific \
+phrase so siblings are spared.\n\
+{ctx}\n\
+{examples}",
+                    ctx = ctx_block(events, settings, true), examples = pick(Intent::RemoveEvent),
+                );
+                let p = run_extractor(client, settings, system, history, user_text, remove_schema()).await?;
+                plan.remove_events.extend(p.remove_events);
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Fallback: the original single union call. Used only when the router call fails outright, so a
+/// clear request never silently does nothing.
+async fn union_extract(
+    client: &reqwest::Client,
+    settings: &Settings,
+    events: &[Event],
+    history: &[ChatTurn],
+    user_text: &str,
+) -> Result<ParsedPlan> {
+    let messages = build_messages(system_prompt(events, settings), history, user_text);
+    let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages, response_schema()).await?;
+    Ok(serde_json::from_value(raw)?)
+}
+
+fn router_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "intents": { "type": "array", "maxItems": 6, "items": { "type": "string", "enum": ["createEvent", "editEvent", "removeEvent", "createTask", "createHabit", "none"] } }
+        },
+        "required": ["intents"]
+    })
+}
+
+/// The `day` enum the model may emit (day words + JSON null), shared by the event/edit schemas.
+fn day_enum() -> Value {
+    json!(["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", null])
+}
+
+fn events_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": { "events": { "type": "array", "maxItems": 15, "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "day": { "type": ["string", "null"], "enum": day_enum() },
+                "date": { "type": ["string", "null"] },
+                "startTime": { "type": ["string", "null"] },
+                "endTime": { "type": ["string", "null"] },
+                "durationMinutes": { "type": ["integer", "null"] }
+            }, "required": ["title"] } } },
+        "required": ["events"]
+    })
+}
+
+fn update_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": { "updateEvents": { "type": "array", "maxItems": 15, "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "match": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "title": { "type": ["string", "null"], "maxLength": 100 },
+                "day": { "type": ["string", "null"], "enum": day_enum() },
+                "startTime": { "type": ["string", "null"] },
+                "endTime": { "type": ["string", "null"] },
+                "durationMinutes": { "type": ["integer", "null"] }
+            }, "required": ["match"] } } },
+        "required": ["updateEvents"]
+    })
+}
+
+fn remove_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": { "removeEvents": { "type": "array", "maxItems": 15, "items": { "type": "string", "minLength": 1, "maxLength": 100 } } },
+        "required": ["removeEvents"]
+    })
+}
+
+fn projects_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": { "projects": { "type": "array", "maxItems": 6, "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+                "tasks": { "type": "array", "maxItems": 25, "items": {
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+                        "estimated_minutes": { "type": "integer" },
+                        "deadline": { "type": ["string", "null"] },
+                        "priority": { "type": "string", "enum": ["low", "medium", "high", "urgent"] },
+                        "depends_on": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 100 } },
+                        "chunkable": { "type": "boolean" }
+                    }, "required": ["title", "estimated_minutes", "priority"] } }
+            }, "required": ["name", "tasks"] } } },
+        "required": ["projects"]
+    })
+}
+
+fn habits_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": { "habits": { "type": "array", "maxItems": 10, "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 80 }, "durationMinutes": { "type": ["integer", "null"] } },
+            "required": ["name"] } } },
+        "required": ["habits"]
+    })
 }
 
 /// Does this message lean on the prior conversation (a follow-up/edit), so the planner needs
@@ -691,6 +1074,52 @@ fn find_explicit_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     None
 }
 
+/// Day-of-month from an ordinal token ("25th" → 25), 1..=31. Requires the `st/nd/rd/th` suffix.
+fn parse_ordinal(tok: &str) -> Option<u32> {
+    for suf in ["st", "nd", "rd", "th"] {
+        if let Some(num) = tok.strip_suffix(suf) {
+            if let Ok(d) = num.parse::<u32>() {
+                if (1..=31).contains(&d) {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The next calendar date with day-of-month `day` (this month if not yet past, else the next month
+/// that has that day). Skips months without the day (e.g. the 31st of a 30-day month).
+fn next_day_of_month(today: NaiveDate, day: u32) -> Option<NaiveDate> {
+    for add in 0..=13u32 {
+        let base = today.checked_add_months(chrono::Months::new(add))?;
+        if let Some(d) = NaiveDate::from_ymd_opt(base.year(), base.month(), day) {
+            if d >= today {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// An ordinal day-of-month the user wrote ("on the 25th", "the 3rd") → the next such date. The model
+/// can't express a bare day-of-month and Rust owns dates, so we resolve it here. Requires a preceding
+/// "the" so rank words ("my 1st meeting") aren't mistaken for a date.
+fn find_day_of_month(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let lower = text.to_lowercase();
+    let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for w in toks.windows(2) {
+        if w[0] == "the" {
+            if let Some(day) = parse_ordinal(w[1]) {
+                if let Some(d) = next_day_of_month(today, day) {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Some models HTML-escape titles ("A&M" → "A&amp;M"). Undo the common entities so titles
 /// render correctly. `&amp;` is unescaped last to avoid double-decoding.
 fn unescape_html(s: &str) -> String {
@@ -770,10 +1199,13 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
     let range = find_time_range(user_text);
     let duration = find_duration_minutes(user_text);
     let span = find_span_days(user_text);
-    let explicit_date = find_explicit_date(user_text, today);
+    // An explicit M/D, or an ordinal day-of-month ("the 25th") the model can't express — both
+    // resolved in Rust, never trusted from the model.
+    let explicit_date = find_explicit_date(user_text, today).or_else(|| find_day_of_month(user_text, today));
     // A range of named days ("wednesday and thursday") → a multi-day all-day span.
     let weekday_span = find_weekday_span(user_text, today);
-    if range.is_none() && duration.is_none() && span.is_none() && explicit_date.is_none() && weekday_span.is_none() {
+    let shift = find_time_shift(user_text);
+    if range.is_none() && duration.is_none() && span.is_none() && explicit_date.is_none() && weekday_span.is_none() && shift.is_none() {
         return;
     }
     let date_str = explicit_date.map(|d| d.format("%Y-%m-%d").to_string());
@@ -910,7 +1342,51 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
                 up.duration_minutes = Some(d);
             }
         }
+        // Relative shift ("push it back an hour") — recorded here, applied to the existing event's
+        // current start in `store_plan` (the model is unreliable at this arithmetic). A shift and an
+        // explicit new time don't co-occur, so a present `start_time` takes precedence downstream.
+        if up.start_time.is_none() {
+            up.shift_minutes = shift;
+        }
     }
+}
+
+/// A bare magnitude of time ("an hour" → 60, "half an hour" → 30, "30 minutes" → 30), for relative
+/// shifts where the quantity may be worded ("an hour") rather than numeric.
+fn shift_magnitude(lc: &str) -> Option<i64> {
+    if lc.contains("hour and a half") {
+        return Some(90);
+    }
+    if lc.contains("half an hour") || lc.contains("half hour") {
+        return Some(30);
+    }
+    if let Some(m) = find_duration_minutes(lc) {
+        return Some(m); // "30 minutes", "2 hours", "1.5 hrs", "45 min"
+    }
+    if lc.contains("an hour") || lc.contains("a hour") || lc.contains("one hour") {
+        return Some(60);
+    }
+    None
+}
+
+/// A relative time shift the user asked for on an existing event ("push it back an hour" → +60,
+/// "move it up 30 minutes" → −30). Signed minutes; `None` if there's no clear shift phrase + amount.
+/// "back/later/delay/postpone" = later (+); "up/earlier/sooner" = earlier (−). Ambiguous words
+/// (a bare "forward"/"back") are intentionally excluded.
+fn find_time_shift(text: &str) -> Option<i64> {
+    let lc = text.to_lowercase();
+    // "back" reads as later here — the dominant scheduling idiom ("push/move a meeting back" =
+    // postpone). It only fires alongside an amount (below), so "move it back to 3pm" won't trip it.
+    let later = ["back", "postpone", "delay", "later", "push out"];
+    let earlier = ["move up", "moved up", "move it up", "bump up", "earlier", "sooner"];
+    let dir = if later.iter().any(|p| lc.contains(p)) {
+        1
+    } else if earlier.iter().any(|p| lc.contains(p)) {
+        -1
+    } else {
+        return None;
+    };
+    shift_magnitude(&lc).map(|m| dir * m)
 }
 
 /// Pull an explicit length ("2 hours", "90 min", "1.5 hrs") out of free text. Returns the
@@ -1626,7 +2102,14 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             if !event_matches(&e.title, &up.target) {
                 continue;
             }
-            let (t, s, en) = merge_event(&e, now, up.day.as_deref(), up.date.as_deref(), up.start_time.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
+            // A relative shift becomes a concrete new start, computed from THIS event's current
+            // start (Rust does the arithmetic the model can't). An explicit start_time wins over it.
+            let shifted = up
+                .shift_minutes
+                .filter(|_| up.start_time.is_none())
+                .and_then(|d| parse_dt(&e.start).map(|s| (s + Duration::minutes(d)).format("%H:%M").to_string()));
+            let start_arg = up.start_time.clone().or(shifted);
+            let (t, s, en) = merge_event(&e, now, up.day.as_deref(), up.date.as_deref(), start_arg.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
             crate::db::update_event(conn, e.id, &t, &s, &en)?;
             updated_event_titles.push(t);
         }
@@ -2077,6 +2560,7 @@ mod tests {
                 duration_minutes: None,
                 date: None,
                 span_days: None,
+                shift_minutes: None,
             }],
             ..Default::default()
         };
@@ -2231,6 +2715,7 @@ mod tests {
                 duration_minutes: None,
                 date: None,
                 span_days: None,
+                shift_minutes: None,
             }],
             habits: vec![ParsedHabit { name: "Violin practice".into(), duration_minutes: 60 }],
             ..Default::default()
@@ -2314,6 +2799,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_relative_time_shift() {
+        assert_eq!(find_time_shift("push my dentist appointment back an hour"), Some(60));
+        assert_eq!(find_time_shift("move it up 30 minutes"), Some(-30));
+        assert_eq!(find_time_shift("can you push the meeting back half an hour"), Some(30));
+        assert_eq!(find_time_shift("postpone it by 2 hours"), Some(120));
+        assert_eq!(find_time_shift("make it earlier by 15 min"), Some(-15));
+        // no direction, or no amount → not a shift
+        assert_eq!(find_time_shift("move it to 3pm"), None);
+        assert_eq!(find_time_shift("push it back"), None);
+
+        // End to end: backfill stamps the shift; store_plan applies it off the existing start.
+        let now = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let mut plan = ParsedPlan {
+            update_events: vec![UpdateEvent {
+                target: "Dentist".into(),
+                title: None,
+                day: None,
+                start_time: None,
+                end_time: None,
+                duration_minutes: None,
+                date: None,
+                span_days: None,
+                shift_minutes: None,
+            }],
+            ..Default::default()
+        };
+        backfill_event_fields(&mut plan, "push my dentist appointment back an hour", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+        assert_eq!(plan.update_events[0].shift_minutes, Some(60));
+        // Apply against a 14:00 event → 15:00, duration preserved.
+        let dentist = crate::model::Event {
+            id: 1,
+            title: "Dentist".into(),
+            start: "2026-06-09T14:00:00".into(),
+            end: "2026-06-09T15:00:00".into(),
+            kind: "fixed".into(),
+            source: "manual".into(),
+            created_at: String::new(),
+            provider: None,
+            external_id: None,
+            account_id: None,
+            etag: None,
+        };
+        let up = &plan.update_events[0];
+        let shifted = up.shift_minutes.and_then(|d| parse_dt(&dentist.start).map(|s| (s + Duration::minutes(d)).format("%H:%M").to_string()));
+        let (_t, s, en) = merge_event(&dentist, now, None, None, shifted.as_deref(), None, None, None, None);
+        assert_eq!(s, "2026-06-09T15:00:00");
+        assert_eq!((parse_dt(&en).unwrap() - parse_dt(&s).unwrap()).num_minutes(), 60);
+    }
+
+    #[test]
+    fn parses_ordinal_day_of_month() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+        // "the 25th" is later this month.
+        assert_eq!(find_day_of_month("renew my passport on the 25th at 10am", today), NaiveDate::from_ymd_opt(2026, 6, 25));
+        // "the 3rd" already passed this month → next month.
+        assert_eq!(find_day_of_month("dentist on the 3rd", today), NaiveDate::from_ymd_opt(2026, 7, 3));
+        // today's own ordinal resolves to today.
+        assert_eq!(find_day_of_month("the 5th", today), NaiveDate::from_ymd_opt(2026, 6, 5));
+        // requires a preceding "the" — rank words are not dates.
+        assert_eq!(find_day_of_month("my 1st meeting tomorrow", today), None);
+        assert_eq!(find_day_of_month("no ordinal here", today), None);
+        // the 31st skips 30-day months (June, Sept) to the next month that has it.
+        assert_eq!(find_day_of_month("the 31st", today), NaiveDate::from_ymd_opt(2026, 7, 31));
+        // folds into the event date path: an ordinal-dated event lands on that day.
+        let now = today.and_hms_opt(9, 0, 0).unwrap();
+        let mut e = ev("today", Some("10:00"), None);
+        e.title = "Renew passport".into();
+        e.day = None;
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        backfill_event_fields(&mut plan, "renew my passport on the 25th at 10am", today);
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-25"));
+        assert_eq!(resolve_event(now, &plan.events[0]).unwrap().0.date(), NaiveDate::from_ymd_opt(2026, 6, 25).unwrap());
+    }
+
+    #[test]
     fn vietnam_trip_becomes_an_all_day_multi_day_event() {
         // "on 6/12 ... staying for two weeks" → all-day event 6/12 → 6/26, not a 24h block.
         let now = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap().and_hms_opt(9, 0, 0).unwrap();
@@ -2370,6 +2930,7 @@ mod tests {
             duration_minutes: None,
             date: None,
             span_days: None,
+            shift_minutes: None,
         };
         let mut plan = ParsedPlan {
             events: vec![trip],
@@ -2402,6 +2963,7 @@ mod tests {
             duration_minutes: None,
             date: None,
             span_days: None,
+            shift_minutes: None,
         };
         let mut plan = ParsedPlan { events: vec![create], update_events: vec![update], ..Default::default() };
         backfill_event_fields(&mut plan, "i have a&m orientation from wednesday to thursday this week", mon);
@@ -2427,6 +2989,7 @@ mod tests {
             duration_minutes: None,
             date: None,
             span_days: None,
+            shift_minutes: None,
         };
         let mut plan = ParsedPlan { update_events: vec![up("A&M - Wednesday"), up("A&M - Thursday")], ..Default::default() };
         backfill_event_fields(&mut plan, "they are full day", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());

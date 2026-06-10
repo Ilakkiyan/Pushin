@@ -114,14 +114,37 @@ struct DownloadProgress {
     total: u64,
 }
 
-/// Stream-download a model, emitting `model-download-progress` events, verify SHA-256
-/// when provided, and atomically move into place.
+/// Ask HuggingFace for a model file's sha256 without downloading it: a HEAD on the resolve URL
+/// returns `X-Linked-ETag` (the LFS object's sha256) on the pre-redirect response. We must NOT
+/// follow the redirect, or we'd read the CDN's etag instead. Fails closed.
+async fn fetch_hf_sha256(url: &str) -> Result<String> {
+    let head_client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let resp = head_client.head(url).header("User-Agent", "pushin-app").send().await?;
+    resp.headers()
+        .get("x-linked-etag")
+        .or_else(|| resp.headers().get("etag"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("couldn't get a sha256 checksum for this model from HuggingFace — refusing to download it unverified"))
+}
+
+/// Stream-download a model, emitting `model-download-progress` events, verify its SHA-256
+/// (always — fetched from HuggingFace if not supplied), and atomically move into place.
 pub async fn download_model(app: AppHandle, client: reqwest::Client, id: String, expected_sha: String) -> Result<String> {
     let info = model_info(&id).ok_or_else(|| anyhow!("unknown model id: {id}"))?;
     let dest = model_file_path(&app, info.filename)?;
     if dest.exists() {
         return Ok(dest.display().to_string());
     }
+
+    // Resolve the expected checksum first and fail closed if we can't get one — never write an
+    // unverified model. A caller-supplied hash wins; otherwise ask HuggingFace for the file's sha256.
+    let expected = if expected_sha.trim().is_empty() {
+        fetch_hf_sha256(info.url).await?
+    } else {
+        expected_sha.trim().to_string()
+    };
 
     let resp = client.get(info.url).send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or((info.size_mb as u64) * 1_000_000);
@@ -146,12 +169,10 @@ pub async fn download_model(app: AppHandle, client: reqwest::Client, id: String,
     file.flush()?;
     drop(file);
 
-    if !expected_sha.trim().is_empty() {
-        let got = hex::encode(hasher.finalize());
-        if !got.eq_ignore_ascii_case(expected_sha.trim()) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(anyhow!("model checksum mismatch (got {got})"));
-        }
+    let got = hex::encode(hasher.finalize());
+    if !got.eq_ignore_ascii_case(&expected) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow!("model checksum mismatch — refusing a tampered download (wanted {expected}, got {got})"));
     }
 
     std::fs::rename(&tmp, &dest)?;
@@ -189,9 +210,25 @@ fn platform_asset_candidates() -> Option<&'static [&'static str]> {
     }
 }
 
+/// Verify downloaded bytes against a GitHub asset digest of the form `sha256:<hex>`.
+/// Fails closed: a missing/non-sha256 digest or any mismatch is an error, so an unverified
+/// or tampered binary is never written to disk, unpacked, or executed.
+fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
+    let want = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("inference engine asset has no sha256 checksum — refusing to run an unverified binary"))?
+        .trim();
+    let got = hex::encode(Sha256::digest(bytes));
+    if got.eq_ignore_ascii_case(want) {
+        Ok(())
+    } else {
+        Err(anyhow!("inference engine checksum mismatch — refusing to run a tampered binary (wanted {want}, got {got})"))
+    }
+}
+
 /// Find the newest llama.cpp release asset for this platform ("latest" sometimes has no
 /// assets yet, so we scan recent releases; within a release we honor candidate order).
-async fn find_server_asset(client: &reqwest::Client) -> Result<(String, String)> {
+async fn find_server_asset(client: &reqwest::Client) -> Result<(String, String, String)> {
     let candidates = platform_asset_candidates()
         .ok_or_else(|| anyhow!("automatic engine download isn't supported on this OS yet — install llama.cpp or Ollama"))?;
     let releases: serde_json::Value = client
@@ -215,9 +252,13 @@ async fn find_server_asset(client: &reqwest::Client) -> Result<(String, String)>
                     // future checksum/signature sidecars sharing the same prefix).
                     let is_archive = name.ends_with(".zip") || name.ends_with(".tar.gz");
                     if is_archive && name.contains(cand) {
-                        let url = a["browser_download_url"].as_str().unwrap_or_default().to_string();
-                        if !url.is_empty() {
-                            return Ok((name.to_string(), url));
+                        let url = a["browser_download_url"].as_str().unwrap_or_default();
+                        // GitHub publishes a "sha256:<hex>" digest per asset. We only accept an
+                        // asset we can verify, and check the bytes against it before running them
+                        // (the engine is an executable we spawn — never run an unverified binary).
+                        let digest = a["digest"].as_str().unwrap_or_default();
+                        if !url.is_empty() && digest.starts_with("sha256:") {
+                            return Ok((name.to_string(), url.to_string(), digest.to_string()));
                         }
                     }
                 }
@@ -241,9 +282,11 @@ pub async fn ensure_server_binary(app: &AppHandle, client: &reqwest::Client) -> 
     }
 
     let _ = app.emit("inference-status", "Downloading the inference engine…");
-    let (name, url) = find_server_asset(client).await?;
+    let (name, url, digest) = find_server_asset(client).await?;
     let archive = dir.join(&name);
     let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
+    // Integrity gate: verify against GitHub's published checksum BEFORE writing/unpacking/spawning.
+    verify_sha256(&bytes, &digest)?;
     std::fs::write(&archive, &bytes)?;
 
     let _ = app.emit("inference-status", "Unpacking the inference engine…");
@@ -446,7 +489,18 @@ fn spawn_llama(app: &AppHandle, model: &std::path::Path, port: u16, embeddings: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+
+    #[test]
+    fn sha256_gate_accepts_match_and_rejects_everything_else() {
+        // sha256("hello world")
+        let good = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(verify_sha256(b"hello world", good).is_ok());
+        // hex compare is case-insensitive (prefix stays lowercase, as GitHub sends it)
+        assert!(verify_sha256(b"hello world", "sha256:B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9").is_ok());
+        assert!(verify_sha256(b"tampered bytes", good).is_err()); // wrong content
+        assert!(verify_sha256(b"hello world", "md5:abc").is_err()); // non-sha256 algo
+        assert!(verify_sha256(b"hello world", "").is_err()); // missing digest → fail closed
+    }
 
     /// The engine archive may bury the binary under a top-level dir (macOS/Linux) or lay it
     /// flat (Windows). Extraction + flatten must land the binary AND its sibling libs in `bin/`

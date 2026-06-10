@@ -34,6 +34,34 @@ pub async fn embed_text(client: &reqwest::Client, base_url: &str, model: &str, i
     Ok(vec)
 }
 
+/// Embed several inputs in one request (the OpenAI API accepts an array). Results are placed by the
+/// response's `index` field so order matches `inputs`. Used to embed the few-shot exemplar bank once.
+pub async fn embed_batch(client: &reqwest::Client, base_url: &str, model: &str, inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
+    let base = base_url.trim_end_matches('/');
+    let resp = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": model, "input": inputs }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("embeddings request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| anyhow!("embeddings endpoint error: {e}"))?;
+    let v: Value = resp.json().await?;
+    let data = v["data"].as_array().ok_or_else(|| anyhow!("no data in embeddings response"))?;
+    let mut out: Vec<Vec<f32>> = vec![Vec::new(); inputs.len()];
+    for d in data {
+        let idx = d["index"].as_u64().unwrap_or(0) as usize;
+        let vec: Vec<f32> = d["embedding"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).unwrap_or_default();
+        if idx < out.len() {
+            out[idx] = vec;
+        }
+    }
+    if out.iter().any(|v| v.is_empty()) {
+        bail!("batch embedding returned an empty vector");
+    }
+    Ok(out)
+}
+
 /// Pack an f32 vector into a little-endian byte blob for SQLite storage.
 pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);

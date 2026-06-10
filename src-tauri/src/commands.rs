@@ -2,7 +2,7 @@
 //! held across an `.await` (so async commands stay `Send`).
 
 use crate::booking::{self, BookingSlot};
-use crate::calendar::{google, local::LocalProvider, CalendarProvider};
+use crate::calendar::google;
 use crate::model::*;
 use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
@@ -538,17 +538,6 @@ pub async fn sync_google(state: State<'_, AppState>) -> Result<google::SyncSumma
     Ok(summary)
 }
 
-/// Local-provider read (the seam demo); unused by the Google path.
-#[tauri::command]
-pub fn sync_calendar(state: State<AppState>) -> Result<usize, String> {
-    let conn = state.db.lock().unwrap();
-    let settings = db::get_settings(&conn).map_err(err)?;
-    let now = Local::now().naive_local();
-    let start = scheduler::fmt_dt(now);
-    let end = scheduler::fmt_dt(now + chrono::Duration::days(settings.horizon_days.max(1)));
-    let events = LocalProvider.pull_events(&conn, &start, &end).map_err(err)?;
-    Ok(events.len())
-}
 
 // ---------- inference / model management ----------
 

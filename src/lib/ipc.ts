@@ -251,7 +251,6 @@ export const api = {
   connectGoogle: () => invoke<string>("connect_google"),
   disconnectGoogle: () => invoke<void>("disconnect_google"),
   syncGoogle: () => invoke<SyncSummary>("sync_google"),
-  syncCalendar: () => invoke<number>("sync_calendar"),
 
   llmStatus: () => invoke<LlmStatus>("llm_status"),
   listModels: () => invoke<ModelInfo[]>("list_models"),

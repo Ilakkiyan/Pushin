@@ -11,6 +11,7 @@ pub mod model;
 mod model_manager;
 pub mod parser;
 mod scheduler;
+mod secrets;
 
 use commands::AppState;
 use std::sync::Mutex;
@@ -72,7 +73,6 @@ pub fn run() {
             commands::connect_google,
             commands::disconnect_google,
             commands::sync_google,
-            commands::sync_calendar,
             commands::llm_status,
             commands::list_models,
             commands::model_present,

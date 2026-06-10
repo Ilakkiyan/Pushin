@@ -38,6 +38,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Google OAuth (PKCE) — base64url challenge + random verifier
 base64 = "0.22"
 getrandom = "0.2"
+# OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service) so Google
+# OAuth tokens are never persisted in plaintext SQLite.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # Error handling
 anyhow = "1"
 thiserror = "2"
