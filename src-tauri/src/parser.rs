@@ -340,7 +340,19 @@ fn calendar_listing(events: &[Event]) -> String {
         .join("\n")
 }
 
-fn system_prompt(events: &[Event], settings: &Settings) -> String {
+/// The fixed example block used by the union prompt when dynamic exemplars are unavailable (embed
+/// server down or semantic off). Covers all five output shapes. `union_extract` swaps in
+/// message-relevant exemplars (`select_union_exemplars`) when embeddings are up.
+const STATIC_EXAMPLES: &str = "Examples:\n\
+user: lunch with mom friday 12-2 → {\"events\":[{\"title\":\"Lunch with mom\",\"day\":\"friday\",\"startTime\":\"12:00\",\"endTime\":\"14:00\"}]}\n\
+user: remove all sleepovers → {\"removeEvents\":[\"sleepover\"]}\n\
+user: make the sleepover 8pm to 8am → {\"updateEvents\":[{\"match\":\"sleepover\",\"startTime\":\"20:00\",\"endTime\":\"08:00\"}]}\n\
+user: make the meeting today 2 hours instead of 1 → {\"updateEvents\":[{\"match\":\"Meeting\",\"durationMinutes\":120}]}\n\
+user: practice violin every day from 4pm to 5pm → {\"habits\":[{\"name\":\"Violin practice\",\"durationMinutes\":60}]}\n\
+user: exercise daily → {\"habits\":[{\"name\":\"Exercise\",\"durationMinutes\":30}]}\n\
+user: plan a blog - pick platform, write posts → {\"projects\":[{\"name\":\"Blog\",\"tasks\":[{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}]}]}";
+
+fn system_prompt(events: &[Event], settings: &Settings, examples: &str) -> String {
     let now = Local::now().naive_local();
     let calendar = calendar_listing(events);
 
@@ -378,18 +390,12 @@ their titles (e.g. \"Blog\", \"Pick platform\") unless the user actually mention
 {routine}\
 Events already on the calendar (reference these to change or remove them):\n\
 {calendar}\n\
-Examples:\n\
-user: lunch with mom friday 12-2 → {{\"events\":[{{\"title\":\"Lunch with mom\",\"day\":\"friday\",\"startTime\":\"12:00\",\"endTime\":\"14:00\"}}]}}\n\
-user: remove all sleepovers → {{\"removeEvents\":[\"sleepover\"]}}\n\
-user: make the sleepover 8pm to 8am → {{\"updateEvents\":[{{\"match\":\"sleepover\",\"startTime\":\"20:00\",\"endTime\":\"08:00\"}}]}}\n\
-user: make the meeting today 2 hours instead of 1 → {{\"updateEvents\":[{{\"match\":\"Meeting\",\"durationMinutes\":120}}]}}\n\
-user: practice violin every day from 4pm to 5pm → {{\"habits\":[{{\"name\":\"Violin practice\",\"durationMinutes\":60}}]}}\n\
-user: exercise daily → {{\"habits\":[{{\"name\":\"Exercise\",\"durationMinutes\":30}}]}}\n\
-user: plan a blog - pick platform, write posts → {{\"projects\":[{{\"name\":\"Blog\",\"tasks\":[{{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}}]}}]}}",
+{examples}",
         now = now.format("%Y-%m-%d %H:%M"),
         weekday = now.format("%A"),
         routine = routine_summary(settings),
         calendar = calendar,
+        examples = examples,
     )
 }
 
@@ -438,6 +444,139 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
     route_recurring_to_habits(plan, user_text);
+    apply_restraint_guard(plan, user_text, today);
+}
+
+/// **Restraint guard.** Small on-device models — especially once shown create-shaped few-shot
+/// examples — sometimes fabricate an event/task from a message that asks for nothing: a greeting
+/// ("hey, how's it going?") or a past-tense report ("I already finished the laundry earlier"). When
+/// the plan holds ONLY fabricated creates (no edit/remove/habit — those are high-confidence actions),
+/// the message carries NO scheduling cue (time/date/recurrence/scheduling verb), AND it reads as a
+/// greeting or a completed-action report, drop the fabrication and ask what to schedule instead.
+/// Conservative by construction: all three gates must hold, so a real request that merely opens with
+/// "hi" ("hi, add gym tomorrow at 6am") is never suppressed (its time/verb cue trips `has_action_cue`).
+fn apply_restraint_guard(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
+    let fabricated = !plan.events.is_empty() || plan.projects.iter().any(|p| !p.tasks.is_empty());
+    let strong_action = !plan.update_events.is_empty() || !plan.remove_events.is_empty() || !plan.habits.is_empty();
+    if !fabricated || strong_action || has_action_cue(text, today) {
+        return;
+    }
+    if is_greeting(text) || is_past_completion(text) || is_vague_plans(text) {
+        plan.events.clear();
+        plan.projects.clear();
+        if plan.clarifications.is_empty() {
+            plan.clarifications.push("What would you like to schedule?".into());
+        }
+    }
+}
+
+/// The message gestures at unspecified future activity ("I have some stuff going on next week")
+/// without naming any concrete event — the model loves to elaborate this into invented items. Paired
+/// with the `has_action_cue` gate in the guard, so a vague phrase next to a real time/verb is spared.
+fn is_vague_plans(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const VAGUE: &[&str] = &[
+        "some stuff", "stuff going on", "some things", "a few things", "bunch of stuff", "lot going on",
+        "a lot to do", "lots going on", "lots to do", "some plans", "things going on", "a lot going on",
+    ];
+    VAGUE.iter().any(|p| t.contains(p))
+}
+
+/// Future-oriented scheduling signals: a clock time, a resolvable date/span, a recurrence, or an
+/// explicit scheduling/edit verb. Deliberately ignores bare activity nouns and past-tense verbs so a
+/// completed-action report ("I already finished the laundry") isn't mistaken for a live request.
+fn has_action_cue(text: &str, today: NaiveDate) -> bool {
+    if mentions_clock_time(text) {
+        return true;
+    }
+    if find_explicit_date(text, today).is_some()
+        || find_relative_date(text, today).is_some()
+        || find_day_of_month(text, today).is_some()
+        || find_span_days(text).is_some()
+        || recurrence(text).is_some()
+    {
+        return true;
+    }
+    // Word/phrase-bounded match (punctuation → spaces, wrapped in spaces) so "going to" doesn't fire
+    // on "going today" and "set a" doesn't fire on "set apart".
+    let norm: String = text.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '\'' { c } else { ' ' }).collect();
+    let padded = format!(" {} ", norm.split_whitespace().collect::<Vec<_>>().join(" "));
+    const VERBS: &[&str] = &[
+        "schedule", "add", "book", "remind", "set up", "setup", "set a", "make a", "put", "plan",
+        "create", "move", "reschedule", "cancel", "remove", "delete", "rename", "need to", "needs to",
+        "have to", "has to", "want to", "wanna", "going to", "gonna", "will", "i'll", "let's", "block", "pencil",
+    ];
+    VERBS.iter().any(|v| padded.contains(&format!(" {v} ")))
+}
+
+/// True if a clock time is mentioned ("2pm", "9:30", "3 pm", "at 3", "noon"). Narrow on purpose: the
+/// "am"/"pm" must sit on a digit-bearing or numeric-preceding token, so words like "team"/"I am" don't match.
+fn mentions_clock_time(text: &str) -> bool {
+    let l = text.to_lowercase();
+    if l.contains("noon") || l.contains("midnight") || l.contains("o'clock") || l.contains("oclock") {
+        return true;
+    }
+    let chars: Vec<char> = l.chars().collect();
+    for i in 1..chars.len() {
+        if chars[i] == ':' && chars[i - 1].is_ascii_digit() && chars.get(i + 1).map_or(false, |c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    let toks: Vec<&str> = l.split_whitespace().collect();
+    for (i, w) in toks.iter().enumerate() {
+        if *w == "at" && toks.get(i + 1).and_then(|n| n.chars().next()).map_or(false, |c| c.is_ascii_digit()) {
+            return true;
+        }
+        let trimmed = w.trim_end_matches(|c: char| c == '.' || c == ',' || c == '!' || c == '?');
+        let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
+        if has_digit && (trimmed.ends_with("am") || trimmed.ends_with("pm")) {
+            return true;
+        }
+        if (*w == "am" || *w == "pm") && i > 0 && toks[i - 1].chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The message is essentially a greeting / social pleasantry.
+fn is_greeting(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    const PHRASES: &[&str] = &[
+        "how's it going", "hows it going", "how are you", "how is it going", "how's your day",
+        "what's up", "whats up", "how have you been", "nice to meet you", "good to see you",
+    ];
+    if PHRASES.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+    let first: String = t.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '\'').collect();
+    matches!(first.as_str(), "hi" | "hey" | "hello" | "yo" | "sup" | "howdy" | "hiya" | "heya" | "greetings")
+        || t.starts_with("good morning")
+        || t.starts_with("good afternoon")
+        || t.starts_with("good evening")
+}
+
+/// The message reports an action the user ALREADY did (past tense + a completion marker, with no
+/// future framing) — not a new thing to schedule.
+fn is_past_completion(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const DONE: &[&str] = &[
+        "finished", "completed", "wrapped up", "took care of", "got done", "did the", "have done",
+        "i've done", "ive done", "i did", "knocked out", "already done",
+    ];
+    if !DONE.iter().any(|d| t.contains(d)) {
+        return false;
+    }
+    const PAST: &[&str] = &[
+        "already", "earlier", "yesterday", "last night", "this morning", "this afternoon", "just now", "a while ago", "ago",
+    ];
+    const FUTURE: &[&str] = &[
+        "need to", "have to", "want to", "going to", "gonna", "will ", "i'll", "should ", "by ", "before ", "tomorrow", "next ",
+    ];
+    PAST.iter().any(|p| t.contains(p)) && !FUTURE.iter().any(|f| t.contains(f))
 }
 
 /// **Datagen only.** The single-call (union-format) chat messages the fine-tuned student will see at
@@ -445,7 +584,8 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
 /// *router* pipeline (`plan`), which routes far better than a one-shot union call: that distills the
 /// router's correctness into the one-call format the student uses.
 pub fn union_messages(settings: &Settings, current_events: &[Event], history: &[ChatTurn], user_text: &str) -> Value {
-    build_messages(system_prompt(current_events, settings), history, user_text)
+    // Datagen uses the static example block (no embed server in the finetune toolchain).
+    build_messages(system_prompt(current_events, settings, STATIC_EXAMPLES), history, user_text)
 }
 
 /// **Datagen only** (see `finetune/`). Run the SINGLE union extraction (no router) against a teacher
@@ -463,7 +603,7 @@ pub async fn union_label(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<(Value, Value, ParsedPlan)> {
-    let system = system_prompt(current_events, settings);
+    let system = system_prompt(current_events, settings, STATIC_EXAMPLES);
     let messages = build_messages(system, history, user_text);
     let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages.clone(), response_schema()).await?;
     let mut plan: ParsedPlan = serde_json::from_value(raw.clone()).unwrap_or_default();
@@ -637,6 +777,69 @@ fn default_exemplars(intent: Intent, k: usize) -> Vec<&'static Exemplar> {
     EXEMPLARS.iter().filter(|e| e.intent == intent).take(k).collect()
 }
 
+/// Embed the user message + the exemplar bank (best-effort, on-device). Returns `(query, bank)`;
+/// either being `None` means callers fall back to static exemplars. Shared by the union path and the
+/// router's per-intent extractors so both pick exemplars the same way. Gated on `embed_model`
+/// (empty = semantic off).
+async fn query_and_bank(
+    client: &reqwest::Client,
+    settings: &Settings,
+    user_text: &str,
+) -> (Option<Vec<f32>>, Option<&'static [Vec<f32>]>) {
+    if settings.embed_model.trim().is_empty() {
+        return (None, None);
+    }
+    let base = model_manager::embed_base_url();
+    let bank = bank_embeddings(client, &base, &settings.embed_model).await;
+    let q = hermes::embed_text(client, &base, &settings.embed_model, user_text).await.ok();
+    match (q, bank) {
+        (Some(q), Some(_)) => (Some(q), bank),
+        _ => (None, None),
+    }
+}
+
+/// Exemplars for the UNION prompt, which has no routed intents. Guarantees one example of EACH output
+/// shape (so habit/task forms never disappear for a message that reads like a different intent —
+/// directly guarding the multi-intent habit-drop case), choosing the most query-similar exemplar of
+/// each, then reinforces the dominant intent with the next-most-similar overall, capped at 7 (≈ the
+/// static block's size, so the prompt doesn't grow — longer prompts degrade the small model).
+fn select_union_exemplars(query: &[f32], bank: &[Vec<f32>]) -> Vec<&'static Exemplar> {
+    let mut scored: Vec<(f32, usize)> = (0..EXEMPLARS.len()).map(|i| (hermes::cosine(query, &bank[i]), i)).collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let order: Vec<usize> = scored.iter().map(|(_, i)| *i).collect();
+
+    let mut picks: Vec<usize> = Vec::new();
+    for intent in [Intent::CreateEvent, Intent::CreateTask, Intent::CreateHabit, Intent::EditEvent, Intent::RemoveEvent] {
+        if let Some(&i) = order.iter().find(|&&i| EXEMPLARS[i].intent == intent) {
+            picks.push(i);
+        }
+    }
+    for &i in &order {
+        if picks.len() >= 7 {
+            break;
+        }
+        if !picks.contains(&i) {
+            picks.push(i);
+        }
+    }
+    picks.into_iter().map(|i| &EXEMPLARS[i]).collect()
+}
+
+/// The union prompt's example block — same `Examples:\n user: … → …` shape as `STATIC_EXAMPLES`. Leads
+/// with a restraint demonstration: the dynamic exemplars always show one "create" of each intent, which
+/// otherwise primes the model to fabricate an event from a greeting/no-op message (observed regression);
+/// showing greeting → nothing-but-a-question counteracts that.
+fn union_examples_block(ex: &[&Exemplar]) -> String {
+    let mut s = String::from(
+        "Examples:\n\
+user: hey, how's it going? → {\"clarifications\":[\"What would you like to schedule?\"]}\n",
+    );
+    for e in ex {
+        s.push_str(&format!("user: {} → {}\n", e.text, e.output));
+    }
+    s
+}
+
 fn exemplar_block(ex: &[&Exemplar]) -> String {
     let mut s = String::from("Examples →\n");
     for e in ex {
@@ -657,17 +860,7 @@ async fn extract_by_intents(
 
     // Embed the query + bank once (on-device, best-effort). If unavailable, `pick` falls back to
     // static exemplars, so this never regresses below the fixed-example behavior.
-    let (qvec, bank): (Option<Vec<f32>>, Option<&'static [Vec<f32>]>) = if settings.embed_model.trim().is_empty() {
-        (None, None)
-    } else {
-        let base = model_manager::embed_base_url();
-        let bank = bank_embeddings(client, &base, &settings.embed_model).await;
-        let q = hermes::embed_text(client, &base, &settings.embed_model, user_text).await.ok();
-        match (q, bank) {
-            (Some(q), Some(_)) => (Some(q), bank),
-            _ => (None, None),
-        }
-    };
+    let (qvec, bank) = query_and_bank(client, settings, user_text).await;
     let pick = |intent: Intent| -> String {
         let ex = match (&qvec, bank) {
             (Some(q), Some(b)) => select_exemplars(q, b, intent, 2),
@@ -762,7 +955,14 @@ async fn union_extract(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<ParsedPlan> {
-    let messages = build_messages(system_prompt(events, settings), history, user_text);
+    // Dynamic few-shot: swap the static example block for the exemplars most relevant to THIS
+    // message (best-effort; falls back to the static block when embeddings are unavailable).
+    let (qvec, bank) = query_and_bank(client, settings, user_text).await;
+    let examples = match (qvec.as_deref(), bank) {
+        (Some(q), Some(b)) => union_examples_block(&select_union_exemplars(q, b)),
+        _ => STATIC_EXAMPLES.to_string(),
+    };
+    let messages = build_messages(system_prompt(events, settings, &examples), history, user_text);
     let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages, response_schema()).await?;
     Ok(serde_json::from_value(raw)?)
 }
@@ -1065,6 +1265,38 @@ fn backfill_task_dependencies(plan: &mut ParsedPlan, user_text: &str) {
     }
 }
 
+/// Split a message into clauses on punctuation and conjunctions, so a single recurring clause can be
+/// isolated from a multi-intent sentence ("dinner Sunday at 6pm; and journal every night").
+fn split_clauses(text: &str) -> Vec<String> {
+    let mut parts = vec![text.to_string()];
+    for sep in [";", ",", " and ", " plus ", " also "] {
+        parts = parts.iter().flat_map(|p| p.split(sep)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    }
+    parts
+}
+
+/// Multi-intent rescue: when a message mixes a recurring routine with other items, the small model
+/// often routes the routine as a one-off task/event (or drops it). Walk each clause; any that carries
+/// its OWN recurrence cue becomes a habit (with that clause's cadence/duration) unless one already
+/// names it. The same-named one-off the model mis-emitted is then dropped by the dedupe pass in
+/// `route_recurring_to_habits`. Per-clause `recurrence` is more precise than the whole-message call —
+/// it won't fold an unrelated "dinner Sunday" into the journal habit's cadence.
+fn recover_recurring_clauses(plan: &mut ParsedPlan, user_text: &str) {
+    for clause in split_clauses(user_text) {
+        if let Some((cadence, days, interval_days)) = recurrence(&clause) {
+            let name = match synthesize_habit_name(&clause) {
+                Some(n) => n,
+                None => continue,
+            };
+            if plan.habits.iter().any(|h| titles_refer_same(&h.name, &name)) {
+                continue;
+            }
+            let d = find_duration_minutes(&clause).or_else(|| range_minutes(&clause)).unwrap_or(30);
+            plan.habits.push(ParsedHabit { name, duration_minutes: d, cadence, days, interval_days });
+        }
+    }
+}
+
 fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
     if let Some((cadence, days, interval_days)) = recurrence(user_text) {
         let dur = find_duration_minutes(user_text).or_else(|| range_minutes(user_text));
@@ -1111,9 +1343,12 @@ fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
                 if let Some(name) = synthesize_habit_name(user_text) {
                     plan.habits.push(ParsedHabit { name, duration_minutes: dur.unwrap_or(30), ..Default::default() });
                 }
+            } else {
+                // Multi-subject mixed message (routine + unrelated items): isolate the recurring
+                // clause(s) and recover them as habit(s) instead of leaving the routine mis-routed as
+                // a one-off task/event (the multi-intent habit-drop failure).
+                recover_recurring_clauses(plan, user_text);
             }
-            // subjects.len() > 1 → a mixed message (routine + an unrelated item); leave it to the
-            // normal pipeline rather than forcing the wrong thing into a habit.
         }
 
         // A recurring routine IS the habit — it must not also linger as a one-off event/update/task.
@@ -1130,11 +1365,15 @@ fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
             plan.projects.retain(|p| !p.tasks.is_empty());
         }
 
-        // Stamp the detected cadence onto every resulting habit (the model can't express it).
+        // Stamp the detected cadence onto every habit the model couldn't express it for. Skip habits
+        // that already carry a cadence (the per-clause recovery sets its own, more precise one — the
+        // whole-message `recurrence` can mis-fold an unrelated weekday into it).
         for h in &mut plan.habits {
-            h.cadence = cadence.clone();
-            h.days = days.clone();
-            h.interval_days = interval_days;
+            if h.cadence.is_empty() {
+                h.cadence = cadence.clone();
+                h.days = days.clone();
+                h.interval_days = interval_days;
+            }
         }
     }
 
@@ -1757,8 +1996,11 @@ fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
                 }
             }
         }
-    } else if task_only && deadlines.len() >= 2 && deadlines.len() == total {
+    } else if deadlines.len() >= 2 && deadlines.len() == total {
         // One deadline per task, paired in reading order ("ch.1 by Monday and ch.2 by Wednesday").
+        // No `task_only` gate: these come from EXPLICIT "by/due/before" phrases (never a bare day), and
+        // the exact deadlines==tasks count guards mis-pairing — so it's safe even when the model also
+        // double-emits a same-named event (which would otherwise disable the whole backfill).
         let mut it = deadlines.iter();
         for proj in &mut plan.projects {
             for t in &mut proj.tasks {
@@ -2511,6 +2753,127 @@ mod tests {
         }
     }
 
+    fn d() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
+    }
+
+    #[test]
+    fn restraint_guard_suppresses_greeting_fabrication() {
+        let mut e = ev("today", None, None);
+        e.title = "How's it going today".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_restraint_guard(&mut plan, "Hey! How's it going today?", d());
+        assert!(plan.events.is_empty(), "a greeting must not fabricate an event");
+        assert!(!plan.clarifications.is_empty(), "should ask what to schedule instead");
+    }
+
+    #[test]
+    fn restraint_guard_suppresses_past_completion() {
+        let mut plan = ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Laundry".into(),
+                tasks: vec![ParsedTask { title: "Laundry".into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+        apply_restraint_guard(&mut plan, "I already finished the laundry earlier.", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "a past-tense report is not a new task");
+    }
+
+    #[test]
+    fn restraint_guard_spares_real_requests() {
+        // Opens with a greeting but is a real timed request → must survive.
+        let mut e = ev("tomorrow", Some("06:00"), None);
+        e.title = "Gym".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_restraint_guard(&mut plan, "Hi! Add gym tomorrow at 6am.", d());
+        assert_eq!(plan.events.len(), 1, "a real request opening with a greeting must not be suppressed");
+
+        // Plain create, no greeting/past pattern at all.
+        let mut e2 = ev("friday", Some("14:00"), None);
+        e2.title = "Dentist".into();
+        let mut plan2 = ParsedPlan { events: vec![e2], ..Default::default() };
+        apply_restraint_guard(&mut plan2, "Dentist this Friday at 2pm.", d());
+        assert_eq!(plan2.events.len(), 1);
+
+        // A genuine past-completion verb but with future framing → not suppressed.
+        let mut e3 = ev("tomorrow", Some("15:00"), None);
+        e3.title = "Review".into();
+        let mut plan3 = ParsedPlan { events: vec![e3], ..Default::default() };
+        apply_restraint_guard(&mut plan3, "I finished chapter 1, schedule a review tomorrow at 3pm.", d());
+        assert_eq!(plan3.events.len(), 1);
+    }
+
+    #[test]
+    fn action_cue_and_noop_detectors() {
+        assert!(mentions_clock_time("call at 3pm"));
+        assert!(mentions_clock_time("standup 9:30"));
+        assert!(mentions_clock_time("lunch at noon"));
+        assert!(mentions_clock_time("meeting at 3"));
+        assert!(mentions_clock_time("flight tomorrow at 1400"));
+        assert!(!mentions_clock_time("how's it going today"));
+        assert!(!mentions_clock_time("i am on the team"));
+
+        assert!(has_action_cue("remind me to stretch every morning", d()));
+        assert!(has_action_cue("schedule a review", d()));
+        assert!(has_action_cue("dentist on 6/25", d()));
+        assert!(!has_action_cue("hey how's it going", d()));
+        assert!(!has_action_cue("i already finished the laundry earlier", d()));
+
+        assert!(is_greeting("Hey! How's it going today?"));
+        assert!(is_greeting("good morning"));
+        assert!(!is_greeting("dentist friday at 2pm"));
+
+        assert!(is_past_completion("I already finished the laundry earlier."));
+        assert!(!is_past_completion("I need to finish the report by friday"));
+
+        assert!(is_vague_plans("I have some stuff going on next week."));
+        assert!(!is_vague_plans("dentist friday at 2pm"));
+    }
+
+    #[test]
+    fn restraint_guard_suppresses_vague_elaboration() {
+        // "some stuff going on next week" with no concrete time/title → the model's invented events
+        // and tasks must be dropped.
+        let mut plan = ParsedPlan {
+            events: vec![
+                { let mut e = ev("today", None, None); e.title = "Work meeting".into(); e },
+                { let mut e = ev("today", None, None); e.title = "Team lunch".into(); e },
+            ],
+            projects: vec![ParsedProject {
+                name: "Week".into(),
+                tasks: vec![ParsedTask { title: "Project review".into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+        apply_restraint_guard(&mut plan, "I have some stuff going on next week.", d());
+        assert!(plan.events.is_empty() && plan.projects.iter().all(|p| p.tasks.is_empty()), "vague input must not fabricate a calendar");
+    }
+
+    #[test]
+    fn multi_intent_recurring_clause_becomes_a_habit() {
+        // The model mis-routed "stretch every morning" as a task beside the haircut event. The
+        // recurring clause must be recovered as a (daily) habit, the mis-routed task dropped, and the
+        // unrelated event left alone — and the per-clause daily cadence must NOT be clobbered by the
+        // whole-message recurrence (which would mis-read the haircut's "Saturday" as weekly).
+        let mut e = ev("saturday", Some("11:00"), None);
+        e.title = "Haircut".into();
+        let mut plan = ParsedPlan {
+            events: vec![e],
+            projects: vec![ParsedProject {
+                name: "Misc".into(),
+                tasks: vec![ParsedTask { title: "Stretch".into(), estimated_minutes: 15, priority: "medium".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+        route_recurring_to_habits(&mut plan, "Book a haircut Saturday at 11am, and remind me to stretch every morning.");
+        assert_eq!(plan.habits.len(), 1, "the recurring clause becomes exactly one habit");
+        assert!(plan.habits[0].name.to_lowercase().contains("stretch"));
+        assert_eq!(plan.habits[0].cadence, "daily", "per-clause daily cadence, not the haircut's Saturday");
+        assert!(plan.events.iter().any(|e| e.title == "Haircut"), "the unrelated event survives");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "the mis-routed task is dropped");
+    }
+
     #[test]
     fn history_only_for_followups() {
         // Self-contained requests go in cold — no history to contaminate them.
@@ -2802,6 +3165,16 @@ mod tests {
         let fri = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(23, 59, 0).unwrap();
         assert_eq!(plan.projects[0].tasks[0].deadline.as_deref().and_then(parse_dt), Some(tue));
         assert_eq!(plan.projects[0].tasks[1].deadline.as_deref().and_then(parse_dt), Some(fri));
+
+        // Explicit per-task deadlines still pair even when the model ALSO double-emits a same-named
+        // event (which used to disable the backfill via the dropped `task_only` gate).
+        let mut plan = mk(&["Finish chapter 1", "Finish chapter 2"]);
+        plan.events = vec![{ let mut e = ev("monday", None, None); e.title = "Finish chapter 1".into(); e }];
+        backfill_task_fields(&mut plan, "finish chapter 1 by monday and chapter 2 by wednesday", today);
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        assert_eq!(plan.projects[0].tasks[0].deadline.as_deref().and_then(parse_dt), Some(mon));
+        assert_eq!(plan.projects[0].tasks[1].deadline.as_deref().and_then(parse_dt), Some(wed));
 
         // Deadline count ≠ task count → don't guess the pairing (leave them).
         let mut plan = mk(&["A", "B", "C"]);

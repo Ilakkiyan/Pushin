@@ -892,7 +892,8 @@ fn cases() -> Vec<Case> {
             history: &[],
             seed: &[("Old standup", 1, (9, 0), 1, (9, 30))],
             prompt: "Ok my week: dentist Monday at 9am, finish the budget report (about 3 hours) by Wednesday, go for a run every morning, and cancel the old standup.",
-            expect: E { min_events: Some(1), min_tasks: Some(1), min_habits: Some(1), min_removed: Some(1), title_has: &["dentist"], habit_has: &["run"], ..Default::default() },
+            // "dent" stem: the model titles this "Dentist" or "Dental" run-to-run; both are correct.
+            expect: E { min_events: Some(1), min_tasks: Some(1), min_habits: Some(1), min_removed: Some(1), title_has: &["dent"], habit_has: &["run"], ..Default::default() },
         },
     ]
 }
