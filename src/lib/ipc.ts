@@ -165,13 +165,16 @@ export interface BookingSlot {
 export interface HabitDay {
   day: string; // "YYYY-MM-DD"
   done: boolean;
+  due: boolean; // expected that day per the habit's cadence
 }
 
 export interface HabitStats {
   id: number;
   name: string;
   color: string;
-  cadence: string;
+  cadence: string; // "daily" | "weekly" | "interval"
+  days: number[]; // weekdays 1=Mon..7=Sun (cadence="weekly")
+  intervalDays: number; // step for cadence="interval" (2 = every other day)
   durationMinutes: number;
   createdAt: string;
   doneToday: boolean;
@@ -233,10 +236,10 @@ export const api = {
     invoke<ScheduleResult>("create_booking", { eventTypeId, name, email, start, end }),
 
   listHabits: () => invoke<HabitStats[]>("list_habits"),
-  createHabit: (name: string, color: string, cadence: string, durationMinutes: number) =>
-    invoke<HabitStats[]>("create_habit", { name, color, cadence, durationMinutes }),
-  updateHabit: (id: number, name: string, color: string, durationMinutes: number) =>
-    invoke<HabitStats[]>("update_habit", { id, name, color, durationMinutes }),
+  createHabit: (name: string, color: string, cadence: string, days: number[], intervalDays: number, durationMinutes: number) =>
+    invoke<HabitStats[]>("create_habit", { name, color, cadence, days, intervalDays, durationMinutes }),
+  updateHabit: (id: number, name: string, color: string, cadence: string, days: number[], intervalDays: number, durationMinutes: number) =>
+    invoke<HabitStats[]>("update_habit", { id, name, color, cadence, days, intervalDays, durationMinutes }),
   toggleHabit: (id: number, day: string | null) => invoke<HabitStats[]>("toggle_habit", { id, day }),
   deleteHabit: (id: number) => invoke<HabitStats[]>("delete_habit", { id }),
   scheduleHabit: (id: number, day: string | null) => invoke<ScheduleResult>("schedule_habit", { id, day }),

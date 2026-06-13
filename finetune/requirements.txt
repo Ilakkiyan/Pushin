@@ -1,0 +1,18 @@
+# Stage 5 (training) deps. Install Unsloth LAST, after a CUDA-matched PyTorch.
+#
+# RTX 5080 is Blackwell (sm_120) → you need PyTorch built for CUDA 12.8+ FIRST, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r finetune/requirements.txt
+# If you hit "no kernel image for device" or bitsandbytes errors, your torch/bnb predate Blackwell
+# support — upgrade to the latest (or nightly) builds.
+
+unsloth
+trl
+peft
+transformers
+datasets
+accelerate
+bitsandbytes
+sentencepiece
+protobuf

@@ -3,11 +3,6 @@ import { Send, Sparkles } from "lucide-react";
 import { useStore } from "../state/store";
 import InferenceSetup from "../components/InferenceSetup";
 
-const EXAMPLES = [
-  "Launch a side project in 3 weeks: design a logo, build a landing page, write 3 blog posts, set up analytics.",
-  "Prep for my exam next Friday: review 4 chapters, do 2 practice tests, make a cheat sheet.",
-];
-
 export default function ChatPane() {
   const llm = useStore((s) => s.llm);
   const busy = useStore((s) => s.busy);
@@ -74,17 +69,6 @@ export default function ChatPane() {
         {messages.length === 0 && llm?.reachable && (
           <div className="text-sm text-gray-400 space-y-3">
             <p>Describe what you’re working on in plain language and I’ll break it into tasks and schedule them.</p>
-            <div className="space-y-2">
-              {EXAMPLES.map((ex) => (
-                <button
-                  key={ex}
-                  onClick={() => send(ex)}
-                  className="block w-full text-left text-xs rounded-lg border border-white/10 px-3 py-2 text-gray-300 hover:bg-white/5"
-                >
-                  {ex}
-                </button>
-              ))}
-            </div>
           </div>
         )}
 

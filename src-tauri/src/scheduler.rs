@@ -183,14 +183,16 @@ pub fn free_slots(now: NaiveDateTime, s: &Settings, busy: &[Interval]) -> Vec<In
     out.into_iter().filter(|i| i.end > i.start).collect()
 }
 
-/// Place up to `remaining` minutes of work into `free` (mutated), no earlier than
-/// `earliest`. One block per contiguous interval; `min_chunk` avoids tiny fragments.
-/// Returns (placed blocks, last end, minutes that couldn't be placed).
+/// Place up to `remaining` minutes of work into `free` (mutated), no earlier than `earliest` and
+/// (when set) no later than `latest` — so a task is never scheduled past its deadline. One block
+/// per contiguous interval; `min_chunk` avoids tiny fragments. Returns (placed blocks, last end,
+/// minutes that couldn't be placed). Time after `latest` stays in the free pool for other tasks.
 fn place(
     free: &mut Vec<Interval>,
     earliest: NaiveDateTime,
     mut remaining: i64,
     min_chunk: i64,
+    latest: Option<NaiveDateTime>,
 ) -> (Vec<Interval>, Option<NaiveDateTime>, i64) {
     let mut placed = Vec::new();
     let mut last_end = None;
@@ -202,7 +204,9 @@ fn place(
             continue;
         }
         let piece_start = iv.start.max(earliest);
-        let piece_len = (iv.end - piece_start).num_minutes();
+        // Don't let this task's block cross its deadline (but keep the rest of the slot free).
+        let piece_end = latest.map_or(iv.end, |l| iv.end.min(l));
+        let piece_len = (piece_end - piece_start).num_minutes();
         if piece_len <= 0 {
             i += 1;
             continue;
@@ -280,8 +284,10 @@ fn schedule_one(
     let already = *locked_min.get(&t.id).unwrap_or(&0);
     let remaining = (est - already).max(0);
     let min_chunk = t.min_chunk_minutes.max(1);
+    // Never schedule a task past its deadline — cap placement at it.
+    let deadline = t.deadline.as_deref().and_then(parse_dt);
 
-    let (placed, last_end, left) = place(free, earliest, remaining, min_chunk);
+    let (placed, last_end, left) = place(free, earliest, remaining, min_chunk, deadline);
     for p in &placed {
         blocks.push(Block {
             id: 0,
@@ -300,23 +306,21 @@ fn schedule_one(
             *cur = e;
         }
     }
+    // Anything that couldn't be placed: if the task has a deadline, the reason is it won't fit
+    // before that deadline (we capped there) → DeadlineMiss; otherwise it's over-capacity.
     if left > 0 {
-        conflicts.push(Conflict::Unschedulable {
-            task_id: t.id,
-            title: t.title.clone(),
-            remaining_minutes: left,
-        });
-    }
-    if let Some(dl) = &t.deadline {
-        if let (Some(dld), Some(end)) = (parse_dt(dl), scheduled_end.get(&t.id)) {
-            if *end > dld {
-                conflicts.push(Conflict::DeadlineMiss {
-                    task_id: t.id,
-                    title: t.title.clone(),
-                    scheduled_end: fmt_dt(*end),
-                    deadline: fmt_dt(dld),
-                });
-            }
+        match deadline {
+            Some(dld) => conflicts.push(Conflict::DeadlineMiss {
+                task_id: t.id,
+                title: t.title.clone(),
+                scheduled_end: fmt_dt(last_end.unwrap_or(dld)),
+                deadline: fmt_dt(dld),
+            }),
+            None => conflicts.push(Conflict::Unschedulable {
+                task_id: t.id,
+                title: t.title.clone(),
+                remaining_minutes: left,
+            }),
         }
     }
 }
@@ -542,6 +546,37 @@ mod tests {
             (en - st).num_minutes()
         }).sum::<i64>(), 480);
         assert!(r.conflicts.iter().any(|c| matches!(c, Conflict::Unschedulable { remaining_minutes, .. } if *remaining_minutes == 120)));
+    }
+
+    #[test]
+    fn never_schedules_past_deadline() {
+        // A task due Tuesday must not get blocks on Wednesday+, even if there's room later.
+        let s = settings(7); // a week of capacity
+        let now = dt(2026, 6, 8, 8, 0); // Monday
+        let deadline = "2026-06-09T23:59:00"; // Tuesday end-of-day
+        let tasks = vec![task(1, "Study", 240, Some(deadline), vec![])];
+        let r = schedule(now, &s, &tasks, &[], &[]);
+        let cap = parse_dt(deadline).unwrap();
+        assert!(!r.blocks.is_empty());
+        for b in &r.blocks {
+            assert!(parse_dt(&b.end).unwrap() <= cap, "block {b:?} runs past the deadline");
+        }
+    }
+
+    #[test]
+    fn deadline_miss_when_it_cannot_fit_in_time() {
+        // 8h of work but only ~3h before today-noon → can't fit → DeadlineMiss, and nothing placed
+        // after the deadline.
+        let s = settings(7);
+        let now = dt(2026, 6, 8, 8, 0);
+        let deadline = "2026-06-08T12:00:00";
+        let tasks = vec![task(1, "Cram", 480, Some(deadline), vec![])];
+        let r = schedule(now, &s, &tasks, &[], &[]);
+        assert!(r.conflicts.iter().any(|c| matches!(c, Conflict::DeadlineMiss { .. })));
+        let cap = parse_dt(deadline).unwrap();
+        for b in &r.blocks {
+            assert!(parse_dt(&b.end).unwrap() <= cap);
+        }
     }
 
     #[test]

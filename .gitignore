@@ -40,3 +40,8 @@ Thumbs.db
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
+
+# Fine-tune experiment: generated weights/data (regenerable, large)
+/finetune/out/
+/finetune/data/
+/unsloth_compiled_cache/

@@ -312,28 +312,35 @@ pub fn list_habits(state: State<AppState>) -> Result<Vec<HabitStats>, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn create_habit(
     state: State<AppState>,
     name: String,
     color: String,
     cadence: String,
+    days: Vec<u8>,
+    interval_days: i64,
     duration_minutes: i64,
 ) -> Result<Vec<HabitStats>, String> {
     let conn = state.db.lock().unwrap();
-    db::insert_habit(&conn, &name, &color, &cadence, duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
+    db::insert_habit(&conn, &name, &color, &cadence, &days, interval_days.max(1), duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
     habit_stats(&conn).map_err(err)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn update_habit(
     state: State<AppState>,
     id: i64,
     name: String,
     color: String,
+    cadence: String,
+    days: Vec<u8>,
+    interval_days: i64,
     duration_minutes: i64,
 ) -> Result<Vec<HabitStats>, String> {
     let conn = state.db.lock().unwrap();
-    db::update_habit(&conn, id, &name, &color, duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
+    db::update_habit(&conn, id, &name, &color, &cadence, &days, interval_days.max(1), duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
     habit_stats(&conn).map_err(err)
 }
 
@@ -431,7 +438,10 @@ pub fn set_habit_scheduled(state: State<AppState>, id: i64, scheduled: bool) -> 
         let horizon = settings.horizon_days.max(1);
         for d in 0..horizon {
             let day = now.date() + Duration::days(d);
-            place_habit_on_day(&conn, &habit, day, now).map_err(err)?;
+            // Only drop the habit on the days its cadence calls for (daily/weekly/interval).
+            if habits::is_due(&habit, day) {
+                place_habit_on_day(&conn, &habit, day, now).map_err(err)?;
+            }
         }
     } else {
         for ev in db::list_events(&conn).map_err(err)? {

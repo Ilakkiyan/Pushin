@@ -53,3 +53,15 @@ tokio = { version = "1", features = ["time"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { version = "0.4" }
+
+# Fine-tuning data generator (Stage 1–4 of finetune/PLAN.md). An *example*, not a bin, so it links
+# the lib and reuses dev-dependencies (full tokio + reqwest) without bloating the shipped app's deps.
+# Run: `cargo run --example datagen -- --dry-run` (offline) or against a teacher llama-server.
+[[example]]
+name = "datagen"
+path = "../finetune/datagen/main.rs"
+
+# GRPO reward scorer + prompt dumper (path B). Reuses the datagen templates as verifiable rewards.
+[[example]]
+name = "grpo"
+path = "../finetune/grpo/main.rs"

@@ -6,6 +6,33 @@ import type { HabitStats } from "../lib/ipc";
 import { humanMinutes, mondayIndex, parseLocal } from "../lib/time";
 
 const COLORS = ["#22c55e", "#0ea5e9", "#a855f7", "#f59e0b", "#ef4444", "#ec4899", "#14b8a6", "#6366f1"];
+const WEEKDAYS = [
+  { n: 1, l: "M" },
+  { n: 2, l: "T" },
+  { n: 3, l: "W" },
+  { n: 4, l: "T" },
+  { n: 5, l: "F" },
+  { n: 6, l: "S" },
+  { n: 7, l: "S" },
+];
+const WD_FULL = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+type Cadence = "daily" | "weekly" | "interval";
+
+/** Human label for a habit's recurrence. */
+function cadenceLabel(h: { cadence: string; days: number[]; intervalDays: number }): string {
+  if (h.cadence === "weekly" && h.days.length) {
+    const s = [...h.days].sort((a, b) => a - b);
+    if (s.length === 7) return "Daily";
+    if (s.join() === "1,2,3,4,5") return "Weekdays";
+    if (s.join() === "6,7") return "Weekends";
+    return s.map((d) => WD_FULL[d]).join(", ");
+  }
+  if (h.cadence === "interval" && h.intervalDays > 1) {
+    return h.intervalDays === 2 ? "Every other day" : `Every ${h.intervalDays} days`;
+  }
+  return "Daily";
+}
 
 export default function HabitsPane() {
   const habits = useStore((s) => s.habits);
@@ -15,15 +42,24 @@ export default function HabitsPane() {
   const [name, setName] = useState("");
   const [color, setColor] = useState(COLORS[0]);
   const [duration, setDuration] = useState(30);
+  const [cadence, setCadence] = useState<Cadence>("daily");
+  const [selDays, setSelDays] = useState<number[]>([]);
+  const [intervalDays, setIntervalDays] = useState(2);
 
   useEffect(() => {
     loadHabits();
   }, [loadHabits]);
 
+  const toggleDay = (n: number) => setSelDays((d) => (d.includes(n) ? d.filter((x) => x !== n) : [...d, n].sort((a, b) => a - b)));
+
   const add = () => {
     const n = name.trim();
     if (!n) return;
-    createHabit(n, color, duration);
+    // Weekly with no days picked falls back to daily; interval coerces to ≥2.
+    const cad: Cadence = cadence === "weekly" && selDays.length === 0 ? "daily" : cadence;
+    const days = cad === "weekly" ? selDays : [];
+    const iv = cad === "interval" ? Math.max(2, intervalDays) : 1;
+    createHabit(n, color, cad, days, iv, duration);
     setName("");
     setColor(COLORS[(COLORS.indexOf(color) + 1) % COLORS.length]);
   };
@@ -39,43 +75,90 @@ export default function HabitsPane() {
         </header>
 
         {/* Add habit */}
-        <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-1.5">
-            {COLORS.map((c) => (
-              <button
-                key={c}
-                onClick={() => setColor(c)}
-                className={clsx("size-5 rounded-full transition", color === c ? "ring-2 ring-white/70 ring-offset-2 ring-offset-[#0e1117]" : "opacity-70 hover:opacity-100")}
-                style={{ background: c }}
-                aria-label={`color ${c}`}
-              />
-            ))}
-          </div>
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && add()}
-            placeholder="New habit, e.g. Read"
-            className="flex-1 min-w-[160px] rounded-md bg-white/5 border border-white/10 px-3 py-1.5 text-sm outline-none focus:border-indigo-500/50"
-          />
-          <div className="flex items-center gap-1.5 rounded-md bg-white/5 border border-white/10 px-2 py-1">
+        <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 space-y-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1.5">
+              {COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setColor(c)}
+                  className={clsx("size-5 rounded-full transition", color === c ? "ring-2 ring-white/70 ring-offset-2 ring-offset-[#0e1117]" : "opacity-70 hover:opacity-100")}
+                  style={{ background: c }}
+                  aria-label={`color ${c}`}
+                />
+              ))}
+            </div>
             <input
-              type="number"
-              min={5}
-              step={5}
-              value={duration}
-              onChange={(e) => setDuration(Math.max(5, Number(e.target.value) || 0))}
-              className="w-14 bg-transparent text-sm outline-none text-right"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && add()}
+              placeholder="New habit, e.g. Read"
+              className="flex-1 min-w-[160px] rounded-md bg-white/5 border border-white/10 px-3 py-1.5 text-sm outline-none focus:border-indigo-500/50"
             />
-            <span className="text-xs text-gray-500">min</span>
+            <div className="flex items-center gap-1.5 rounded-md bg-white/5 border border-white/10 px-2 py-1">
+              <input
+                type="number"
+                min={5}
+                step={5}
+                value={duration}
+                onChange={(e) => setDuration(Math.max(5, Number(e.target.value) || 0))}
+                className="w-14 bg-transparent text-sm outline-none text-right"
+              />
+              <span className="text-xs text-gray-500">min</span>
+            </div>
+            <button
+              onClick={add}
+              disabled={!name.trim()}
+              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
+            >
+              <Plus className="size-4" /> Add
+            </button>
           </div>
-          <button
-            onClick={add}
-            disabled={!name.trim()}
-            className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
-          >
-            <Plus className="size-4" /> Add
-          </button>
+
+          {/* Cadence */}
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <div className="flex rounded-md border border-white/10 overflow-hidden">
+              {(["daily", "weekly", "interval"] as Cadence[]).map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setCadence(c)}
+                  className={clsx("px-2.5 py-1 capitalize", cadence === c ? "bg-indigo-500/30 text-indigo-100" : "text-gray-400 hover:bg-white/5")}
+                >
+                  {c === "interval" ? "Every N days" : c === "weekly" ? "Days of week" : "Daily"}
+                </button>
+              ))}
+            </div>
+            {cadence === "weekly" && (
+              <div className="flex gap-1">
+                {WEEKDAYS.map((d) => (
+                  <button
+                    key={d.n}
+                    onClick={() => toggleDay(d.n)}
+                    className={clsx(
+                      "size-6 rounded text-[11px]",
+                      selDays.includes(d.n) ? "bg-indigo-500/30 text-indigo-100 border border-indigo-400/40" : "bg-white/5 text-gray-500 border border-white/10",
+                    )}
+                  >
+                    {d.l}
+                  </button>
+                ))}
+              </div>
+            )}
+            {cadence === "interval" && (
+              <div className="flex items-center gap-1.5 text-gray-400">
+                every
+                <input
+                  type="number"
+                  min={2}
+                  max={30}
+                  value={intervalDays}
+                  onChange={(e) => setIntervalDays(Math.min(30, Math.max(2, Number(e.target.value) || 2)))}
+                  className="w-12 rounded-md bg-white/5 border border-white/10 px-2 py-0.5 text-right outline-none"
+                />
+                days
+              </div>
+            )}
+          </div>
         </div>
 
         {habits.length === 0 ? (
@@ -109,7 +192,8 @@ function HabitCard({ habit }: { habit: HabitStats }) {
 
   const commitDuration = () => {
     const d = Math.max(5, dur || 0);
-    if (d !== habit.durationMinutes) updateHabit(habit.id, habit.name, habit.color, d);
+    // Preserve the habit's cadence; only the duration changes here.
+    if (d !== habit.durationMinutes) updateHabit(habit.id, habit.name, habit.color, habit.cadence, habit.days, habit.intervalDays, d);
     else setDur(habit.durationMinutes);
   };
 
@@ -139,17 +223,20 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         </button>
 
         <div className="min-w-0 flex-1">
-          <div className="font-medium truncate">{habit.name}</div>
+          <div className="font-medium truncate flex items-center gap-2">
+            {habit.name}
+            <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-white/8 text-gray-400 border border-white/10 shrink-0">{cadenceLabel(habit)}</span>
+          </div>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400 mt-0.5">
             <span className="flex items-center gap-1" title="Current streak">
               <Flame className={clsx("size-3.5", habit.currentStreak > 0 ? "text-orange-400" : "text-gray-600")} />
-              {habit.currentStreak} day{habit.currentStreak === 1 ? "" : "s"}
+              {habit.currentStreak} {habit.currentStreak === 1 ? "time" : "times"}
             </span>
             <span className="flex items-center gap-1" title="Longest streak">
               <Trophy className="size-3.5 text-amber-400" /> {habit.longestStreak}
             </span>
-            <span title="Completed days (all time)">{habit.totalDone} total</span>
-            <span title="Consistency over the last 30 days">{Math.round(habit.completionRate * 100)}% consistent</span>
+            <span title="Completed (all time)">{habit.totalDone} total</span>
+            <span title="Consistency over the last 30 days (scheduled days only)">{Math.round(habit.completionRate * 100)}% consistent</span>
           </div>
         </div>
 
@@ -168,20 +255,18 @@ function HabitCard({ habit }: { habit: HabitStats }) {
           <span className="text-xs text-gray-500">min</span>
         </div>
 
-        {/* Calendar toggle — on/off for every day in the planning period */}
+        {/* Calendar toggle — slots the habit into free space on each of its due days */}
         <button
           onClick={toggleCalendar}
           disabled={pending}
           title={
             onCalendar
               ? `On your calendar for ${habit.scheduledDays} day${habit.scheduledDays === 1 ? "" : "s"} — click to remove`
-              : "Slot this habit into a free space on every day in the planning period"
+              : "Slot this habit into a free space on each of its scheduled days"
           }
           className={clsx(
             "flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md border transition shrink-0 disabled:opacity-50",
-            onCalendar
-              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-              : "border-white/10 text-gray-300 hover:bg-white/10",
+            onCalendar ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-white/10 text-gray-300 hover:bg-white/10",
           )}
         >
           {onCalendar ? <Check className="size-3.5" /> : <CalendarPlus className="size-3.5" />}
@@ -193,14 +278,14 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         </button>
       </div>
 
-      <div className="mt-1 text-[11px] text-gray-600 pl-12">{humanMinutes(habit.durationMinutes)} per session</div>
+      <div className="mt-1 text-[11px] text-gray-600 pl-12">{humanMinutes(habit.durationMinutes)} per session · {cadenceLabel(habit).toLowerCase()}</div>
 
       <Heatmap habit={habit} />
     </div>
   );
 }
 
-/** GitHub-style consistency grid: 7 rows (Mon→Sun) flowing in week columns. */
+/** GitHub-style consistency grid: 7 rows (Mon→Sun) flowing in week columns. Non-due days are dimmed. */
 function Heatmap({ habit }: { habit: HabitStats }) {
   const toggleHabit = useStore((s) => s.toggleHabit);
   const days = habit.history;
@@ -220,9 +305,9 @@ function Heatmap({ habit }: { habit: HabitStats }) {
           <button
             key={d.day}
             onClick={() => toggleHabit(habit.id, d.day)}
-            title={`${d.day}${d.done ? " · done" : ""}`}
+            title={`${d.day}${d.done ? " · done" : d.due ? "" : " · not scheduled"}`}
             className="size-[10px] rounded-[2px] transition hover:ring-1 hover:ring-white/50"
-            style={{ background: d.done ? habit.color : "rgba(255,255,255,0.06)" }}
+            style={{ background: d.done ? habit.color : d.due ? "rgba(255,255,255,0.10)" : "rgba(255,255,255,0.02)" }}
           />
         ))}
       </div>

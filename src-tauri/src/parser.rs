@@ -105,12 +105,26 @@ pub struct ParsedProject {
 }
 
 /// A recurring routine the user does regularly ("practice violin every day"). Routed to the
-/// habit tracker instead of being a one-off event or task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// habit tracker instead of being a one-off event or task. The model only supplies name/duration;
+/// `cadence`/`days`/`interval_days` are filled in deterministically by `route_recurring_to_habits`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedHabit {
     pub name: String,
     #[serde(default = "default_minutes", rename = "durationMinutes")]
     pub duration_minutes: i64,
+    #[serde(default = "default_cadence")]
+    pub cadence: String,
+    #[serde(default)]
+    pub days: Vec<u8>,
+    #[serde(default = "default_interval_days")]
+    pub interval_days: i64,
+}
+
+fn default_cadence() -> String {
+    "daily".into()
+}
+fn default_interval_days() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -379,11 +393,13 @@ user: plan a blog - pick platform, write posts → {{\"projects\":[{{\"name\":\"
     )
 }
 
-/// NL → structured plan. **Router pass (Tier 2):** a cheap first call classifies the message into
-/// intents, then a narrow extractor runs per intent (events-only, tasks-only, …). A small model is
-/// far more reliable extracting one known type than juggling the whole union schema at once, which
-/// is what caused task-vs-event and recurrence misrouting. The deterministic recovery layer and
-/// `store_plan` are unchanged — they operate on the assembled `ParsedPlan`. Holds no DB lock.
+/// NL → structured plan. **Default: a single UNION extraction** — one `chat_json` call against the
+/// full schema (the system prompt shows the calendar + few-shot examples). On the eval battery this
+/// matches the older Tier-2 router (classify-then-narrow-extract) at ~84% of checks — equal to the
+/// 14B — while making ONE model call instead of a classification + per-intent extractor calls. The
+/// **router pipeline (`route_intents` + `extract_by_intents`) is kept as a fallback** for the rare
+/// case the union call fails outright. The deterministic recovery layer (`apply_recovery`) and
+/// `store_plan` operate on the assembled `ParsedPlan` either way. Holds no DB lock.
 pub async fn plan(
     client: &reqwest::Client,
     settings: &Settings,
@@ -391,25 +407,68 @@ pub async fn plan(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<ParsedPlan> {
-    let mut parsed = match route_intents(client, settings, current_events, history, user_text).await {
-        // Router classified the message → run only the relevant narrow extractors.
-        Ok(intents) if !intents.is_empty() => {
-            extract_by_intents(client, settings, current_events, history, user_text, &intents).await?
-        }
-        // Router saw nothing actionable ("none") → respect it (don't fabricate; keeps restraint).
-        Ok(_) => ParsedPlan::default(),
-        // Router call itself failed (network/parse) → fall back to the single union call so a clear
-        // request never silently does nothing.
-        Err(_) => union_extract(client, settings, current_events, history, user_text).await?,
+    // **Single-call union extraction is the default.** On the eval battery it matches the Tier-2
+    // router's accuracy (~84% of checks — equal to the 14B) while making ONE model call instead of
+    // a router classification + per-intent extractor calls: faster, simpler, and the path the
+    // deterministic recovery layer was tuned against. The router pipeline is retained as a fallback
+    // for the rare case the union call fails outright (network/HTTP error or unparseable JSON), so a
+    // clear request never silently does nothing.
+    let mut parsed = match union_extract(client, settings, current_events, history, user_text).await {
+        Ok(p) => p,
+        Err(_) => match route_intents(client, settings, current_events, history, user_text).await {
+            Ok(intents) if !intents.is_empty() => {
+                extract_by_intents(client, settings, current_events, history, user_text, &intents).await.unwrap_or_default()
+            }
+            _ => ParsedPlan::default(),
+        },
     };
 
-    let today = Local::now().naive_local().date();
-    unescape_plan(&mut parsed);
-    resolve_task_deadlines(&mut parsed);
-    backfill_task_fields(&mut parsed, user_text, today);
-    backfill_event_fields(&mut parsed, user_text, today);
-    route_recurring_to_habits(&mut parsed, user_text);
+    apply_recovery(&mut parsed, user_text, Local::now().naive_local().date());
     Ok(parsed)
+}
+
+/// The deterministic recovery layer that runs after extraction — HTML-unescape, deadline
+/// validation, task/event field recovery (days, durations, spans, deadlines), and habit routing.
+/// Shared by `plan` (the router pipeline) and the datagen `union_label` path so a training label is
+/// recovered exactly the way inference will recover the student's output.
+pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
+    unescape_plan(plan);
+    resolve_task_deadlines(plan);
+    backfill_task_fields(plan, user_text, today);
+    backfill_task_dependencies(plan, user_text);
+    backfill_event_fields(plan, user_text, today);
+    route_recurring_to_habits(plan, user_text);
+}
+
+/// **Datagen only.** The single-call (union-format) chat messages the fine-tuned student will see at
+/// inference — system prompt + (gated) history + user. Pair this with a label produced by the
+/// *router* pipeline (`plan`), which routes far better than a one-shot union call: that distills the
+/// router's correctness into the one-call format the student uses.
+pub fn union_messages(settings: &Settings, current_events: &[Event], history: &[ChatTurn], user_text: &str) -> Value {
+    build_messages(system_prompt(current_events, settings), history, user_text)
+}
+
+/// **Datagen only** (see `finetune/`). Run the SINGLE union extraction (no router) against a teacher
+/// model and return `(request messages, the model's RAW schema JSON, the recovered plan)`:
+/// - the raw JSON is the fine-tuning **label** (schema-valid by construction — it came through the
+///   `response_schema` grammar), and
+/// - the recovered `ParsedPlan` is what to feed `store_plan` for validation.
+///
+/// The fine-tuned student is meant to run this same one-call path at inference, so the label format
+/// matches inference exactly. Holds no DB lock.
+pub async fn union_label(
+    client: &reqwest::Client,
+    settings: &Settings,
+    current_events: &[Event],
+    history: &[ChatTurn],
+    user_text: &str,
+) -> Result<(Value, Value, ParsedPlan)> {
+    let system = system_prompt(current_events, settings);
+    let messages = build_messages(system, history, user_text);
+    let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages.clone(), response_schema()).await?;
+    let mut plan: ParsedPlan = serde_json::from_value(raw.clone()).unwrap_or_default();
+    apply_recovery(&mut plan, user_text, Local::now().naive_local().date());
+    Ok((messages, raw, plan))
 }
 
 // ---------------- Router pass + narrow per-intent extractors (Tier 2) ----------------
@@ -472,7 +531,8 @@ async fn route_intents(
 - editEvent: change an EXISTING calendar item (move, rename, make longer/shorter).\n\
 - removeEvent: delete or cancel an EXISTING calendar item.\n\
 - createTask: work to do with NO fixed time (study, write, build, plan, finish, read).\n\
-- createHabit: a recurring routine (\"every day\", \"daily\", \"each morning\", \"every night\").\n\
+- createHabit: a recurring routine — \"every day\"/\"daily\", \"every morning/night\", \"every other \
+day\", \"every Monday and Wednesday\", \"weekdays\", \"weekends\". Recurs on a schedule, no single date.\n\
 - none: a greeting, or a vague/unactionable message.\n\
 Pick ALL that apply — one message can need several (e.g. an event AND a task). Output ONLY the intents array.\n\
 {}",
@@ -533,6 +593,8 @@ const EXEMPLARS: &[Exemplar] = &[
     // createHabit
     Exemplar { intent: Intent::CreateHabit, text: "practice violin every day from 4 to 5pm", output: "{\"habits\":[{\"name\":\"Violin practice\",\"durationMinutes\":60}]}" },
     Exemplar { intent: Intent::CreateHabit, text: "meditate for 10 minutes every morning", output: "{\"habits\":[{\"name\":\"Meditate\",\"durationMinutes\":10}]}" },
+    Exemplar { intent: Intent::CreateHabit, text: "go to the gym every monday and wednesday", output: "{\"habits\":[{\"name\":\"Gym\",\"durationMinutes\":60}]}" },
+    Exemplar { intent: Intent::CreateHabit, text: "study US history every other day for 2 hours", output: "{\"habits\":[{\"name\":\"Study US history\",\"durationMinutes\":120}]}" },
     // editEvent
     Exemplar { intent: Intent::EditEvent, text: "make the meeting 2 hours instead of 1", output: "{\"updateEvents\":[{\"match\":\"Meeting\",\"durationMinutes\":120}]}" },
     Exemplar { intent: Intent::EditEvent, text: "move the dentist to 3pm", output: "{\"updateEvents\":[{\"match\":\"Dentist\",\"startTime\":\"15:00\"}]}" },
@@ -651,8 +713,10 @@ Now is {now}.\n\
             Intent::CreateHabit => {
                 let system = format!(
                     "Extract the recurring routine(s) into {{\"habits\":[{{\"name\":...,\"durationMinutes\":...}}]}}. \
-A habit is something done regularly (daily, every morning, every night). Don't ask which weekdays. Output \
-only routines from THIS message.\n\
+A habit is anything done on a repeating schedule — daily, every morning/night, every other day, certain \
+weekdays (e.g. Mon & Wed), weekdays, or weekends. Give it a short `name` (e.g. \"Gym\", \"Study US \
+history\") and a `durationMinutes` if a length is stated. Always output a habit when the message says it \
+recurs; never leave it empty or ask which days. Output only routines from THIS message.\n\
 {examples}",
                     examples = pick(Intent::CreateHabit),
                 );
@@ -875,10 +939,14 @@ fn synthesize_habit_name(text: &str) -> Option<String> {
     ] {
         s = s.replace(p, " ");
     }
-    // Drop connectors, duration/time units, and any numeric/clock token ("30", "4pm", "5:30").
+    // Drop connectors, duration/time units, recurrence/weekday words, and any numeric/clock token.
     const DROP: &[&str] = &[
         "for", "at", "from", "to", "minutes", "minute", "mins", "min", "hours", "hour", "hrs", "hr",
-        "h", "m", "am", "pm", "a", "an", "the", "my", "of", "on", "in",
+        "h", "m", "am", "pm", "a", "an", "the", "my", "of", "on", "in", "go", "and", "every", "other",
+        "each", "day", "days", "week", "weeks", "weekday", "weekdays", "weekend", "weekends", "second", "alternate",
+        "monday", "mon", "mondays", "tuesday", "tue", "tues", "tuesdays", "wednesday", "wed", "weds", "wednesdays",
+        "thursday", "thu", "thur", "thurs", "thursdays", "friday", "fri", "fridays", "saturday", "sat", "saturdays",
+        "sunday", "sun", "sundays",
     ];
     let words: Vec<String> = s
         .split_whitespace()
@@ -902,45 +970,153 @@ fn synthesize_habit_name(text: &str) -> Option<String> {
 /// but as a deterministic safety net we (a) convert a single recurring event/task it routed as a
 /// one-off, (b) synthesize a habit from the text when it emitted nothing usable, and (c) suppress
 /// any one-off event/task it double-emitted next to the habit. Always dedupes.
-fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
-    if daily_recurrence(user_text) {
-        let dur = find_duration_minutes(user_text).or_else(|| range_minutes(user_text));
-        let total_tasks: usize = plan.projects.iter().map(|p| p.tasks.len()).sum();
+/// Detect a recurring routine and its cadence from the user's text → (cadence, weekdays, interval).
+/// "every other day"/"every N days" → interval; weekdays/"weekdays"/"weekends" or "every <weekday>"
+/// → weekly; plain "every day"/"daily" → daily. None when there's no recurrence.
+fn recurrence(text: &str) -> Option<(String, Vec<u8>, i64)> {
+    let t = text.to_lowercase();
+    let wd = |s: &str| -> Option<u8> {
+        Some(match s {
+            "monday" | "mon" | "mondays" => 1,
+            "tuesday" | "tue" | "tues" | "tuesdays" => 2,
+            "wednesday" | "wed" | "weds" | "wednesdays" => 3,
+            "thursday" | "thu" | "thur" | "thurs" | "thursdays" => 4,
+            "friday" | "fri" | "fridays" => 5,
+            "saturday" | "sat" | "saturdays" => 6,
+            "sunday" | "sun" | "sundays" => 7,
+            _ => return None,
+        })
+    };
+    let toks: Vec<&str> = t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
 
-        if plan.habits.is_empty() {
-            if plan.events.len() == 1 && total_tasks == 0 && plan.update_events.is_empty() {
-                // Routed as one fixed event → make it the habit.
-                let ev = plan.events.remove(0);
-                let d = dur.or(ev.duration_minutes).unwrap_or(60);
-                plan.habits.push(ParsedHabit { name: ev.title, duration_minutes: d });
-            } else if plan.events.is_empty() && total_tasks == 1 {
-                // …or as a single task.
-                let mut taken = None;
-                for proj in &mut plan.projects {
-                    if let Some(t) = proj.tasks.pop() {
-                        taken = Some(t);
-                        break;
-                    }
-                }
-                plan.projects.retain(|p| !p.tasks.is_empty());
-                if let Some(t) = taken {
-                    let d = dur.unwrap_or_else(|| t.estimated_minutes.max(15));
-                    plan.habits.push(ParsedHabit { name: t.title, duration_minutes: d });
-                }
-            } else if plan.events.is_empty()
-                && total_tasks == 0
-                && plan.update_events.is_empty()
-                && plan.remove_events.is_empty()
-            {
-                // …or the model produced nothing (it just asked "what time?") — synthesize, so a
-                // clear recurring routine isn't silently dropped.
-                if let Some(name) = synthesize_habit_name(user_text) {
-                    plan.habits.push(ParsedHabit { name, duration_minutes: dur.unwrap_or(30) });
+    // interval — "every other day", "every 3 days"
+    if t.contains("every other day") || t.contains("every second day") || t.contains("alternate days") {
+        return Some(("interval".into(), vec![], 2));
+    }
+    for w in toks.windows(3) {
+        if w[0] == "every" {
+            if let Some(n) = w[1].parse::<i64>().ok().or_else(|| word_number(w[1])) {
+                if matches!(w[2], "day" | "days") && (2..=30).contains(&n) {
+                    return Some(("interval".into(), vec![], n));
                 }
             }
         }
+    }
+    // weekday sets
+    if t.contains("weekday") || t.contains("week day") {
+        return Some(("weekly".into(), vec![1, 2, 3, 4, 5], 1));
+    }
+    if t.contains("weekend") {
+        return Some(("weekly".into(), vec![6, 7], 1));
+    }
+    // specific weekdays, but only with a recurrence cue ("every"/"each", or a plural like "mondays")
+    let cue = t.contains("every") || t.contains("each") || toks.iter().any(|w| w.ends_with('s') && wd(w).is_some());
+    if cue {
+        let mut days: Vec<u8> = Vec::new();
+        for w in &toks {
+            if let Some(d) = wd(w) {
+                if !days.contains(&d) {
+                    days.push(d);
+                }
+            }
+        }
+        if !days.is_empty() {
+            // "every day except sunday" / "weekdays but not friday": the named days are EXCLUSIONS
+            // from the full week, not the target days.
+            if t.contains("except") || t.contains("but not") || t.contains("excluding") || t.contains("besides") {
+                let ex = days.clone();
+                days = (1u8..=7).filter(|d| !ex.contains(d)).collect();
+            }
+            days.sort_unstable();
+            if !days.is_empty() {
+                return Some(("weekly".into(), days, 1));
+            }
+        }
+    }
+    if daily_recurrence(text) {
+        return Some(("daily".into(), vec![], 1));
+    }
+    None
+}
 
-        // A daily routine IS the habit — it must not also linger as a one-off event/update/task.
+/// Sequential task language ("fix the bug, **then** write tests, **then** deploy") implies an
+/// ordered dependency chain. The small model lists the steps in order but rarely fills `depends_on`,
+/// so chain each task onto the previous one (only where the model left deps empty). Gated on an
+/// explicit sequencing cue so unordered lists ("buy milk and eggs") aren't chained.
+fn backfill_task_dependencies(plan: &mut ParsedPlan, user_text: &str) {
+    let lc = user_text.to_lowercase();
+    let sequential = lc.contains(" then ")
+        || lc.contains(", then")
+        || lc.contains("and then")
+        || lc.contains("after that")
+        || lc.contains("followed by");
+    if !sequential {
+        return;
+    }
+    for proj in &mut plan.projects {
+        for i in 1..proj.tasks.len() {
+            if proj.tasks[i].depends_on.is_empty() {
+                let prev = proj.tasks[i - 1].title.clone();
+                if !prev.trim().is_empty() {
+                    proj.tasks[i].depends_on.push(prev);
+                }
+            }
+        }
+    }
+}
+
+fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
+    if let Some((cadence, days, interval_days)) = recurrence(user_text) {
+        let dur = find_duration_minutes(user_text).or_else(|| range_minutes(user_text));
+
+        if plan.habits.is_empty() {
+            // Cluster everything the model emitted by subject. For a recurring routine it commonly
+            // DOUBLE-EMITS the same thing — an event AND a same-named update (and sometimes a task).
+            // If it's all one subject, collapse to a single habit (the cleanup below drops the rest).
+            let mut subjects: Vec<String> = Vec::new();
+            let add = |t: &str, subjects: &mut Vec<String>| {
+                let t = t.trim();
+                if !t.is_empty() && !is_placeholder_title(t) && !subjects.iter().any(|s| titles_refer_same(s, t)) {
+                    subjects.push(t.to_string());
+                }
+            };
+            for e in &plan.events {
+                add(&e.title, &mut subjects);
+            }
+            for u in &plan.update_events {
+                add(&u.target, &mut subjects);
+            }
+            for p in &plan.projects {
+                for t in &p.tasks {
+                    add(&t.title, &mut subjects);
+                }
+            }
+
+            if subjects.len() == 1 {
+                // One recurring subject (possibly split across event/update/task) → one habit.
+                let name = plan
+                    .events
+                    .first()
+                    .map(|e| e.title.clone())
+                    .or_else(|| plan.projects.iter().flat_map(|p| &p.tasks).next().map(|t| t.title.clone()))
+                    .unwrap_or_else(|| subjects[0].clone());
+                let d = dur
+                    .or_else(|| plan.events.first().and_then(|e| e.duration_minutes))
+                    .or_else(|| plan.projects.iter().flat_map(|p| &p.tasks).next().map(|t| t.estimated_minutes.max(15)))
+                    .unwrap_or(60);
+                plan.habits.push(ParsedHabit { name, duration_minutes: d, ..Default::default() });
+            } else if subjects.is_empty() {
+                // The model produced nothing actionable (just asked "what time?") — synthesize, so a
+                // clear recurring routine isn't silently dropped.
+                if let Some(name) = synthesize_habit_name(user_text) {
+                    plan.habits.push(ParsedHabit { name, duration_minutes: dur.unwrap_or(30), ..Default::default() });
+                }
+            }
+            // subjects.len() > 1 → a mixed message (routine + an unrelated item); leave it to the
+            // normal pipeline rather than forcing the wrong thing into a habit.
+        }
+
+        // A recurring routine IS the habit — it must not also linger as a one-off event/update/task.
         // The model often double-emits ("Practice violin" event beside the "Violin practice"
         // habit); drop creates/updates/tasks that name the same thing (order-insensitive).
         if !plan.habits.is_empty() {
@@ -952,6 +1128,13 @@ fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
                 proj.tasks.retain(|t| !dup(&t.title));
             }
             plan.projects.retain(|p| !p.tasks.is_empty());
+        }
+
+        // Stamp the detected cadence onto every resulting habit (the model can't express it).
+        for h in &mut plan.habits {
+            h.cadence = cadence.clone();
+            h.days = days.clone();
+            h.interval_days = interval_days;
         }
     }
 
@@ -1120,6 +1303,33 @@ fn find_day_of_month(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     None
 }
 
+/// A relative date the model can't express, resolved in Rust: "the day after tomorrow" (+2),
+/// "in N days/weeks", "within N days", "in a week". Requires the "in"/"within" preposition so a
+/// bare duration ("for two weeks" = a trip span) is NOT mistaken for a date — see the span guard in
+/// `backfill_event_fields`.
+fn find_relative_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
+    let lc = text.to_lowercase();
+    if lc.contains("day after tomorrow") {
+        return Some(today + Duration::days(2));
+    }
+    let toks: Vec<&str> = lc.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for w in toks.windows(3) {
+        if w[0] == "in" || w[0] == "within" {
+            if let Some(n) = w[1].parse::<i64>().ok().or_else(|| word_number(w[1])) {
+                let days = match w[2] {
+                    "day" | "days" => Some(n),
+                    "week" | "weeks" => Some(n * 7),
+                    _ => None,
+                };
+                if let Some(d) = days.filter(|d| *d > 0 && *d <= 365) {
+                    return Some(today + Duration::days(d));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Some models HTML-escape titles ("A&M" → "A&amp;M"). Undo the common entities so titles
 /// render correctly. `&amp;` is unescaped last to avoid double-decoding.
 fn unescape_html(s: &str) -> String {
@@ -1198,10 +1408,16 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
 
     let range = find_time_range(user_text);
     let duration = find_duration_minutes(user_text);
-    let span = find_span_days(user_text);
-    // An explicit M/D, or an ordinal day-of-month ("the 25th") the model can't express — both
-    // resolved in Rust, never trusted from the model.
-    let explicit_date = find_explicit_date(user_text, today).or_else(|| find_day_of_month(user_text, today));
+    // "in two weeks" is a relative DATE, not a trip span — when one is present, suppress the span so
+    // the event lands on that day instead of becoming an all-day multi-day block. ("for two weeks"
+    // has no "in"/"within", so trips are unaffected.)
+    let relative_date = find_relative_date(user_text, today);
+    let span = if relative_date.is_some() { None } else { find_span_days(user_text) };
+    // An explicit M/D, an ordinal day-of-month ("the 25th"), or a relative date ("the day after
+    // tomorrow", "in two weeks") — all resolved in Rust, never trusted from the model.
+    let explicit_date = find_explicit_date(user_text, today)
+        .or_else(|| find_day_of_month(user_text, today))
+        .or(relative_date);
     // A range of named days ("wednesday and thursday") → a multi-day all-day span.
     let weekday_span = find_weekday_span(user_text, today);
     let shift = find_time_shift(user_text);
@@ -1432,6 +1648,18 @@ fn find_duration_minutes(text: &str) -> Option<i64> {
         }
         i = j.max(i); // don't re-scan the unit
     }
+    // Word-number durations the digit scan misses: "two hours", "an hour", "three hrs".
+    let lower: String = chars.iter().collect();
+    let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    for w in toks.windows(2) {
+        if let Some(n) = word_number(w[0]) {
+            match w[1] {
+                "hour" | "hours" | "hr" | "hrs" => return Some(n * 60),
+                "minute" | "minutes" | "min" | "mins" => return Some(n),
+                _ => {}
+            }
+        }
+    }
     None
 }
 
@@ -1486,15 +1714,17 @@ fn find_deadline_dates(text: &str, today: NaiveDate) -> Vec<NaiveDate> {
             }
         }
     }
-    out.sort();
-    out.dedup();
+    // Dedup keeping first-appearance order — positional per-task assignment relies on text order.
+    let mut seen = HashSet::new();
+    out.retain(|d| seen.insert(*d));
     out
 }
 
 /// Recover the task fields the small model gets wrong, the same way we recover event fields —
 /// from the user's own words, deterministically:
-///   • **Deadline** — a single deadline stated in the text applies to every task that lacks one
-///     ("prep for the exam friday: review chapters, do practice tests" → both due Friday).
+///   • **Deadline** — a single deadline in the text applies to every task that lacks one
+///     ("prep for the exam friday: …" → all due Friday). When the message states ONE deadline per
+///     task ("ch.1 by Monday and ch.2 by Wednesday"), they're assigned in reading order.
 ///   • **Estimate** — for a lone task, an explicit length in the text ("study about 3 hours")
 ///     overrides the model's guess (which defaults to 60). Gated to a single task with no
 ///     competing event so a duration is never mis-assigned.
@@ -1516,12 +1746,26 @@ fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
             }
         }
     }
+    let eod = |d: NaiveDate| fmt_dt(d.and_hms_opt(23, 59, 0).unwrap());
     if deadlines.len() == 1 {
-        let dl = fmt_dt(deadlines[0].and_hms_opt(23, 59, 0).unwrap());
+        // One deadline → every task that lacks one inherits it.
+        let dl = eod(deadlines[0]);
         for proj in &mut plan.projects {
             for t in &mut proj.tasks {
                 if t.deadline.as_deref().and_then(parse_dt).is_none() {
                     t.deadline = Some(dl.clone());
+                }
+            }
+        }
+    } else if task_only && deadlines.len() >= 2 && deadlines.len() == total {
+        // One deadline per task, paired in reading order ("ch.1 by Monday and ch.2 by Wednesday").
+        let mut it = deadlines.iter();
+        for proj in &mut plan.projects {
+            for t in &mut proj.tasks {
+                if let Some(d) = it.next() {
+                    if t.deadline.as_deref().and_then(parse_dt).is_none() {
+                        t.deadline = Some(eod(*d));
+                    }
                 }
             }
         }
@@ -1779,6 +2023,47 @@ fn resolve_event(now: NaiveDateTime, ev: &ParsedEvent) -> Option<(NaiveDateTime,
     Some((start, end_after(start, end)))
 }
 
+/// A multi-day event that carries a *daily* time window ("robotics competition, 3 days, 8am–5pm")
+/// is several same-time days, not one all-day block — expand it into one dated `(start, end)` per
+/// day so the window survives and the scheduler treats each day as busy. Returns `None` for a plain
+/// multi-day span with no time of day (a trip), which stays a single all-day block in `resolve_event`.
+/// Capped at 14 days so a long span ("30 days, 9–5") can't explode the calendar — those fall back
+/// to the all-day path.
+fn expand_daily_span(now: NaiveDateTime, ev: &ParsedEvent) -> Option<Vec<(NaiveDateTime, NaiveDateTime)>> {
+    let span = ev.span_days.filter(|d| (2..=14).contains(d))?;
+    let start_t = ev.start_time.as_deref().and_then(parse_hm)?;
+    let has_end = ev.end_time.as_deref().and_then(parse_hm).is_some();
+    let dur = ev.duration_minutes.and_then(sane_duration);
+    if !has_end && dur.is_none() {
+        return None; // a span with only a start time isn't a clear daily window — leave it all-day
+    }
+    // First-day date: explicit date, else the day word, else today (mirrors `resolve_event`).
+    let date = ev
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .or_else(|| {
+            ev.day
+                .as_deref()
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+                .and_then(|d| resolve_day(now.date(), d))
+        })
+        .unwrap_or(now.date());
+    let days = (0..span)
+        .map(|i| {
+            let start = (date + Duration::days(i)).and_time(start_t);
+            let end = match dur {
+                Some(m) if !has_end => start + Duration::minutes(m),
+                _ => compute_end(start, ev.end_time.as_deref()),
+            };
+            (start, end_after(start, end))
+        })
+        .collect();
+    Some(days)
+}
+
 /// Safety clamp: an event's end must always be strictly after its start, or the calendar
 /// renders nothing and the scheduler skips it. Falls back to a 60-minute block.
 fn end_after(start: NaiveDateTime, end: NaiveDateTime) -> NaiveDateTime {
@@ -2015,7 +2300,8 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
                 continue;
             }
             let color = HABIT_PALETTE[created_habit_names.len() % HABIT_PALETTE.len()];
-            crate::db::insert_habit(conn, name, color, "daily", h.duration_minutes.clamp(5, 24 * 60))?;
+            let cadence = if h.cadence.is_empty() { "daily" } else { &h.cadence };
+            crate::db::insert_habit(conn, name, color, cadence, &h.days, h.interval_days.max(1), h.duration_minutes.clamp(5, 24 * 60))?;
             created_habit_names.push(name.to_string());
         }
     }
@@ -2142,7 +2428,30 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             updated_event_titles.push(t);
             continue;
         }
-        // Genuinely new event.
+        // Genuinely new event. A multi-day event with a daily time window ("robotics competition,
+        // 3 days, 8am–5pm") becomes one dated event per day so the 8–5 window survives; plain
+        // multi-day trips (no time of day) fall through to the all-day span path in `resolve_event`.
+        if let Some(days) = expand_daily_span(now, ev) {
+            for (start, end) in days {
+                let (s, e) = (fmt_dt(start), fmt_dt(end));
+                let id = crate::db::insert_event(conn, &ev.title, &s, &e, "fixed")?;
+                current.push(Event {
+                    id,
+                    title: ev.title.clone(),
+                    start: s,
+                    end: e,
+                    kind: "fixed".into(),
+                    source: "manual".into(),
+                    created_at: String::new(),
+                    provider: None,
+                    external_id: None,
+                    account_id: None,
+                    etag: None,
+                });
+            }
+            created_event_titles.push(ev.title.clone()); // one logical event for the chat summary
+            continue;
+        }
         match resolve_event(now, ev) {
             Some((start, end)) => {
                 let (s, e) = (fmt_dt(start), fmt_dt(end));
@@ -2247,6 +2556,31 @@ mod tests {
         assert_eq!(parse_hm("9"), t(9, 0));
         assert_eq!(parse_hm("12am"), t(0, 0));
         assert_eq!(parse_hm("14:00:00"), t(14, 0));
+    }
+
+    #[test]
+    fn daily_window_span_expands_per_day() {
+        let now = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        // "robotics competition, 3 days, 8am–5pm" → three dated 8–5 days, not one all-day block.
+        let mut e = ev("thursday", Some("08:00"), Some("5 pm"));
+        e.span_days = Some(3);
+        e.date = Some("2026-06-11".into());
+        e.day = None;
+        let days = expand_daily_span(now, &e).expect("a daily-window span expands per day");
+        assert_eq!(days.len(), 3);
+        for (i, (s, en)) in days.iter().enumerate() {
+            assert_eq!(s.date(), NaiveDate::from_ymd_opt(2026, 6, 11 + i as u32).unwrap());
+            assert_eq!(s.time(), NaiveTime::from_hms_opt(8, 0, 0).unwrap());
+            assert_eq!((*en - *s).num_minutes(), 540); // 8am–5pm
+        }
+        // A plain multi-day trip (no time of day) stays a single all-day block (no expansion).
+        let mut trip = ev("monday", None, None);
+        trip.span_days = Some(14);
+        assert!(expand_daily_span(now, &trip).is_none());
+        // A long windowed span (> 14 days) also falls back to all-day, not hundreds of events.
+        let mut long = ev("monday", Some("09:00"), Some("17:00"));
+        long.span_days = Some(30);
+        assert!(expand_daily_span(now, &long).is_none());
     }
 
     fn sample_event() -> crate::model::Event {
@@ -2461,8 +2795,16 @@ mod tests {
         assert_eq!(plan.projects[0].tasks[0].deadline.as_deref(), Some("2026-06-10T17:00:00")); // kept
         assert!(plan.projects[0].tasks[1].deadline.is_some()); // filled
 
-        // Two conflicting deadlines in the message → don't guess, set none.
+        // One deadline per task → paired in reading order (A→Tuesday, B→Friday).
         let mut plan = mk(&["A", "B"]);
+        backfill_task_fields(&mut plan, "A due tuesday and B due friday", today);
+        let tue = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        let fri = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(23, 59, 0).unwrap();
+        assert_eq!(plan.projects[0].tasks[0].deadline.as_deref().and_then(parse_dt), Some(tue));
+        assert_eq!(plan.projects[0].tasks[1].deadline.as_deref().and_then(parse_dt), Some(fri));
+
+        // Deadline count ≠ task count → don't guess the pairing (leave them).
+        let mut plan = mk(&["A", "B", "C"]);
         backfill_task_fields(&mut plan, "A due tuesday and B due friday", today);
         assert!(plan.projects[0].tasks.iter().all(|t| t.deadline.is_none()));
 
@@ -2661,6 +3003,91 @@ mod tests {
     }
 
     #[test]
+    fn recurrence_detects_cadence_and_synthesizes() {
+        // Cadence detection.
+        assert_eq!(recurrence("go to the gym every monday and wednesday"), Some(("weekly".into(), vec![1, 3], 1)));
+        assert_eq!(recurrence("study every other day for 2 hours"), Some(("interval".into(), vec![], 2)));
+        assert_eq!(recurrence("water the plants every 3 days"), Some(("interval".into(), vec![], 3)));
+        assert_eq!(recurrence("stand-up every weekday at 9"), Some(("weekly".into(), vec![1, 2, 3, 4, 5], 1)));
+        assert_eq!(recurrence("relax on weekends"), Some(("weekly".into(), vec![6, 7], 1)));
+        assert_eq!(recurrence("exercise daily"), Some(("daily".into(), vec![], 1)));
+        assert_eq!(recurrence("lunch on friday"), None); // one-off, not recurring
+        // "except" inverts the named days against the full week.
+        assert_eq!(recurrence("workout every day except sunday at 8pm"), Some(("weekly".into(), vec![1, 2, 3, 4, 5, 6], 1)));
+        assert_eq!(recurrence("gym every day but not saturday and sunday"), Some(("weekly".into(), vec![1, 2, 3, 4, 5], 1)));
+
+        // Synthesis strips lead-ins, recurrence words, and weekdays down to the activity.
+        assert_eq!(synthesize_habit_name("Go to the gym every Monday and Wednesday").as_deref(), Some("Gym"));
+        assert_eq!(synthesize_habit_name("meditate every other day").as_deref(), Some("Meditate"));
+
+        // End to end: an empty plan + weekly recurrence → a synthesized weekly habit.
+        let mut plan = ParsedPlan::default();
+        route_recurring_to_habits(&mut plan, "Go to the gym every Monday and Wednesday.");
+        assert_eq!(plan.habits.len(), 1);
+        assert_eq!(plan.habits[0].name, "Gym");
+        assert_eq!(plan.habits[0].cadence, "weekly");
+        assert_eq!(plan.habits[0].days, vec![1, 3]);
+    }
+
+    #[test]
+    fn sequential_then_chains_task_dependencies() {
+        let mk = |t: &str| ParsedTask { title: t.into(), ..Default::default() };
+        let mut plan = ParsedPlan {
+            projects: vec![ParsedProject { name: "Launch".into(), tasks: vec![mk("Fix the login bug"), mk("Write tests"), mk("Deploy to prod")] }],
+            ..Default::default()
+        };
+        backfill_task_dependencies(&mut plan, "fix the login bug, then write tests, then deploy to prod");
+        let t = &plan.projects[0].tasks;
+        assert!(t[0].depends_on.is_empty(), "first step has no prerequisite");
+        assert_eq!(t[1].depends_on, vec!["Fix the login bug".to_string()]);
+        assert_eq!(t[2].depends_on, vec!["Write tests".to_string()]);
+
+        // No sequencing cue → unordered list, no chaining.
+        let mut p2 = ParsedPlan {
+            projects: vec![ParsedProject { name: "Errands".into(), tasks: vec![mk("Buy milk"), mk("Buy eggs")] }],
+            ..Default::default()
+        };
+        backfill_task_dependencies(&mut p2, "buy milk and eggs");
+        assert!(p2.projects[0].tasks[1].depends_on.is_empty());
+    }
+
+    #[test]
+    fn double_emitted_recurring_routine_collapses_to_one_habit() {
+        // The model emits the SAME routine as an event + a same-named update + a task. It must
+        // collapse into ONE habit, keeping the stated duration and the detected interval cadence.
+        let mut e = ev("today", Some("09:00"), None);
+        e.title = "Study US History".into();
+        let up = UpdateEvent {
+            target: "Study US History".into(),
+            title: None,
+            day: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+            shift_minutes: None,
+        };
+        let mut plan = ParsedPlan {
+            events: vec![e],
+            update_events: vec![up],
+            projects: vec![ParsedProject {
+                name: "Study".into(),
+                tasks: vec![ParsedTask { title: "Study US History".into(), estimated_minutes: 60, priority: "medium".into(), ..Default::default() }],
+            }],
+            ..Default::default()
+        };
+        route_recurring_to_habits(&mut plan, "I will study every other day this week for two hours at 9 am for US history.");
+        assert_eq!(plan.habits.len(), 1, "one habit for the single routine");
+        assert!(plan.habits[0].name.to_lowercase().contains("histor"));
+        assert_eq!(plan.habits[0].duration_minutes, 120, "two hours preserved");
+        assert_eq!(plan.habits[0].cadence, "interval");
+        assert_eq!(plan.habits[0].interval_days, 2);
+        assert!(plan.events.is_empty() && plan.update_events.is_empty(), "duplicates suppressed");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0);
+    }
+
+    #[test]
     fn recurring_routines_become_habits() {
         // The model routed "every day" as a single fixed event → convert to a habit.
         let mut ev1 = ev("today", Some("16:00"), Some("17:00"));
@@ -2717,7 +3144,7 @@ mod tests {
                 span_days: None,
                 shift_minutes: None,
             }],
-            habits: vec![ParsedHabit { name: "Violin practice".into(), duration_minutes: 60 }],
+            habits: vec![ParsedHabit { name: "Violin practice".into(), duration_minutes: 60, ..Default::default() }],
             ..Default::default()
         };
         route_recurring_to_habits(&mut plan, "i want to practice violin every day from 4 to 5pm");
@@ -2846,6 +3273,32 @@ mod tests {
         let (_t, s, en) = merge_event(&dentist, now, None, None, shifted.as_deref(), None, None, None, None);
         assert_eq!(s, "2026-06-09T15:00:00");
         assert_eq!((parse_dt(&en).unwrap() - parse_dt(&s).unwrap()).num_minutes(), 60);
+    }
+
+    #[test]
+    fn parses_relative_date() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+        assert_eq!(find_relative_date("lunch the day after tomorrow at 1pm", today), NaiveDate::from_ymd_opt(2026, 6, 7));
+        assert_eq!(find_relative_date("review in two weeks at 2pm", today), NaiveDate::from_ymd_opt(2026, 6, 19));
+        assert_eq!(find_relative_date("call in 3 days", today), NaiveDate::from_ymd_opt(2026, 6, 8));
+        assert_eq!(find_relative_date("ship within a week", today), NaiveDate::from_ymd_opt(2026, 6, 12));
+        // not a date: durations, "in N hours", a trip span, plain "in vietnam"
+        assert_eq!(find_relative_date("in 2 hours", today), None);
+        assert_eq!(find_relative_date("staying in vietnam for two weeks", today), None);
+
+        // End to end: a relative-dated event lands on the right day, and the span is NOT applied
+        // (it stays a point event at its time, not a 14-day all-day block).
+        let now = today.and_hms_opt(9, 0, 0).unwrap();
+        let mut e = ev("today", Some("14:00"), None);
+        e.title = "Project review".into();
+        e.day = None;
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        backfill_event_fields(&mut plan, "schedule a project review in two weeks at 2pm", today);
+        assert_eq!(plan.events[0].span_days, None, "an 'in two weeks' date must not become a span");
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-19"));
+        let (s, en) = resolve_event(now, &plan.events[0]).unwrap();
+        assert_eq!(s.date(), NaiveDate::from_ymd_opt(2026, 6, 19).unwrap());
+        assert_eq!((en - s).num_minutes(), 60); // a normal-length event, not all-day
     }
 
     #[test]

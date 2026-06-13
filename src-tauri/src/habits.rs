@@ -3,7 +3,7 @@
 
 use crate::model::{Event, Habit, HabitDay, HabitStats};
 use crate::scheduler::{parse_dt, Interval};
-use chrono::{Duration, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
 use std::collections::HashSet;
 
 /// Is this habit already on the calendar for `day`? Used so "Add to today" can only place a
@@ -21,23 +21,87 @@ const HISTORY_DAYS: i64 = 17 * 7;
 /// Window for the consistency percentage.
 const RATE_WINDOW_DAYS: i64 = 30;
 
-/// Build the metrics for one habit from the days it was completed.
+/// Build the metrics for one habit from the days it was completed. Streaks and consistency are
+/// measured over the habit's **due** days (per its cadence), so a Mon/Wed habit isn't "broken" by
+/// an un-completed Tuesday.
 pub fn compute_stats(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate) -> HabitStats {
     HabitStats {
         id: habit.id,
         name: habit.name.clone(),
         color: habit.color.clone(),
         cadence: habit.cadence.clone(),
+        days: habit.days.clone(),
+        interval_days: habit.interval_days.max(1),
         duration_minutes: habit.duration_minutes,
         created_at: habit.created_at.clone(),
         done_today: done.contains(&today),
-        current_streak: current_streak(done, today),
-        longest_streak: longest_streak(done),
+        current_streak: current_streak(habit, done, today),
+        longest_streak: longest_streak(habit, done),
         completion_rate: completion_rate(habit, done, today),
         total_done: done.len() as i64,
         scheduled_days: 0, // filled in by commands::habit_stats (needs the events table)
-        history: history(done, today),
+        history: history(habit, done, today),
     }
+}
+
+/// The habit's creation calendar date (anchor for interval cadences).
+fn created_date(habit: &Habit) -> Option<NaiveDate> {
+    habit.created_at.get(..10).and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+}
+
+/// Is the habit expected on `date`, per its cadence? daily = always; weekly = the weekday is in
+/// `days`; interval = `interval_days` apart from creation. Unknown cadence falls back to daily.
+pub fn is_due(habit: &Habit, date: NaiveDate) -> bool {
+    match habit.cadence.as_str() {
+        "weekly" => {
+            let wd = date.weekday().number_from_monday() as u8; // 1=Mon..7=Sun
+            !habit.days.is_empty() && habit.days.contains(&wd)
+        }
+        "interval" => {
+            let n = habit.interval_days.max(1);
+            if n <= 1 {
+                return true;
+            }
+            created_date(habit).map_or(true, |c| date >= c && (date - c).num_days() % n == 0)
+        }
+        _ => true,
+    }
+}
+
+/// The nearest due day strictly before `date` (bounded scan), or None.
+fn prev_due(habit: &Habit, date: NaiveDate) -> Option<NaiveDate> {
+    let mut d = date - Duration::days(1);
+    for _ in 0..400 {
+        if is_due(habit, d) {
+            return Some(d);
+        }
+        d -= Duration::days(1);
+    }
+    None
+}
+
+/// The nearest due day strictly after `date` (bounded scan), or None.
+fn next_due(habit: &Habit, date: NaiveDate) -> Option<NaiveDate> {
+    let mut d = date + Duration::days(1);
+    for _ in 0..400 {
+        if is_due(habit, d) {
+            return Some(d);
+        }
+        d += Duration::days(1);
+    }
+    None
+}
+
+/// The latest due day on or before `date` (bounded scan), or None.
+fn due_on_or_before(habit: &Habit, date: NaiveDate) -> Option<NaiveDate> {
+    let mut d = date;
+    for _ in 0..400 {
+        if is_due(habit, d) {
+            return Some(d);
+        }
+        d -= Duration::days(1);
+    }
+    None
 }
 
 /// Find when to drop a habit of `duration_min` onto a day, given that day's `busy`
@@ -104,64 +168,95 @@ pub fn find_habit_slot(
     Some((window_end - dur, window_end))
 }
 
-/// Consecutive completed days ending today, or ending yesterday if today isn't done yet
-/// (so an unbroken run still shows while today is "pending"). 0 if the last completion is
-/// older than yesterday.
-fn current_streak(done: &HashSet<NaiveDate>, today: NaiveDate) -> i64 {
-    let mut cursor = if done.contains(&today) {
-        today
-    } else if done.contains(&(today - Duration::days(1))) {
-        today - Duration::days(1)
+/// Consecutive completed **due** days ending at the latest due day on/before today — or, if today
+/// is due but still pending, ending at the previous due day (so an unbroken run shows while today
+/// is "pending"). 0 if the most recent due day was missed.
+fn current_streak(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate) -> i64 {
+    let start = if is_due(habit, today) {
+        if done.contains(&today) {
+            Some(today)
+        } else {
+            prev_due(habit, today) // today due but pending → count up to the previous due day
+        }
     } else {
-        return 0;
+        due_on_or_before(habit, today)
+    };
+    let mut cursor = match start {
+        Some(d) => d,
+        None => return 0,
     };
     let mut count = 0;
-    while done.contains(&cursor) {
+    loop {
+        if !done.contains(&cursor) {
+            break;
+        }
         count += 1;
-        cursor -= Duration::days(1);
+        match prev_due(habit, cursor) {
+            Some(p) => cursor = p,
+            None => break,
+        }
     }
     count
 }
 
-/// The longest unbroken run anywhere in the habit's history.
-fn longest_streak(done: &HashSet<NaiveDate>) -> i64 {
+/// The longest unbroken run of completed **due** days anywhere in the habit's history.
+fn longest_streak(habit: &Habit, done: &HashSet<NaiveDate>) -> i64 {
     let mut longest = 0;
     for &d in done {
-        // Only count from the start of a run (the day before is missing).
-        if done.contains(&(d - Duration::days(1))) {
-            continue;
+        if !is_due(habit, d) {
+            continue; // only completions on due days count toward a cadence streak
+        }
+        // Only start from the beginning of a run (the previous due day is missing/not done).
+        if let Some(p) = prev_due(habit, d) {
+            if done.contains(&p) {
+                continue;
+            }
         }
         let mut len = 0;
-        let mut cursor = d;
-        while done.contains(&cursor) {
+        let mut cursor = Some(d);
+        while let Some(c) = cursor {
+            if !done.contains(&c) {
+                break;
+            }
             len += 1;
-            cursor += Duration::days(1);
+            cursor = next_due(habit, c);
         }
         longest = longest.max(len);
     }
     longest
 }
 
-/// Fraction of the last 30 days (or since creation, if younger) that were completed.
+/// Fraction of the habit's **due** days in the last 30 days (or since creation, if younger) that
+/// were completed. A habit with no due days in the window reports 0.
 fn completion_rate(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate) -> f64 {
-    let created = habit
-        .created_at
-        .get(..10)
-        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .unwrap_or(today);
+    let created = created_date(habit).unwrap_or(today);
     let since_created = (today - created).num_days() + 1;
     let window = since_created.clamp(1, RATE_WINDOW_DAYS);
-    let hits = (0..window).filter(|i| done.contains(&(today - Duration::days(*i)))).count() as f64;
-    hits / window as f64
+    let (mut due, mut hits) = (0i64, 0i64);
+    for i in 0..window {
+        let d = today - Duration::days(i);
+        if is_due(habit, d) {
+            due += 1;
+            if done.contains(&d) {
+                hits += 1;
+            }
+        }
+    }
+    if due == 0 {
+        0.0
+    } else {
+        hits as f64 / due as f64
+    }
 }
 
-/// Contiguous days, oldest → today, each flagged done/not — drives the heatmap.
-fn history(done: &HashSet<NaiveDate>, today: NaiveDate) -> Vec<HabitDay> {
+/// Contiguous days, oldest → today, each flagged done + due — drives the heatmap (non-due days
+/// render dimmed so the cadence reads visually).
+fn history(habit: &Habit, done: &HashSet<NaiveDate>, today: NaiveDate) -> Vec<HabitDay> {
     (0..HISTORY_DAYS)
         .rev()
         .map(|i| {
             let d = today - Duration::days(i);
-            HabitDay { day: d.format("%Y-%m-%d").to_string(), done: done.contains(&d) }
+            HabitDay { day: d.format("%Y-%m-%d").to_string(), done: done.contains(&d), due: is_due(habit, d) }
         })
         .collect()
 }
@@ -176,11 +271,30 @@ mod tests {
             name: "Read".into(),
             color: "#22c55e".into(),
             cadence: "daily".into(),
+            days: vec![],
+            interval_days: 1,
             duration_minutes: 30,
             archived: false,
             created_at: format!("{created}T08:00:00"),
         }
     }
+    fn weekly(created: &str, days: &[u8]) -> Habit {
+        Habit { cadence: "weekly".into(), days: days.to_vec(), ..habit(created) }
+    }
+    fn interval(created: &str, n: i64) -> Habit {
+        Habit { cadence: "interval".into(), interval_days: n, ..habit(created) }
+    }
+    const DAILY: fn() -> Habit = || Habit {
+        id: 1,
+        name: "Read".into(),
+        color: "#22c55e".into(),
+        cadence: "daily".into(),
+        days: vec![],
+        interval_days: 1,
+        duration_minutes: 30,
+        archived: false,
+        created_at: "2025-01-01T08:00:00".into(),
+    };
 
     fn days(today: NaiveDate, offsets: &[i64]) -> HashSet<NaiveDate> {
         offsets.iter().map(|o| today - Duration::days(*o)).collect()
@@ -190,28 +304,28 @@ mod tests {
     fn streak_counts_run_ending_today() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
         let done = days(today, &[0, 1, 2, 4]); // today, -1, -2, (gap), -4
-        assert_eq!(current_streak(&done, today), 3);
+        assert_eq!(current_streak(&DAILY(), &done, today), 3);
     }
 
     #[test]
     fn streak_survives_a_pending_today() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
         let done = days(today, &[1, 2, 3]); // not today, but yesterday + back
-        assert_eq!(current_streak(&done, today), 3);
+        assert_eq!(current_streak(&DAILY(), &done, today), 3);
     }
 
     #[test]
     fn streak_breaks_after_a_missed_day() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
         let done = days(today, &[2, 3, 4]); // last completion was 2 days ago
-        assert_eq!(current_streak(&done, today), 0);
+        assert_eq!(current_streak(&DAILY(), &done, today), 0);
     }
 
     #[test]
     fn longest_streak_scans_whole_history() {
         let today = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
         let done = days(today, &[0, 1, 5, 6, 7, 8, 20]); // runs of 2, 4, 1
-        assert_eq!(longest_streak(&done), 4);
+        assert_eq!(longest_streak(&DAILY(), &done), 4);
     }
 
     #[test]
@@ -318,5 +432,50 @@ mod tests {
         assert_eq!(s.history.len() as i64, HISTORY_DAYS);
         assert_eq!(s.history.last().unwrap().day, "2026-06-10"); // newest is today
         assert!(s.history.last().unwrap().done);
+    }
+
+    #[test]
+    fn is_due_honors_cadence() {
+        // 2026-06-08 is a Monday.
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
+        let mw = weekly("2026-01-01", &[1, 3]); // Mon & Wed
+        assert!(is_due(&mw, mon) && !is_due(&mw, tue) && is_due(&mw, wed));
+
+        let eod = interval("2026-06-08", 2); // every other day from Mon
+        assert!(is_due(&eod, mon) && !is_due(&eod, tue) && is_due(&eod, wed));
+        assert!(!is_due(&eod, NaiveDate::from_ymd_opt(2026, 6, 7).unwrap())); // before creation
+
+        assert!(is_due(&habit("2026-01-01"), tue)); // daily is always due
+    }
+
+    #[test]
+    fn weekly_streak_ignores_off_days() {
+        let wed = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(); // a Wednesday
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 8).unwrap();
+        let prev_wed = NaiveDate::from_ymd_opt(2026, 6, 3).unwrap();
+        // Created on the first completed due day so the rate window covers exactly its due days.
+        let mw = weekly("2026-06-03", &[1, 3]);
+        // Completed Wed + the Mon before + the Wed before → a 3-long streak across off-days.
+        let done: HashSet<NaiveDate> = [wed, mon, prev_wed].into_iter().collect();
+        let s = compute_stats(&mw, &done, wed);
+        assert_eq!(s.current_streak, 3); // a missed Tuesday must NOT break it
+        // Consistency is over DUE days only — all 3 due days since creation were done → 100%.
+        assert!((s.completion_rate - 1.0).abs() < 1e-9, "rate was {}", s.completion_rate);
+        // The heatmap marks Tuesday not-due.
+        assert!(s.history.iter().any(|d| d.day == "2026-06-09" && !d.due));
+    }
+
+    #[test]
+    fn interval_streak_counts_every_other_day() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 10).unwrap();
+        let h = interval("2026-06-02", 2); // due 6/2,6/4,6/6,6/8,6/10,...
+        let done = days(today, &[0, 2, 4]); // 6/10, 6/8, 6/6 — three due days in a row
+        assert_eq!(current_streak(&h, &done, today), 3);
+        // A completion on an off day (6/9) doesn't extend the streak.
+        let mut done2 = done.clone();
+        done2.insert(today - Duration::days(1));
+        assert_eq!(current_streak(&h, &done2, today), 3);
     }
 }

@@ -61,8 +61,8 @@ interface State {
   refreshLlm: () => Promise<void>;
 
   loadHabits: () => Promise<void>;
-  createHabit: (name: string, color: string, durationMinutes: number) => Promise<void>;
-  updateHabit: (id: number, name: string, color: string, durationMinutes: number) => Promise<void>;
+  createHabit: (name: string, color: string, cadence: string, days: number[], intervalDays: number, durationMinutes: number) => Promise<void>;
+  updateHabit: (id: number, name: string, color: string, cadence: string, days: number[], intervalDays: number, durationMinutes: number) => Promise<void>;
   toggleHabit: (id: number, day?: string | null) => Promise<void>;
   deleteHabit: (id: number) => Promise<void>;
   scheduleHabit: (id: number, day?: string | null) => Promise<void>;
@@ -221,8 +221,8 @@ export const useStore = create<State>((set, get) => {
 
     // Habit commands return the full recomputed list, so we just store the result.
     loadHabits: async () => set({ habits: await api.listHabits() }),
-    createHabit: async (name, color, durationMinutes) => set({ habits: await api.createHabit(name, color, "daily", durationMinutes) }),
-    updateHabit: async (id, name, color, durationMinutes) => set({ habits: await api.updateHabit(id, name, color, durationMinutes) }),
+    createHabit: async (name, color, cadence, days, intervalDays, durationMinutes) => set({ habits: await api.createHabit(name, color, cadence, days, intervalDays, durationMinutes) }),
+    updateHabit: async (id, name, color, cadence, days, intervalDays, durationMinutes) => set({ habits: await api.updateHabit(id, name, color, cadence, days, intervalDays, durationMinutes) }),
     toggleHabit: async (id, day = null) => set({ habits: await api.toggleHabit(id, day) }),
     deleteHabit: async (id) => set({ habits: await api.deleteHabit(id) }),
     // Scheduling a habit creates a calendar event + re-plans, so refresh app data via mutate.

@@ -88,7 +88,10 @@ pub struct Booking {
     pub created_at: String,
 }
 
-/// A tracked habit. `cadence` is "daily" for now (room to grow to weekly targets).
+/// A tracked habit. Recurrence is `cadence` + its parameters:
+/// - "daily"   → every day.
+/// - "weekly"  → only the weekdays in `days` (1=Mon..7=Sun).
+/// - "interval"→ every `interval_days` days, anchored at `created_at` (2 = every other day).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Habit {
@@ -96,17 +99,27 @@ pub struct Habit {
     pub name: String,
     pub color: String,
     pub cadence: String,
+    #[serde(default)]
+    pub days: Vec<u8>,
+    #[serde(default = "default_interval_days")]
+    pub interval_days: i64,
     pub duration_minutes: i64,
     pub archived: bool,
     pub created_at: String,
 }
 
+fn default_interval_days() -> i64 {
+    1
+}
+
 /// One day in a habit's history (for the consistency heatmap). `day` is "YYYY-MM-DD".
+/// `due` = the habit was expected that day (per its cadence); `done` = it was completed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HabitDay {
     pub day: String,
     pub done: bool,
+    pub due: bool,
 }
 
 /// A habit plus the derived streak/consistency metrics the UI renders.
@@ -117,6 +130,10 @@ pub struct HabitStats {
     pub name: String,
     pub color: String,
     pub cadence: String,
+    #[serde(default)]
+    pub days: Vec<u8>,
+    #[serde(default = "default_interval_days")]
+    pub interval_days: i64,
     pub duration_minutes: i64,
     pub created_at: String,
     pub done_today: bool,

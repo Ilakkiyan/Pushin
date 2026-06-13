@@ -5,7 +5,7 @@ import type { Conflict } from "../lib/ipc";
 function describe(c: Conflict): string {
   switch (c.kind) {
     case "deadlineMiss":
-      return `“${c.title}” is scheduled to finish after its deadline`;
+      return `“${c.title}” can’t be fully scheduled before its deadline`;
     case "unschedulable":
       return `“${c.title}” doesn’t fit in your free time (${c.remainingMinutes}m over)`;
     case "dependencyCycle":

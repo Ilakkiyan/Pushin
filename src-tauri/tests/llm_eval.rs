@@ -241,6 +241,42 @@ fn passport_on_the_25th(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)>
     // known date-resolution stretch. The check documents whether the model lands the right day.
     vec![chk("lands on the 25th", ev_start_date(c, "passport").map(|d| d.day()) == Some(25))]
 }
+fn robotics_three_days(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // "3 days from 8am to 5pm" must become three separate 8–5 days (Thu/Fri/Sat), NOT one all-day
+    // block that swallows the time window (the bug: find_span_days made it span_days → all-day).
+    let evs: Vec<Event> = db::list_events(c)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.title.to_lowercase().contains("robot"))
+        .collect();
+    let windows_ok = !evs.is_empty()
+        && evs.iter().all(|e| match (parse(&e.start), parse(&e.end)) {
+            (Some(s), Some(en)) => s.hour() == 8 && (en - s).num_minutes() == 540, // 8am–5pm
+            _ => false,
+        });
+    let mut days: Vec<NaiveDate> = evs.iter().filter_map(|e| parse(&e.start).map(|d| d.date())).collect();
+    days.sort();
+    days.dedup();
+    let consecutive = days.len() == 3 && (days[2] - days[0]).num_days() == 2;
+    vec![
+        chk("three robotics days", evs.len() == 3),
+        chk("each is an 8am–5pm window (not all-day)", windows_ok),
+        chk("three consecutive days from Thursday", consecutive),
+    ]
+}
+fn us_history_two_hours(o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // The 2-hour duration is the point (the create-time duration-drop the user hit). "Every other
+    // day" recurrence has no clean home (habits are daily-only), so accept the block as either a
+    // recurring habit or a single event — as long as it lands as a ~2-hour US-history slot.
+    let habit_2h = db::list_habits(c)
+        .map(|hs| hs.iter().any(|h| h.name.to_lowercase().contains("histor") && (h.duration_minutes - 120).abs() <= 5))
+        .unwrap_or(false);
+    let event_2h = near(ev_minutes(c, "histor"), 120);
+    vec![
+        chk("US history got scheduled (habit or event)", !o.created_habit_names.is_empty() || !o.created_event_titles.is_empty()),
+        chk("as a 2-hour block", habit_2h || event_2h),
+    ]
+}
 fn one_task_not_event(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
     // "Spend Saturday afternoon cleaning the garage" is work (a task), not a fixed event, and is one
     // activity (not a decomposed project).
@@ -376,6 +412,27 @@ fn cases() -> Vec<Case> {
             prompt: "I'm going to exercise for an hour every day at 10pm.",
             expect: E { habits: Some(1), events: Some(0), habit_has: &["exercise"], ..Default::default() },
         },
+        Case {
+            // "every day except sunday" is a partial-week recurrence; habits are daily-only (no
+            // per-day exclusions, no fixed time), so the exclusion + 8pm are known gaps. The point
+            // is it lands as ONE (daily) workout habit, not a stack of one-off events.
+            name: "daily-except-one-day routine → habit (exclusion is a known gap)",
+            category: "habit",
+            history: &[],
+            seed: &[],
+            prompt: "I want to workout every day this week except sunday at 8pm.",
+            expect: E { min_habits: Some(1), events: Some(0), habit_has: &["workout"], ..Default::default() },
+        },
+        Case {
+            // "every other day" recurrence isn't expressible (daily-only habits), but the stated
+            // two-hour duration MUST survive — the create-time duration-drop the user reported.
+            name: "every-other-day study block keeps its 2-hour duration",
+            category: "habit",
+            history: &[],
+            seed: &[],
+            prompt: "I will study every other day this week for two hours at 9 am for US history.",
+            expect: E { custom: Some(us_history_two_hours), ..Default::default() },
+        },
         // ---- dates / spans ----
         Case {
             name: "explicit date + multi-week span",
@@ -392,6 +449,16 @@ fn cases() -> Vec<Case> {
             seed: &[],
             prompt: "I have orientation Wednesday and Thursday this week.",
             expect: E { min_events: Some(1), custom: Some(span_two_days), ..Default::default() },
+        },
+        Case {
+            // A multi-day event WITH a daily time window: "3 days from 8am to 5pm" must become three
+            // separate 8–5 days (Thu/Fri/Sat), not one all-day block that swallows the times.
+            name: "multi-day event with a daily time window",
+            category: "dates",
+            history: &[],
+            seed: &[],
+            prompt: "From this Thursday, I have a robotics competition that lasts for 3 days from 8 am to 5 pm.",
+            expect: E { custom: Some(robotics_three_days), ..Default::default() },
         },
         // ---- mixed event + task ----
         Case {
@@ -868,8 +935,16 @@ async fn llm_eval() {
         let current: Vec<Event> = db::list_events(&conn).unwrap_or_default();
         let history: Vec<ChatTurn> = case.history.iter().map(|(r, c)| ChatTurn { role: (*r).into(), content: (*c).into() }).collect();
 
+        // PUSHIN_EVAL_UNION=1 → evaluate the single-call union path (what a fine-tuned student runs)
+        // instead of the router pipeline. Both end in the same store_plan + recovery.
+        let union_mode = std::env::var("PUSHIN_EVAL_UNION").is_ok();
+        let plan_result = if union_mode {
+            parser::union_label(&client, &settings, &current, &history, case.prompt).await.map(|(_, _, p)| p)
+        } else {
+            parser::plan(&client, &settings, &current, &history, case.prompt).await
+        };
         let (checks, outcome): (Vec<(String, bool)>, Option<PlanOutcome>) =
-            match parser::plan(&client, &settings, &current, &history, case.prompt).await {
+            match plan_result {
                 Ok(plan) => match parser::store_plan(&conn, &settings, &plan) {
                     Ok(o) => (evaluate(&case.expect, &o, &conn), Some(o)),
                     Err(e) => (vec![chk(format!("store_plan errored: {e}"), false)], None),

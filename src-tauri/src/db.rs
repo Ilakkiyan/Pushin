@@ -11,6 +11,7 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_habits.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_habit_duration.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_project_archive.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_notes.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_habit_cadence.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -45,6 +46,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 6 {
         conn.execute_batch(MIGRATION_0006)?;
         conn.pragma_update(None, "user_version", 6)?;
+    }
+    if version < 7 {
+        conn.execute_batch(MIGRATION_0007)?;
+        conn.pragma_update(None, "user_version", 7)?;
     }
     Ok(())
 }
@@ -454,12 +459,22 @@ pub fn mark_event_pushed(conn: &Connection, id: i64, external_id: &str, etag: Op
 
 // ---------- Habits ----------
 
+/// CSV "1,3" ↔ weekday list. Empty/whitespace → empty vec.
+fn parse_days_csv(s: &str) -> Vec<u8> {
+    s.split(',').filter_map(|p| p.trim().parse::<u8>().ok()).filter(|d| (1..=7).contains(d)).collect()
+}
+fn days_to_csv(days: &[u8]) -> String {
+    days.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")
+}
+
 fn row_to_habit(r: &Row) -> rusqlite::Result<Habit> {
     Ok(Habit {
         id: r.get("id")?,
         name: r.get("name")?,
         color: r.get("color")?,
         cadence: r.get("cadence")?,
+        days: parse_days_csv(&r.get::<_, String>("days").unwrap_or_default()),
+        interval_days: r.get::<_, i64>("interval_days").unwrap_or(1),
         duration_minutes: r.get("duration_minutes")?,
         archived: r.get::<_, i64>("archived")? != 0,
         created_at: r.get("created_at")?,
@@ -472,18 +487,21 @@ pub fn list_habits(conn: &Connection) -> Result<Vec<Habit>> {
     Ok(rows)
 }
 
-pub fn insert_habit(conn: &Connection, name: &str, color: &str, cadence: &str, duration_minutes: i64) -> Result<i64> {
+#[allow(clippy::too_many_arguments)]
+pub fn insert_habit(conn: &Connection, name: &str, color: &str, cadence: &str, days: &[u8], interval_days: i64, duration_minutes: i64) -> Result<i64> {
     conn.execute(
-        "INSERT INTO habits(name, color, cadence, duration_minutes, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![name, color, cadence, duration_minutes, now_iso()],
+        "INSERT INTO habits(name, color, cadence, days, interval_days, duration_minutes, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![name, color, cadence, days_to_csv(days), interval_days.max(1), duration_minutes, now_iso()],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-pub fn update_habit(conn: &Connection, id: i64, name: &str, color: &str, duration_minutes: i64) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn update_habit(conn: &Connection, id: i64, name: &str, color: &str, cadence: &str, days: &[u8], interval_days: i64, duration_minutes: i64) -> Result<()> {
     conn.execute(
-        "UPDATE habits SET name = ?2, color = ?3, duration_minutes = ?4 WHERE id = ?1",
-        params![id, name, color, duration_minutes],
+        "UPDATE habits SET name = ?2, color = ?3, cadence = ?4, days = ?5, interval_days = ?6, duration_minutes = ?7 WHERE id = ?1",
+        params![id, name, color, cadence, days_to_csv(days), interval_days.max(1), duration_minutes],
     )?;
     Ok(())
 }
