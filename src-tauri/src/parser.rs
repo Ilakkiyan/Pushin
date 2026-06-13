@@ -433,6 +433,26 @@ pub async fn plan(
     Ok(parsed)
 }
 
+/// **Eval only** (`PUSHIN_EVAL_ROUTER=1`). Force the router pipeline (classify + per-intent extract
+/// with the dynamic exemplar bank) that `plan()` now keeps only as an error fallback, so the harness
+/// can A/B router vs union on the same battery. Same recovery layer + `store_plan` as `plan()`.
+pub async fn route_eval(
+    client: &reqwest::Client,
+    settings: &Settings,
+    current_events: &[Event],
+    history: &[ChatTurn],
+    user_text: &str,
+) -> Result<ParsedPlan> {
+    let mut parsed = match route_intents(client, settings, current_events, history, user_text).await {
+        Ok(intents) if !intents.is_empty() => {
+            extract_by_intents(client, settings, current_events, history, user_text, &intents).await.unwrap_or_default()
+        }
+        _ => ParsedPlan::default(),
+    };
+    apply_recovery(&mut parsed, user_text, Local::now().naive_local().date());
+    Ok(parsed)
+}
+
 /// The deterministic recovery layer that runs after extraction — HTML-unescape, deadline
 /// validation, task/event field recovery (days, durations, spans, deadlines), and habit routing.
 /// Shared by `plan` (the router pipeline) and the datagen `union_label` path so a training label is

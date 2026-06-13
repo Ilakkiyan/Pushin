@@ -936,11 +936,16 @@ async fn llm_eval() {
         let current: Vec<Event> = db::list_events(&conn).unwrap_or_default();
         let history: Vec<ChatTurn> = case.history.iter().map(|(r, c)| ChatTurn { role: (*r).into(), content: (*c).into() }).collect();
 
-        // PUSHIN_EVAL_UNION=1 → evaluate the single-call union path (what a fine-tuned student runs)
-        // instead of the router pipeline. Both end in the same store_plan + recovery.
+        // PUSHIN_EVAL_UNION=1 → evaluate the single-call union path (what a fine-tuned student runs).
+        // PUSHIN_EVAL_ROUTER=1 → force the router pipeline (classify + per-intent extract w/ dynamic
+        // few-shot), which `plan()` now keeps only as an error fallback — used to A/B router vs union.
+        // Default (no env) → whatever `plan()` ships (currently union-first). All end in store_plan + recovery.
         let union_mode = std::env::var("PUSHIN_EVAL_UNION").is_ok();
+        let router_mode = std::env::var("PUSHIN_EVAL_ROUTER").is_ok();
         let plan_result = if union_mode {
             parser::union_label(&client, &settings, &current, &history, case.prompt).await.map(|(_, _, p)| p)
+        } else if router_mode {
+            parser::route_eval(&client, &settings, &current, &history, case.prompt).await
         } else {
             parser::plan(&client, &settings, &current, &history, case.prompt).await
         };
