@@ -2,9 +2,11 @@
 
 # 📌 Pushin
 
-**A local‑AI, Motion‑style calendar.** Describe your day in plain language — a small language model
-running **100% on your device** turns it into tasks and events, and a deterministic Rust
-auto‑scheduler packs everything into your calendar around your fixed commitments.
+**A local‑AI, Motion‑style calendar — and a local‑first second brain.** Describe your day in plain
+language and a small language model running **100% on your device** turns it into tasks and events,
+which a deterministic Rust auto‑scheduler packs into your calendar around your fixed commitments.
+Then keep everything else — notes, ideas, knowledge — in a **Notion‑style document vault** with
+**Obsidian‑style `[[wikilinks]]` and a connection graph**, all in the same app.
 
 No cloud. No account. Nothing leaves your machine.
 
@@ -55,13 +57,23 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
 |---|---|
 | 🗣️ **Natural‑language planning** | Type tasks and events like you'd text a friend; the model turns them into a structured plan. |
 | 🧠 **Deterministic auto‑scheduler** | Dependency‑aware EDF + priority packing with conflict detection — the core IP, in Rust, with unit tests. |
+| 📓 **Notion‑style document vault** | A block editor (headings, lists, quotes, slash menu) with nested pages, organized in a sidebar tree. Notes are first‑class documents, not scratch text. |
+| 🕸️ **Obsidian‑style links & graph** | Type `[[` to link any page to another; each page shows its **backlinks**, and a force‑directed **connection graph** visualizes how your knowledge ties together. |
+| 🔮 **On‑device semantic memory (Hermes)** | Pages are embedded locally so recall and search find what you mean, not just keyword matches — with a keyword fallback that always works. |
+| 📆 **Daily notes** | One page per calendar day, opened straight from the week/month grid — the bridge between your time and your knowledge. |
+| 🪢 **Notes ↔ tasks & events** | Link any task or event to a page; the calendar becomes an index into your knowledge, and pages show their linked work. |
+| ✨ **AI that uses your notes** | The planner auto‑recalls relevant notes (e.g. "Sarah prefers afternoons"), offers to remember durable facts from chat, and can **answer questions over your vault** with citations — all on‑device. |
+| 📥 **Quick capture + Inbox** | `Cmd/Ctrl+Shift+N` to jot anything into an Inbox; sort it later into a task, event, or note. One box, zero decisions. |
+| 📦 **Import your vault** | Bring in an Obsidian / Markdown folder — files become pages, `[[links]]` become connections. |
+| ⌘ **Command palette** | `Cmd/Ctrl‑K` for semantic search, jump to any page/view, or **ask your vault** a question. |
 | 📅 **Week view** | Full 24‑hour week grid with drag‑to‑move and pin‑to‑lock; re‑plans around your changes. |
 | 🗓️ **Month view** | Google‑Calendar‑style month grid with per‑day event chips; click a day to jump to its week. |
 | 🔥 **Habit tracker** | Build habits with streaks, a consistency heatmap, and one‑click "add to today's calendar" that slots a habit into a free gap. |
 | 🌙 **Personalized routine** | A first‑run welcome captures your sleep, working hours, and recurring blocked time (meals, gym, commute); the scheduler keeps them free and the AI plans around them. |
 | ✅ **Task list** | Auto‑scheduled work blocks with status, priority, and deadlines. |
 | 🔗 **Two‑way Google Calendar sync** | Mirror events and task blocks to your primary calendar (optional). |
-| 🔒 **100% on‑device** | Inference runs locally via llama.cpp or Ollama. The app works fully offline. |
+| 🪟 **Polished desktop shell** | A collapsible left sidebar and a custom frameless title bar that tucks away in fullscreen (F11). |
+| 🔒 **100% on‑device** | Both the language model and the embedding model run locally via llama.cpp or Ollama. The app works fully offline. |
 
 ---
 
@@ -69,8 +81,8 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
 
 ```
             ┌─────────────────────────────────────────────┐
-            │  React UI  (chat · week · month · habits ·   │
-            │            tasks · booking · settings)       │
+            │  React UI  (sidebar · chat · week · month ·  │
+            │   habits · vault editor · graph · ⌘K palette)│
             └───────────────────────┬─────────────────────┘
                                     │  Tauri IPC (typed commands)
             ┌───────────────────────▼─────────────────────┐
@@ -79,13 +91,16 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
             │                ranges resolved in Rust)      │
             │   • scheduler  free‑slot packing + conflicts │
             │   • habits     streaks / consistency / slots │
+            │   • hermes     vault pages: embeddings +     │
+            │                cosine/keyword recall + links │
             │   • db         SQLite (source of truth)      │
             │   • calendar   two‑way Google sync           │
             └─────────┬───────────────────────┬───────────┘
-                      │ spawns                 │ HTTPS (optional)
+                      │ spawns (×2)            │ HTTPS (optional)
                       ▼                        ▼
-        llama.cpp `llama-server`        Google Calendar API
-        (local, OpenAI‑compatible)
+   llama.cpp `llama-server`              Google Calendar API
+   (chat :8080 + embeddings :8181,
+    local, OpenAI‑compatible)
 ```
 
 **Design rule:** the LLM *parses*, Rust *schedules*. Small models are great at pulling structure
@@ -188,8 +203,9 @@ Pushin needs a local, OpenAI‑compatible inference server. Pick **one**:
 
 On first launch the chat panel shows a **setup card** listing three models — pick one and click
 **Download**. Pushin fetches the model *and* the llama.cpp engine for your OS automatically and starts
-the server on `http://127.0.0.1:8080`. The status pill in the top‑right turns green ("AI ready")
-when it's up.
+the server on `http://127.0.0.1:8080`. The status pill at the bottom of the sidebar turns green
+("AI ready") when it's up. (A second, tiny embedding model for the vault's semantic memory downloads
+automatically the first time too — ~37 MB, no setup.)
 
 > Three tiers, pick for your machine:
 > - **Lite — Qwen2.5 3B** (~2 GB): lightest and fastest; the default download, runs almost anywhere.
@@ -216,6 +232,10 @@ That's it — type into the chat box and watch your calendar fill in.
 
 ## Using Pushin
 
+Everything is reachable from the **left sidebar** (collapse it with the toggle for more room), or
+instantly via the **`Cmd/Ctrl‑K` command palette** — search any page, jump to any view, or create a
+page without leaving the keyboard.
+
 **Chat (right panel).** Describe events and work in plain language:
 - *"Lunch with mom Friday 12–2 and a graduation party from 6–10."* → two events.
 - *"I need to study for the exam, about 4 hours, due Thursday."* → a task the scheduler places.
@@ -237,6 +257,30 @@ lands near the end of the day, tucked between existing commitments) — the sche
 tasks around it.
 
 **Tasks** — everything the scheduler is managing, with priority, deadline, and status.
+
+**Notes (the vault)** — your second brain. Hit **+** in the sidebar's Pages tree to create a page,
+then write in a **block editor**: type `/` for headings, lists, quotes, and more; nest pages under
+each other to build a tree. Type **`[[`** to link to another page (pick an existing one or create it
+on the fly) — the link becomes a clickable chip, and the target page lists every page that links to
+it under **Linked references**. Pages are embedded on‑device, so recall and search understand
+meaning, not just exact words.
+
+**Daily notes & links** — hover any day in the week/month grid and click the note icon (or "Today's
+note" in the sidebar) to open that day's page. Link a task or event to a page from its **Notes**
+action; the page lists its linked work under "Linked tasks & events".
+
+**Inbox (quick capture)** — press `Cmd/Ctrl+Shift+N` anywhere to jot a thought into the Inbox without
+deciding what it is. Later, from the **Inbox**, hit **Plan with AI** to turn it into a task/event,
+**Keep as note**, or delete it.
+
+**Ask your vault & import** — in the `Cmd/Ctrl‑K` palette, type a question and choose **Ask your
+vault** for an on‑device answer with citations; search is semantic when the memory engine is up. Bring
+existing notes in with the **import** button (↓) in the sidebar's Pages header — pick an Obsidian or
+Markdown folder and your files + `[[links]]` come across.
+
+**Graph** — an Obsidian‑style **connection graph** of your whole vault: every page is a node (bigger
+= more links), every `[[link]]` is an edge. Click a node to open that page. It's the bird's‑eye view
+of how your notes connect.
 
 **Booking** — a local mock‑up of a public booking page that reuses the scheduler's free‑slot logic.
 
@@ -445,18 +489,20 @@ cargo build            # compile the backend
 ```
 Pushin/
 ├─ src/                     # React + TypeScript frontend
-│  ├─ panes/                # CalendarPane (week), MonthPane, HabitsPane,
-│  │                        #   ChatPane, TaskListPane, BookingPane, SettingsPane
-│  ├─ components/           # TopBar, InferenceSetup, ConflictBanner
+│  ├─ panes/                # CalendarPane (week), MonthPane, HabitsPane, ChatPane,
+│  │                        #   TaskListPane, VaultPane (editor), GraphPane, BookingPane, SettingsPane
+│  ├─ components/           # Sidebar, TitleBar, VaultTree, PageEditor (BlockNote),
+│  │                        #   CommandPalette, InferenceSetup, ConflictBanner
 │  ├─ state/store.ts        # Zustand store (SQLite is the source of truth)
-│  └─ lib/                  # ipc.ts (typed commands) · time.ts (date helpers)
+│  └─ lib/                  # ipc.ts (typed commands) · time.ts · blocks.ts / editorSchema.tsx (editor)
 ├─ src-tauri/               # Rust backend
 │  ├─ src/
 │  │  ├─ commands.rs        # the Tauri IPC surface
 │  │  ├─ parser.rs          # NL → structured plan (dates/ranges resolved here)
 │  │  ├─ scheduler.rs       # the auto‑scheduler (core IP) + tests
 │  │  ├─ habits.rs          # streak/consistency math + calendar slot finder + tests
-│  │  ├─ db.rs              # SQLite persistence + migrations
+│  │  ├─ hermes.rs          # vault memory: on‑device embeddings + cosine/keyword recall
+│  │  ├─ db.rs              # SQLite persistence + migrations (incl. pages + links) + tests
 │  │  ├─ model.rs           # shared domain types
 │  │  ├─ model_manager.rs   # model + engine auto‑download, llama‑server lifecycle
 │  │  └─ calendar/          # Google two‑way sync
@@ -499,9 +545,10 @@ Google Calendar sync.
 
 ## Tech stack
 
-**Shell:** Tauri 2 · **Frontend:** React 18 + TypeScript + Vite + Tailwind + Zustand ·
-**Backend:** Rust (rusqlite, reqwest, chrono) · **Inference:** llama.cpp `llama-server` /
+**Shell:** Tauri 2 (frameless custom title bar) · **Frontend:** React 19 + TypeScript + Vite +
+Tailwind + Zustand · **Editor & graph:** BlockNote (block editor) + react‑force‑graph (connection
+graph) · **Backend:** Rust (rusqlite, reqwest, chrono) · **Inference:** llama.cpp `llama-server` /
 Ollama (OpenAI‑compatible, `response_format: json_schema`) · **Models:** Qwen2.5 3B / 7B / 14B
-(4‑bit GGUF).
+(4‑bit GGUF) for chat + bge‑small‑en‑v1.5 (~37 MB) for on‑device embeddings.
 
 Targets macOS (arm64), Windows (x64/arm64), and Linux (x64/arm64).

@@ -76,20 +76,20 @@ export default function MonthPane() {
   return (
     <div className="h-full flex flex-col">
       {/* Toolbar */}
-      <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4">
+      <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4 min-w-0 overflow-hidden">
         <ViewToggle />
-        <div className="w-px h-5 bg-white/10 mx-1" />
-        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() - 1, 1))} className="p-1 rounded hover:bg-white/10">
+        <div className="w-px h-5 bg-white/10 mx-1 shrink-0" />
+        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() - 1, 1))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronLeft className="size-4" />
         </button>
-        <button onClick={() => setAnchor(startOfMonth(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10">
+        <button onClick={() => setAnchor(startOfMonth(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
           Today
         </button>
-        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + 1, 1))} className="p-1 rounded hover:bg-white/10">
+        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + 1, 1))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronRight className="size-4" />
         </button>
-        <span className="text-sm text-gray-300 ml-2">{anchor.toLocaleDateString([], { month: "long", year: "numeric" })}</span>
-        <div className="ml-auto flex items-center gap-3 text-[11px] text-gray-500">
+        <span className="text-sm text-gray-300 ml-2 whitespace-nowrap truncate">{anchor.toLocaleDateString([], { month: "long", year: "numeric" })}</span>
+        <div className="ml-auto hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>

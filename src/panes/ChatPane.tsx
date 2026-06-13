@@ -1,17 +1,28 @@
 import { useEffect, useRef, useState } from "react";
-import { Send, Sparkles } from "lucide-react";
+import { Send, Sparkles, Brain, X } from "lucide-react";
 import { useStore } from "../state/store";
+import { api } from "../lib/ipc";
 import InferenceSetup from "../components/InferenceSetup";
 
 export default function ChatPane() {
   const llm = useStore((s) => s.llm);
   const busy = useStore((s) => s.busy);
   const plan = useStore((s) => s.plan);
+  const addNote = useStore((s) => s.addNote);
+  const loadPages = useStore((s) => s.loadPages);
   // Transcript lives in the store so it persists across page/settings changes (cleared on app close).
   const messages = useStore((s) => s.chatMessages);
   const setMessages = useStore((s) => s.setChatMessages);
   const [input, setInput] = useState("");
+  // Durable facts the AI noticed in the last message — offered for the user to confirm into memory.
+  const [memSuggestions, setMemSuggestions] = useState<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const saveMemory = async (fact: string) => {
+    setMemSuggestions((s) => s.filter((f) => f !== fact));
+    await addNote(fact);
+    await loadPages();
+  };
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -50,7 +61,16 @@ export default function ChatPane() {
       if (o.clarifications.length) {
         parts.push("A few things to confirm:\n" + o.clarifications.map((c) => "• " + c).join("\n"));
       }
+      // Transparency: show which saved notes informed the plan.
+      if (o.recalledNotes?.length) {
+        parts.push("📌 Recalled from your notes:\n" + o.recalledNotes.map((r) => "• " + r).join("\n"));
+      }
       setMessages((m) => [...m, { role: "ai", text: parts.join("\n\n") }]);
+      // Best-effort: notice durable facts worth remembering and offer to save them (confirmed, not silent).
+      api
+        .extractMemories(trimmed)
+        .then((facts) => facts.length && setMemSuggestions(facts))
+        .catch(() => {});
     } catch (e) {
       setMessages((m) => [...m, { role: "ai", text: "I couldn't plan that — " + String(e) }]);
     }
@@ -88,6 +108,25 @@ export default function ChatPane() {
 
         {busy && <div className="text-xs text-gray-500">Thinking…</div>}
       </div>
+
+      {memSuggestions.length > 0 && (
+        <div className="px-3 pt-2 shrink-0 space-y-1.5">
+          <div className="text-[11px] text-fuchsia-300/80 flex items-center gap-1">
+            <Brain className="size-3" /> Remember this?
+          </div>
+          {memSuggestions.map((fact) => (
+            <div key={fact} className="flex items-center gap-2 rounded-lg border border-fuchsia-400/20 bg-fuchsia-500/[0.06] px-2.5 py-1.5">
+              <span className="text-xs text-gray-200 flex-1 min-w-0">{fact}</span>
+              <button onClick={() => saveMemory(fact)} className="text-[11px] px-2 py-0.5 rounded bg-fuchsia-500/80 hover:bg-fuchsia-500 text-white shrink-0">
+                Save
+              </button>
+              <button onClick={() => setMemSuggestions((s) => s.filter((f) => f !== fact))} className="text-gray-500 hover:text-gray-300 shrink-0" title="Dismiss">
+                <X className="size-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <form
         onSubmit={(e) => {

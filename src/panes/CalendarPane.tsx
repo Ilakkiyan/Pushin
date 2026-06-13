@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Block, CalEvent } from "../lib/ipc";
-import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso } from "../lib/time";
+import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
 import ViewToggle from "../components/ViewToggle";
 
 /** An all-day / multi-day event runs midnight→midnight (that's how trips are stored). */
@@ -43,6 +43,7 @@ export default function CalendarPane() {
   const unlockBlock = useStore((s) => s.unlockBlock);
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
+  const openDaily = useStore((s) => s.openDaily);
   const focusDateIso = useStore((s) => s.focusDateIso);
   const settings = useStore((s) => s.settings);
 
@@ -144,23 +145,24 @@ export default function CalendarPane() {
   return (
     <div className="h-full flex flex-col">
       {/* Toolbar */}
-      <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4">
+      <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4 min-w-0 overflow-hidden">
         <ViewToggle />
-        <div className="w-px h-5 bg-white/10 mx-1" />
-        <button onClick={() => setAnchor((a) => addMinutes(a, -7 * 1440))} className="p-1 rounded hover:bg-white/10">
+        <div className="w-px h-5 bg-white/10 mx-1 shrink-0" />
+        <button onClick={() => setAnchor((a) => addMinutes(a, -7 * 1440))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronLeft className="size-4" />
         </button>
-        <button onClick={() => setAnchor(startOfWeek(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10">
+        <button onClick={() => setAnchor(startOfWeek(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
           Today
         </button>
-        <button onClick={() => setAnchor((a) => addMinutes(a, 7 * 1440))} className="p-1 rounded hover:bg-white/10">
+        <button onClick={() => setAnchor((a) => addMinutes(a, 7 * 1440))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronRight className="size-4" />
         </button>
-        <span className="text-sm text-gray-300 ml-2">
-          {anchor.toLocaleDateString([], { month: "long", day: "numeric" })} –{" "}
+        <span className="text-sm text-gray-300 ml-2 whitespace-nowrap truncate">
+          {anchor.toLocaleDateString([], { month: "short", day: "numeric" })} –{" "}
           {days[6].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}
         </span>
-        <div className="ml-auto flex items-center gap-3 text-[11px] text-gray-500">
+        {/* Legend is nice-to-have; hide it when the pane is too narrow (sidebar + chat aside squeeze it). */}
+        <div className="ml-auto hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
@@ -173,9 +175,16 @@ export default function CalendarPane() {
       <div className="shrink-0 grid border-b border-white/10" style={{ gridTemplateColumns: "56px repeat(7, 1fr)" }}>
         <div />
         {days.map((d) => (
-          <div key={d.toISOString()} className={clsx("py-2 text-center text-xs", sameDay(d, now) ? "text-indigo-300" : "text-gray-400")}>
+          <div key={d.toISOString()} className={clsx("group relative py-2 text-center text-xs", sameDay(d, now) ? "text-indigo-300" : "text-gray-400")}>
             <div>{d.toLocaleDateString([], { weekday: "short" })}</div>
             <div className={clsx("text-sm", sameDay(d, now) && "font-semibold")}>{d.getDate()}</div>
+            <button
+              onClick={() => openDaily(toLocalDate(d))}
+              title="Open this day's note"
+              className="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 p-0.5 rounded text-gray-500 hover:text-indigo-300 hover:bg-white/10 transition"
+            >
+              <NotebookPen className="size-3.5" />
+            </button>
           </div>
         ))}
       </div>

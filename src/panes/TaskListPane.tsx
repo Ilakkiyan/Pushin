@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Plus, Trash2 } from "lucide-react";
+import { Check, Plus, Trash2, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Task } from "../lib/ipc";
@@ -16,6 +16,7 @@ function TaskRow({ task }: { task: Task }) {
   const projects = useStore((s) => s.projects);
   const setTaskStatus = useStore((s) => s.setTaskStatus);
   const deleteTask = useStore((s) => s.deleteTask);
+  const openEntityNote = useStore((s) => s.openEntityNote);
   const project = projects.find((p) => p.id === task.projectId);
   const done = task.status === "done";
   const pr = PRIORITY[task.priority] ?? PRIORITY[2];
@@ -44,6 +45,13 @@ function TaskRow({ task }: { task: Task }) {
       </div>
 
       <span className={clsx("text-[10px] px-1.5 py-0.5 rounded shrink-0", pr.cls)}>{pr.label}</span>
+      <button
+        onClick={() => openEntityNote("task", task.id, task.title)}
+        title="Open notes for this task"
+        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-indigo-300 shrink-0"
+      >
+        <NotebookPen className="size-3.5" />
+      </button>
       <button
         onClick={() => deleteTask(task.id)}
         className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-rose-400 shrink-0"

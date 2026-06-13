@@ -8,7 +8,7 @@ use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
 use crate::scheduler::{self, Interval};
 use crate::{db, habits, hermes, llm};
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -134,15 +134,44 @@ pub async fn plan_tasks(
         let conn = state.db.lock().unwrap();
         (db::get_settings(&conn).map_err(err)?, db::list_events(&conn).map_err(err)?)
     };
+    // Auto-recall relevant saved notes to inform planning. Best-effort and conservative: only inject
+    // when *semantic* recall ran (embed server up) and the match is strong, capped + truncated — small
+    // models are prompt-sensitive (gotcha #1), so a weak/empty recall changes the prompt by nothing.
+    let recalled: Vec<String> = match recall_notes(&state, &text, 3).await {
+        Ok(r) if r.mode == "semantic" => r
+            .notes
+            .into_iter()
+            .filter(|n| n.score.unwrap_or(0.0) >= 0.35)
+            .take(2)
+            .map(|n| n.content.trim().chars().take(220).collect::<String>())
+            .collect(),
+        _ => Vec::new(),
+    };
     // Network call — no DB lock held here.
-    let parsed = parser::plan(&state.http, &settings, &current_events, &history.unwrap_or_default(), &text)
+    let parsed = parser::plan(&state.http, &settings, &current_events, &history.unwrap_or_default(), &text, &recalled)
         .await
         .map_err(err)?;
 
     let mut conn = state.db.lock().unwrap();
-    let outcome = parser::store_plan(&conn, &settings, &parsed).map_err(err)?;
+    let mut outcome = parser::store_plan(&conn, &settings, &parsed).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)?;
+    outcome.recalled_notes = recalled;
     Ok(outcome)
+}
+
+/// Surface durable facts/preferences in a chat message so the UI can offer to remember them. The
+/// user confirms before anything is saved (keeps the vault clean). Empty on a no-op / model failure.
+#[tauri::command]
+pub async fn extract_memories(state: State<'_, AppState>, text: String) -> Result<Vec<String>, String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Ok(vec![]);
+    }
+    let settings = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?
+    };
+    Ok(parser::extract_memories(&state.http, &settings, &text).await.unwrap_or_default())
 }
 
 // ---------- tasks ----------
@@ -689,6 +718,28 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
     db::list_notes(&conn).map_err(err)
 }
 
+/// Recall the notes most relevant to `query` (shared by the recall command, the planner's auto-recall,
+/// and ask-your-vault). Semantic cosine when the embed server is up and notes are indexed, else
+/// keyword. The DB lock is never held across the embed `.await` (gotcha #8).
+async fn recall_notes(state: &State<'_, AppState>, query: &str, k: usize) -> Result<RecallResult, String> {
+    let model = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?.embed_model
+    };
+    let qvec = if model.trim().is_empty() {
+        None
+    } else {
+        let base = model_manager::embed_base_url();
+        hermes::embed_text(&state.http, &base, &model, query).await.ok()
+    };
+    let notes = {
+        let conn = state.db.lock().unwrap();
+        db::notes_for_recall(&conn).map_err(err)?
+    };
+    let (mode, ranked) = hermes::rank_notes(notes, qvec.as_deref(), query, k);
+    Ok(RecallResult { mode: mode.into(), notes: ranked })
+}
+
 /// Recall the notes most relevant to `query`: semantic cosine when embeddings exist, else keyword.
 #[tauri::command]
 pub async fn hermes_recall(state: State<'_, AppState>, query: String, k: Option<i64>) -> Result<RecallResult, String> {
@@ -697,53 +748,304 @@ pub async fn hermes_recall(state: State<'_, AppState>, query: String, k: Option<
         return Ok(RecallResult { mode: "keyword".into(), notes: vec![] });
     }
     let k = k.unwrap_or(5).clamp(1, 50) as usize;
-    let base = model_manager::embed_base_url();
+    recall_notes(&state, &query, k).await
+}
+
+// ---------- Vault pages (Notion-style documents over the Hermes notes store) ----------
+
+/// Embed `text` on-device, best-effort. Returns the (blob, model) to persist, or None when there's
+/// no embedding backend / empty text — recall then falls back to keyword. Mirrors `hermes_add_note`.
+/// The DB lock is taken only to read the model name and dropped before the network call (gotcha #8).
+async fn embed_best_effort(state: &State<'_, AppState>, text: &str) -> (Option<Vec<u8>>, String) {
     let model = {
         let conn = state.db.lock().unwrap();
-        db::get_settings(&conn).map_err(err)?.embed_model
+        db::get_settings(&conn).map(|s| s.embed_model).unwrap_or_default()
     };
-    let qvec = if model.trim().is_empty() {
-        None
-    } else {
-        hermes::embed_text(&state.http, &base, &model, &query).await.ok()
-    };
-    let notes = {
-        let conn = state.db.lock().unwrap();
-        db::notes_for_recall(&conn).map_err(err)?
-    };
+    if text.trim().is_empty() || model.trim().is_empty() {
+        return (None, model);
+    }
+    let base = model_manager::embed_base_url();
+    let blob = hermes::embed_text(&state.http, &base, &model, text).await.ok().map(|v| hermes::vec_to_blob(&v));
+    (blob, model)
+}
 
-    let has_vectors = notes.iter().any(|(_, e)| e.is_some());
-    let (mode, mut ranked): (&str, Vec<Note>) = match (&qvec, has_vectors) {
-        // Semantic: rank the indexed notes by cosine similarity to the query vector.
-        (Some(qv), true) => {
-            let mut scored: Vec<Note> = notes
-                .into_iter()
-                .filter_map(|(mut n, emb)| {
-                    emb.map(|b| {
-                        n.score = Some(hermes::cosine(qv, &hermes::blob_to_vec(&b)));
-                        n
-                    })
-                })
-                .collect();
-            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            ("semantic", scored)
+/// The vault page tree (lightweight rows — no bodies).
+#[tauri::command]
+pub fn list_pages(state: State<AppState>) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_pages(&conn).map_err(err)
+}
+
+/// A single page with its full body (for the editor).
+#[tauri::command]
+pub fn get_page(state: State<AppState>, id: i64) -> Result<Page, String> {
+    let conn = state.db.lock().unwrap();
+    db::get_page(&conn, id).map_err(err)
+}
+
+/// Create a new (optionally child) page and return it. Blank pages aren't embedded until they have content.
+#[tauri::command]
+pub async fn create_page(state: State<'_, AppState>, title: String, parent_id: Option<i64>, content: Option<String>) -> Result<Page, String> {
+    let title = title.trim().to_string();
+    let content = content.unwrap_or_default();
+    let (blob, model) = embed_best_effort(&state, &content).await;
+    let conn = state.db.lock().unwrap();
+    let id = db::insert_page(
+        &conn,
+        if title.is_empty() { "Untitled" } else { &title },
+        parent_id,
+        &content,
+        None,
+        blob.as_deref(),
+        blob.as_ref().map(|_| model.as_str()),
+    )
+    .map_err(err)?;
+    db::get_page(&conn, id).map_err(err)
+}
+
+/// Save a page's title/icon/body + outgoing wikilinks, re-embedding the body for semantic recall.
+/// `content` is the rendered plaintext (recall + keyword index); `content_json` is the BlockNote
+/// block array; `link_titles` are the titles this page links to (resolved to edges in `set_page_links`).
+#[tauri::command]
+pub async fn update_page(
+    state: State<'_, AppState>,
+    id: i64,
+    title: String,
+    icon: Option<String>,
+    content: String,
+    content_json: Option<String>,
+    link_titles: Vec<String>,
+) -> Result<Page, String> {
+    let title = title.trim().to_string();
+    let (blob, model) = embed_best_effort(&state, &content).await;
+    let conn = state.db.lock().unwrap();
+    db::update_page(
+        &conn,
+        id,
+        if title.is_empty() { "Untitled" } else { &title },
+        icon.as_deref(),
+        &content,
+        content_json.as_deref(),
+        blob.as_deref(),
+        blob.as_ref().map(|_| model.as_str()),
+    )
+    .map_err(err)?;
+    db::set_page_links(&conn, id, &link_titles).map_err(err)?;
+    db::get_page(&conn, id).map_err(err)
+}
+
+/// Delete a page (its outgoing/incoming links cascade; children are re-parented to the root via the
+/// ON DELETE SET NULL FK). Returns the refreshed tree.
+#[tauri::command]
+pub fn delete_page(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_note(&conn, id).map_err(err)?;
+    db::list_pages(&conn).map_err(err)
+}
+
+/// Reparent / reorder a page in the tree. Returns the refreshed tree.
+#[tauri::command]
+pub fn move_page(state: State<AppState>, id: i64, parent_id: Option<i64>, sort_order: f64) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::move_page(&conn, id, parent_id, sort_order).map_err(err)?;
+    db::list_pages(&conn).map_err(err)
+}
+
+/// Pages that link to this one ("Linked references").
+#[tauri::command]
+pub fn page_backlinks(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::page_backlinks(&conn, id).map_err(err)
+}
+
+/// Free-text search over page titles + bodies (for the link picker and command palette).
+#[tauri::command]
+pub fn search_pages(state: State<AppState>, query: String) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::search_pages(&conn, &query).map_err(err)
+}
+
+/// Pages that mention this page's title but don't link it ("unlinked mentions").
+#[tauri::command]
+pub fn unlinked_mentions(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::unlinked_mentions(&conn, id).map_err(err)
+}
+
+/// The whole vault connection graph (nodes + resolved link edges).
+#[tauri::command]
+pub fn page_graph(state: State<AppState>) -> Result<PageGraph, String> {
+    let conn = state.db.lock().unwrap();
+    db::page_graph(&conn).map_err(err)
+}
+
+/// One-box quick capture: save text to the Inbox (embedded best-effort) to sort later.
+#[tauri::command]
+pub async fn capture_note(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("Nothing to capture.".into());
+    }
+    let (blob, model) = embed_best_effort(&state, &text).await;
+    let conn = state.db.lock().unwrap();
+    db::capture(&conn, &text, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
+    Ok(())
+}
+
+/// The unsorted Inbox.
+#[tauri::command]
+pub fn list_inbox(state: State<AppState>) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_inbox(&conn).map_err(err)
+}
+
+/// Keep an Inbox capture as a normal vault page (clears its inbox flag).
+#[tauri::command]
+pub fn keep_inbox_note(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::clear_inbox(&conn, id).map_err(err)
+}
+
+/// Open (creating on first access) the vault page for a calendar day. `date` is 'YYYY-MM-DD'; the
+/// title is a friendly "Weekday, Month D, YYYY".
+#[tauri::command]
+pub fn daily_note(state: State<AppState>, date: String) -> Result<Page, String> {
+    let title = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .map(|d| format!("{}, {} {}, {}", d.format("%A"), d.format("%B"), d.day(), d.year()))
+        .unwrap_or_else(|_| date.clone());
+    let conn = state.db.lock().unwrap();
+    db::get_or_create_daily(&conn, &date, &title).map_err(err)
+}
+
+/// Recursively read a folder's Markdown files for the vault importer (Obsidian/Markdown). Skips
+/// hidden dirs (`.obsidian`, `.git`, …); title = first `# heading` or the filename stem. Caps at
+/// 2000 files so a giant folder can't hang the UI. The frontend converts each to blocks + creates pages.
+#[tauri::command]
+pub fn read_markdown_dir(path: String) -> Result<Vec<ImportDoc>, String> {
+    let root = std::path::PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err("Not a folder.".into());
+    }
+    let mut docs = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if docs.len() >= 2000 {
+                return Ok(docs);
+            }
+            let p = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip .obsidian, .git, .trash, etc.
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else if matches!(p.extension().and_then(|e| e.to_str()), Some("md") | Some("markdown")) {
+                if let Ok(markdown) = std::fs::read_to_string(&p) {
+                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into());
+                    let title = markdown
+                        .lines()
+                        .find_map(|l| l.strip_prefix("# ").map(|h| h.trim().to_string()))
+                        .filter(|h| !h.is_empty())
+                        .unwrap_or(stem);
+                    docs.push(ImportDoc { title, markdown });
+                }
+            }
         }
-        // Keyword fallback: score by term overlap, drop the zero-matches.
-        _ => {
-            let mut scored: Vec<Note> = notes
-                .into_iter()
-                .map(|(mut n, _)| {
-                    n.score = Some(hermes::keyword_score(&n.content, &query));
-                    n
-                })
-                .filter(|n| n.score.unwrap_or(0.0) > 0.0)
-                .collect();
-            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            ("keyword", scored)
-        }
+    }
+    Ok(docs)
+}
+
+/// Link / unlink a page to a task or event (`kind` = "task" | "event").
+#[tauri::command]
+pub fn link_page_entity(state: State<AppState>, page_id: i64, kind: String, entity_id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::link_entity(&conn, page_id, &kind, entity_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn unlink_page_entity(state: State<AppState>, page_id: i64, kind: String, entity_id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::unlink_entity(&conn, page_id, &kind, entity_id).map_err(err)
+}
+
+/// The tasks/events a page references (for the editor's "Linked tasks & events" strip).
+#[tauri::command]
+pub fn page_entities(state: State<AppState>, page_id: i64) -> Result<Vec<EntityRef>, String> {
+    let conn = state.db.lock().unwrap();
+    db::page_entities(&conn, page_id).map_err(err)
+}
+
+/// The pages that reference a given task/event (for a "Notes" affordance on it).
+#[tauri::command]
+pub fn entity_pages(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Page>, String> {
+    let conn = state.db.lock().unwrap();
+    db::entity_pages(&conn, &kind, entity_id).map_err(err)
+}
+
+/// Ask-your-vault (local RAG): recall the most relevant pages, then have the on-device chat model
+/// answer using ONLY those notes and cite which it used. Citations are page ids. Best for the 7B+.
+#[tauri::command]
+pub async fn vault_ask(state: State<'_, AppState>, question: String) -> Result<VaultAnswer, String> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
+        return Ok(VaultAnswer { answer: String::new(), citations: vec![] });
+    }
+    let recalled = recall_notes(&state, &question, 5).await?;
+    if recalled.notes.is_empty() {
+        return Ok(VaultAnswer { answer: "I don't have any notes about that yet.".into(), citations: vec![] });
+    }
+    // Number the notes [1..] so the model cites by index; map indices back to page ids after.
+    let mut context = String::new();
+    for (i, n) in recalled.notes.iter().enumerate() {
+        let snippet: String = n.content.trim().chars().take(500).collect();
+        context.push_str(&format!("[{}] {}\n", i + 1, snippet.replace('\n', " ")));
+    }
+    let ids: Vec<i64> = recalled.notes.iter().map(|n| n.id).collect();
+
+    let settings = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?
     };
-    ranked.truncate(k);
-    Ok(RecallResult { mode: mode.into(), notes: ranked })
+    let system = format!(
+        "Answer the user's question using ONLY the notes below. Be concise. If the notes don't \
+contain the answer, say you don't know — do not invent anything. In `sources`, list the bracketed \
+numbers of the notes you actually used.\n\nNotes:\n{context}"
+    );
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "answer": { "type": "string" },
+            "sources": { "type": "array", "items": { "type": "integer" } }
+        },
+        "required": ["answer", "sources"]
+    });
+    let messages = serde_json::json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": question }
+    ]);
+    let raw = llm::chat_json(&state.http, &settings.llm_base_url, &settings.model_id, messages, schema)
+        .await
+        .map_err(err)?;
+    let answer = raw["answer"].as_str().unwrap_or("").trim().to_string();
+    // Map 1-based note indices → page ids (dedup, ignore out-of-range).
+    let mut citations: Vec<i64> = raw["sources"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_i64())
+                .filter_map(|n| ids.get((n - 1) as usize).copied())
+                .collect()
+        })
+        .unwrap_or_default();
+    citations.sort_unstable();
+    citations.dedup();
+    Ok(VaultAnswer { answer, citations })
 }
 
 /// Make Hermes' semantic recall work with zero setup: ensure the small embedding model is

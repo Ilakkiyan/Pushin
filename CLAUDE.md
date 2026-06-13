@@ -1,9 +1,13 @@
 # Pushin — project guide for Claude Code
 
-Pushin is a **local-AI, Motion-style calendar**. You describe your tasks/events in plain language; a
-**small LLM running 100% on-device** turns that into structured tasks + fixed events, and a
-**deterministic Rust auto-scheduler** packs the tasks into your calendar around fixed events. It also
-has **two-way Google Calendar sync**.
+Pushin is a **local-AI, Motion-style calendar** evolving into a **"second brain"**. You describe your
+tasks/events in plain language; a **small LLM running 100% on-device** turns that into structured tasks
++ fixed events, and a **deterministic Rust auto-scheduler** packs the tasks into your calendar around
+fixed events. It also has **two-way Google Calendar sync**, and a **Notion-style document vault with
+Obsidian-style `[[wikilinks]]` + a connection graph** (the Hermes memory layer, grown up).
+
+The whole app lives behind a **collapsible left sidebar** (`Sidebar.tsx`) — not top tabs — with a
+**Cmd/Ctrl-K command palette** (`CommandPalette.tsx`) to jump to any page or view.
 
 This file is the knowledge handoff. Read it fully before changing things — much of it is non-obvious
 and was learned the hard way.
@@ -37,8 +41,8 @@ Rust core
   ├─ scheduler     : the IP — dependency DAG + EDF/priority greedy + chunking + conflicts; parse_dt/fmt_dt
   ├─ calendar/google : OAuth(PKCE loopback) + token refresh + two-way sync
   ├─ booking       : availability via scheduler free-slots (booking-page seam)
-  ├─ hermes        : memory layer ("second brain") — note embeddings + cosine/keyword recall
-  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes
+  ├─ hermes        : memory layer ("second brain") — embeddings + cosine/keyword recall; backs the vault
+  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links
        │ spawns child process              │ OAuth + HTTPS
        ▼                                    ▼
   llama-server (GGUF, Metal)          Google Calendar API v3 (optional)
@@ -49,7 +53,10 @@ Rust core
 - `lib.rs` — Tauri setup, command registration, app-exit kills the llama-server child.
 - `commands.rs` — the IPC surface. **Never hold the DB `Mutex<Connection>` across an `.await`** (async commands must stay `Send`); use short scoped lock blocks.
 - `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, etc.
-- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init`, `0002_google`).
+- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0009_brain`). `0008` evolves
+  `notes` into vault pages + adds `page_links`; `0009` adds `daily_date` (daily notes), `entity_links`
+  (page ↔ task/event), and an `inbox` flag (quick capture). Page CRUD, graph, daily/inbox, entity
+  links, and unlinked-mentions queries all live here.
 - `model_manager.rs` — model + engine auto-download, `llama-server` spawn/health, `MODELS` list.
   Cross-platform: picks the **CPU** llama.cpp release asset per OS/arch (asset substrings are
   extension-less since llama.cpp churns extensions — Linux moved `.zip`→`.tar.gz`). macOS/Linux
@@ -64,10 +71,23 @@ Rust core
 - `booking.rs` — booking-page availability (reuses scheduler free-slots).
 
 **Frontend (`src/`)**
-- `lib/ipc.ts` — typed wrappers over every Tauri command + shared types.
-- `state/store.ts` — Zustand store; `mutate()` runs a change → stores conflicts → refresh → `maybeSync()` (debounced Google sync).
-- `panes/` — `ChatPane`, `CalendarPane` (full 24h grid, drag-to-move/pin), `TaskListPane`, `SettingsPane`, `BookingPane`.
-- `components/` — `TopBar`, `InferenceSetup` (first-run model download/start), `ConflictBanner`.
+- `lib/ipc.ts` — typed wrappers over every Tauri command + shared types (incl. `Page`, `PageGraph`).
+- `lib/blocks.ts` — BlockNote helpers: blocks→plaintext (recall index), block JSON↔page, `[[link]]` title extraction.
+- `lib/editorSchema.tsx` — the BlockNote schema + the custom `pageLink` inline-content (the `[[wikilink]]` chip).
+- `state/store.ts` — Zustand store; `mutate()` runs a change → stores conflicts → refresh → `maybeSync()` (debounced Google sync). Also holds `pages`/`currentPageId` + page CRUD and `view`/`sidebarCollapsed`.
+- `panes/` — `ChatPane` (+ "Remember this?" memory chips), `CalendarPane` (24h grid, drag-to-move/pin,
+  day-header daily-note), `MonthPane`, `TaskListPane` (+ task "Notes" action), `ProjectsPane`,
+  `HabitsPane`, `SettingsPane`, `BookingPane`, **`VaultPane`** (page editor), **`GraphPane`**,
+  **`InboxPane`** (quick-capture triage).
+- `components/` — **`Sidebar`** (left nav, AI status, vault tree, Inbox badge, Today's note),
+  **`VaultTree`** (page tree, drag-to-reparent, import button), **`PageEditor`** (BlockNote + autosave +
+  `[[` picker + `/` templates + backlinks/linked-entities/unlinked-mentions), **`CommandPalette`**
+  (Cmd-K: semantic search + ask-your-vault), **`QuickCapture`** (Cmd/Ctrl+Shift+N), **`TitleBar`**
+  (frameless window controls), `InferenceSetup`, `ConflictBanner`, `OnboardingModal`.
+- `lib/import.ts` — vault importer (folder picker → headless BlockNote markdown→blocks → pages).
+  (The old top-tab `TopBar` and standalone `HermesPane` were removed when the sidebar + vault landed.)
+- **Editor stack:** `@blocknote/{core,react,mantine}` (Notion-style block editor; CSS imported in
+  `main.tsx`) + `react-force-graph-2d` (canvas force layout for the graph). Both are client-side/offline.
 
 ---
 
@@ -152,17 +172,36 @@ Rust core
 
 ---
 
-## Hermes — the memory layer / "second brain" (`hermes.rs`, `notes` table)
-The user's chosen direction: grow Pushin into a second brain. **v1 (built) = notes + recall.** Design
-follows the locked decisions (on-device, deterministic core):
-- **Storage:** `notes` table (migration `0006_notes.sql`); embeddings are little-endian f32 BLOBs in
-  the `embedding` column, NULL until indexed. `Note` never serializes the vector to the frontend
-  (just an `indexed` flag, plus a `score` on recall results).
+## The vault — Notion-style documents + Obsidian-style links/graph (`hermes.rs`, `db.rs` pages, `notes` table)
+The "second brain" direction. **v2 (built): the flat Hermes notes grew into full vault pages.** The
+`notes` table is kept (preserves embeddings) but extended by **migration `0008_pages.sql`** with
+`title`, `icon`, `parent_id` (the page tree), `content_json` (BlockNote block array), `sort_order`,
+`archived`, plus a **`page_links`** table (one row per `[[wikilink]]`). `content` stays the **derived
+plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Page`.
+- **Pages API:** `db.rs` (`list_pages`/`get_page`/`insert_page`/`update_page`/`move_page`/
+  `set_page_links`/`page_backlinks`/`search_pages`/`page_graph`, `derive_title`) + matching
+  `commands.rs` (`list_pages`, `get_page`, `create_page`, `update_page`, `delete_page`, `move_page`,
+  `page_backlinks`, `search_pages`, `page_graph`). Unit-tested in `db.rs` `mod tests` (title
+  derivation, link/ghost resolution, self-link skip, delete cascade). Legacy notes (NULL
+  title/content_json) open as a plain paragraph doc with a title derived from the first line.
+- **Wikilinks (`[[`):** the editor's `pageLink` inline content carries `{pageId, title}`. On save the
+  frontend extracts link titles and `update_page` rebuilds `page_links` (`set_page_links` resolves
+  each title→page id; unresolved = a "ghost" with NULL `target_id`). `page_graph`/`page_backlinks`
+  **re-resolve ghosts by title at read time**, so a link to a not-yet-created page lights up the
+  moment that page exists — no rewrite needed.
+- **Editor save loop:** `PageEditor` debounces (~600ms) and flushes on unmount; sends `content`
+  (plaintext, re-embedded best-effort), `content_json`, and the link titles. Embedding reuses the
+  Hermes `embed_best_effort` lock dance (gotcha #8).
+- **Embeddings/recall (unchanged at the data layer):** little-endian f32 BLOBs in `embedding` (NULL
+  until indexed); `hermes.rs` `cosine`/`keyword_score`/codec are pure + tested. `hermes_recall` still
+  ranks the same rows (now pages). **The standalone Hermes capture/recall UI is gone**; keyword search
+  is in the Cmd-K palette. **Next step (not built): semantic recall in the palette + auto-recalling
+  relevant pages into the planner's context (don't destabilize the parser — do it deliberately).**
 - **Embeddings = all-in-one, zero setup:** Pushin runs a **second `llama-server` in `--embeddings`
   mode** on `EMBED_PORT` (8181), serving a tiny auto-downloaded model (`EMBED_MODEL` =
   bge-small-en-v1.5 Q8, ~37 MB, 384-dim). `ensure_embeddings` (idempotent, best-effort) downloads it
-  + spawns the server; it's triggered from `store.load()`, after "Start the AI", and on opening the
-  Hermes pane. Second child lives in `AppState.embed_server`, killed on exit alongside the chat one.
+  + spawns the server; it's triggered from `store.load()` and after "Start the AI". Second child
+  lives in `AppState.embed_server`, killed on exit alongside the chat one.
   Hermes embeds via `model_manager::embed_base_url()` (NOT `llm_base_url`); `Settings.embed_model` is
   just the (cosmetic) request name, empty = semantic off.
 - **Recall = graceful degradation:** `hermes_recall` embeds the query and ranks indexed notes by
@@ -173,11 +212,27 @@ follows the locked decisions (on-device, deterministic core):
   a note always saves even if embedding fails (stored unindexed).
 - **Pure + tested:** `cosine`, `keyword_score`, and the f32↔BLOB codec are pure (`cargo test --lib
   hermes`). The embed HTTP client mirrors `llm.rs` (can't be unit-tested offline).
-- **UI:** `HermesPane` (TopBar "Hermes" 🧠) — capture, recall search (shows mode + % match), notes
-  list with an indexed dot. Embedding model is set in Settings → On-device AI.
-- **Next steps (not built):** auto-recall relevant notes into the planner's context; extract durable
-  facts/preferences from chats; semantic search across tasks/events; re-index notes created before
-  the embed server was up (they stay keyword-only until then).
+- **UI:** the vault — `Sidebar` page tree (`VaultTree`, drag-to-reparent) → `VaultPane`/`PageEditor`
+  (block editor + `[[` link picker + `/` slash templates + "Linked references" backlinks + "Linked
+  tasks & events" + "Unlinked mentions"), `GraphPane` (connection graph), and `InboxPane` (quick
+  capture). Embedding model is set in Settings → On-device AI.
+- **Calendar ↔ vault bridge (built):** **Daily Notes** (`get_or_create_daily`; a page per date with
+  `daily_date`, opened from the calendar day-header / "Today's note" / Journal sidebar section) and
+  **entity links** (`entity_links` table; a task/event ↔ its notes page, via `openEntityNote` + the
+  editor's "Linked tasks & events" panel).
+- **AI over the vault (built):** `hermes::recall` (the recall ranking, refactored out of the
+  `hermes_recall` command so it's shared) powers — **auto-recall** (top notes injected into the planner
+  system prompt by `plan_tasks`, semantic-only + score-gated to protect parser reliability; surfaced as
+  "📌 Recalled" in chat), **chat→memory** (`parser::extract_memories` proposes durable facts as a
+  confirm chip), **semantic Cmd-K** (`CommandPalette` prefers recall over `search_pages`), and
+  **ask-your-vault** (`vault_ask` — local RAG: recall → `chat_json` answer with page citations).
+- **Frictionless layer (built):** **quick capture** (`Cmd/Ctrl+Shift+N` → `QuickCapture` → `capture_note`
+  → Inbox), Inbox triage (Plan with AI / Keep as note / Delete), **Markdown/Obsidian import**
+  (`read_markdown_dir` walks a folder via `tauri-plugin-dialog`; `lib/import.ts` converts each file with
+  a headless BlockNote editor, `[[links]]` → `set_page_links`), and **editor templates** (custom `/`
+  slash items).
+- **Next steps (not built):** re-index pages created before the embed server was up; per-page icons;
+  global (OS-level) quick-capture hotkey; Notion-export importer; progressive-disclosure onboarding.
 
 ---
 

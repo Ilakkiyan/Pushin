@@ -21,6 +21,7 @@ use tauri::{Manager, RunEvent};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle();
             let data_dir = handle.path().app_data_dir()?;
@@ -70,6 +71,27 @@ pub fn run() {
             commands::hermes_delete_note,
             commands::hermes_recall,
             commands::ensure_embeddings,
+            commands::list_pages,
+            commands::get_page,
+            commands::create_page,
+            commands::update_page,
+            commands::delete_page,
+            commands::move_page,
+            commands::page_backlinks,
+            commands::search_pages,
+            commands::page_graph,
+            commands::daily_note,
+            commands::link_page_entity,
+            commands::unlink_page_entity,
+            commands::page_entities,
+            commands::entity_pages,
+            commands::extract_memories,
+            commands::unlinked_mentions,
+            commands::vault_ask,
+            commands::read_markdown_dir,
+            commands::capture_note,
+            commands::list_inbox,
+            commands::keep_inbox_note,
             commands::connect_google,
             commands::disconnect_google,
             commands::sync_google,

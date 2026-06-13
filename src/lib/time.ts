@@ -7,6 +7,11 @@ export function toLocalIso(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** Local calendar date as 'YYYY-MM-DD' (the key for a daily note). */
+export function toLocalDate(d: Date): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 /** Parse a naive-local ISO string into a local Date (unambiguous). */
 export function parseLocal(iso: string): Date {
   const [datePart, timePart = "00:00:00"] = iso.split("T");

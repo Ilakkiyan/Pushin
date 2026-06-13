@@ -8,6 +8,7 @@
 //! Everything here is local: embeddings are computed by the same OpenAI-compatible server Pushin
 //! already talks to (`{base}/v1/embeddings`), and vectors live in SQLite as little-endian f32.
 
+use crate::model::Note;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
@@ -115,6 +116,43 @@ pub fn keyword_score(content: &str, query: &str) -> f32 {
     hits as f32 / terms.len() as f32
 }
 
+/// Rank notes against a query: **semantic** cosine when a query vector is present and some notes are
+/// embedded, else a **keyword** fallback. Returns the mode that ran plus the top-`k` notes with their
+/// `score` set. Pure (no I/O) so it's shared by the recall command, the planner's auto-recall, and
+/// ask-your-vault. `notes` pairs each note with its raw embedding bytes (None = not indexed).
+pub fn rank_notes(notes: Vec<(Note, Option<Vec<u8>>)>, qvec: Option<&[f32]>, query: &str, k: usize) -> (&'static str, Vec<Note>) {
+    let has_vectors = notes.iter().any(|(_, e)| e.is_some());
+    let (mode, mut ranked): (&str, Vec<Note>) = match (qvec, has_vectors) {
+        (Some(qv), true) => {
+            let mut scored: Vec<Note> = notes
+                .into_iter()
+                .filter_map(|(mut n, emb)| {
+                    emb.map(|b| {
+                        n.score = Some(cosine(qv, &blob_to_vec(&b)));
+                        n
+                    })
+                })
+                .collect();
+            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            ("semantic", scored)
+        }
+        _ => {
+            let mut scored: Vec<Note> = notes
+                .into_iter()
+                .map(|(mut n, _)| {
+                    n.score = Some(keyword_score(&n.content, query));
+                    n
+                })
+                .filter(|n| n.score.unwrap_or(0.0) > 0.0)
+                .collect();
+            scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            ("keyword", scored)
+        }
+    };
+    ranked.truncate(k);
+    (mode, ranked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +195,75 @@ mod tests {
         let near = [0.9f32, 0.1];
         let far = [0.0f32, 1.0];
         assert!(cosine(&q, &near) > cosine(&q, &far));
+    }
+
+    // ---- rank_notes (the shared recall ranking) ----
+
+    fn note(id: i64, content: &str) -> Note {
+        Note {
+            id,
+            content: content.into(),
+            created_at: "2026-01-01T00:00:00".into(),
+            updated_at: "2026-01-01T00:00:00".into(),
+            indexed: false,
+            score: None,
+        }
+    }
+
+    #[test]
+    fn rank_semantic_orders_by_cosine_and_truncates() {
+        let q = [1.0f32, 0.0];
+        let notes = vec![
+            (note(1, "far"), Some(vec_to_blob(&[0.0, 1.0]))),
+            (note(2, "near"), Some(vec_to_blob(&[0.95, 0.05]))),
+            (note(3, "mid"), Some(vec_to_blob(&[0.6, 0.6]))),
+        ];
+        let (mode, ranked) = rank_notes(notes, Some(&q), "anything", 2);
+        assert_eq!(mode, "semantic");
+        assert_eq!(ranked.len(), 2, "truncated to k");
+        assert_eq!(ranked[0].id, 2, "nearest first");
+        assert_eq!(ranked[1].id, 3);
+        assert!(ranked[0].score.unwrap() > ranked[1].score.unwrap());
+    }
+
+    #[test]
+    fn rank_semantic_drops_unindexed_notes() {
+        let q = [1.0f32, 0.0];
+        let notes = vec![
+            (note(1, "indexed"), Some(vec_to_blob(&[1.0, 0.0]))),
+            (note(2, "not indexed"), None),
+        ];
+        let (mode, ranked) = rank_notes(notes, Some(&q), "x", 10);
+        assert_eq!(mode, "semantic");
+        assert_eq!(ranked.iter().map(|n| n.id).collect::<Vec<_>>(), vec![1], "unindexed note excluded");
+    }
+
+    #[test]
+    fn rank_falls_back_to_keyword_when_no_vectors() {
+        // qvec present but NO note has an embedding → keyword mode.
+        let q = [1.0f32];
+        let notes = vec![
+            (note(1, "the quarterly budget review"), None),
+            (note(2, "lunch with mom"), None),
+            (note(3, "nothing relevant"), None),
+        ];
+        let (mode, ranked) = rank_notes(notes, Some(&q), "budget review", 10);
+        assert_eq!(mode, "keyword");
+        assert_eq!(ranked[0].id, 1, "best keyword overlap first");
+        assert!(ranked.iter().all(|n| n.id != 3), "zero-overlap notes dropped");
+    }
+
+    #[test]
+    fn rank_keyword_when_query_has_no_vector() {
+        let notes = vec![(note(1, "gym on tuesday"), Some(vec_to_blob(&[1.0])))];
+        let (mode, ranked) = rank_notes(notes, None, "gym", 10);
+        assert_eq!(mode, "keyword", "no query vector → keyword even if notes are indexed");
+        assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn rank_handles_empty() {
+        let (_, ranked) = rank_notes(vec![], Some(&[1.0f32]), "q", 5);
+        assert!(ranked.is_empty());
     }
 }

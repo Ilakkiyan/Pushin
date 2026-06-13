@@ -138,6 +138,8 @@ export interface PlanOutcome {
   removedEventTitles: string[];
   createdHabitNames: string[];
   clarifications: string[];
+  /** Vault notes auto-recalled to inform this plan (shown in chat for transparency). */
+  recalledNotes?: string[];
 }
 
 export interface ModelInfo {
@@ -202,6 +204,63 @@ export interface RecallResult {
   notes: Note[];
 }
 
+/** A vault page — a Notion-style document with an Obsidian-style place in the page tree. `content`
+ *  is the rendered plaintext (recall/search index); `contentJson` is the BlockNote block array
+ *  (undefined on legacy notes → opened as a plain paragraph doc). `score` is set only on recall. */
+export interface Page {
+  id: number;
+  title: string;
+  icon?: string;
+  parentId?: number;
+  content: string;
+  contentJson?: string;
+  sortOrder: number;
+  archived: boolean;
+  /** Set when this page IS a calendar day's note ('YYYY-MM-DD'). */
+  dailyDate?: string;
+  /** True while the page is an unsorted quick-capture in the Inbox. */
+  inbox: boolean;
+  createdAt: string;
+  updatedAt: string;
+  indexed: boolean;
+  score?: number;
+}
+
+/** A reference from a page to a task or event. */
+export interface EntityRef {
+  kind: "task" | "event";
+  id: number;
+}
+
+/** A Markdown file found by the vault importer (title + raw markdown). */
+export interface ImportDoc {
+  title: string;
+  markdown: string;
+}
+
+/** An answer from "ask your vault" (local RAG): the generated answer + the page ids it cited. */
+export interface VaultAnswer {
+  answer: string;
+  citations: number[];
+}
+
+export interface GraphNode {
+  id: number;
+  title: string;
+  parentId?: number;
+  degree: number;
+}
+
+export interface GraphEdge {
+  source: number;
+  target: number;
+}
+
+export interface PageGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 // ---- commands ----
 export const api = {
   loadAll: () => invoke<AppData>("load_all"),
@@ -210,6 +269,8 @@ export const api = {
 
   planTasks: (text: string, history: { role: string; content: string }[]) =>
     invoke<PlanOutcome>("plan_tasks", { text, history }),
+
+  extractMemories: (text: string) => invoke<string[]>("extract_memories", { text }),
 
   createTask: (title: string, estimatedMinutes: number, deadline: string | null, priority: number, projectId: number | null) =>
     invoke<ScheduleResult>("create_task", { title, estimatedMinutes, deadline, priority, projectId }),
@@ -249,6 +310,33 @@ export const api = {
   hermesAddNote: (content: string) => invoke<Note[]>("hermes_add_note", { content }),
   hermesDeleteNote: (id: number) => invoke<Note[]>("hermes_delete_note", { id }),
   hermesRecall: (query: string, k?: number) => invoke<RecallResult>("hermes_recall", { query, k: k ?? null }),
+
+  // Vault pages (Notion-style documents + Obsidian-style links/graph)
+  listPages: () => invoke<Page[]>("list_pages"),
+  getPage: (id: number) => invoke<Page>("get_page", { id }),
+  createPage: (title: string, parentId: number | null, content?: string) =>
+    invoke<Page>("create_page", { title, parentId, content: content ?? null }),
+  updatePage: (id: number, title: string, icon: string | null, content: string, contentJson: string | null, linkTitles: string[]) =>
+    invoke<Page>("update_page", { id, title, icon, content, contentJson, linkTitles }),
+  deletePage: (id: number) => invoke<Page[]>("delete_page", { id }),
+  movePage: (id: number, parentId: number | null, sortOrder: number) =>
+    invoke<Page[]>("move_page", { id, parentId, sortOrder }),
+  pageBacklinks: (id: number) => invoke<Page[]>("page_backlinks", { id }),
+  searchPages: (query: string) => invoke<Page[]>("search_pages", { query }),
+  unlinkedMentions: (id: number) => invoke<Page[]>("unlinked_mentions", { id }),
+  pageGraph: () => invoke<PageGraph>("page_graph"),
+  vaultAsk: (question: string) => invoke<VaultAnswer>("vault_ask", { question }),
+  dailyNote: (date: string) => invoke<Page>("daily_note", { date }),
+  linkPageEntity: (pageId: number, kind: string, entityId: number) =>
+    invoke<void>("link_page_entity", { pageId, kind, entityId }),
+  unlinkPageEntity: (pageId: number, kind: string, entityId: number) =>
+    invoke<void>("unlink_page_entity", { pageId, kind, entityId }),
+  pageEntities: (pageId: number) => invoke<EntityRef[]>("page_entities", { pageId }),
+  entityPages: (kind: string, entityId: number) => invoke<Page[]>("entity_pages", { kind, entityId }),
+  readMarkdownDir: (path: string) => invoke<ImportDoc[]>("read_markdown_dir", { path }),
+  captureNote: (text: string) => invoke<void>("capture_note", { text }),
+  listInbox: () => invoke<Page[]>("list_inbox"),
+  keepInboxNote: (id: number) => invoke<void>("keep_inbox_note", { id }),
   setHabitScheduled: (id: number, scheduled: boolean) => invoke<ScheduleResult>("set_habit_scheduled", { id, scheduled }),
 
   connectGoogle: () => invoke<string>("connect_google"),

@@ -153,6 +153,10 @@ pub struct PlanOutcome {
     pub removed_event_titles: Vec<String>,
     pub created_habit_names: Vec<String>,
     pub clarifications: Vec<String>,
+    /// Vault notes auto-recalled to inform this plan (surfaced in chat for transparency). Filled by
+    /// `plan_tasks` after `store_plan`, so it defaults empty everywhere else.
+    #[serde(default)]
+    pub recalled_notes: Vec<String>,
 }
 
 fn priority_to_int(p: &str) -> i64 {
@@ -352,9 +356,17 @@ user: practice violin every day from 4pm to 5pm → {\"habits\":[{\"name\":\"Vio
 user: exercise daily → {\"habits\":[{\"name\":\"Exercise\",\"durationMinutes\":30}]}\n\
 user: plan a blog - pick platform, write posts → {\"projects\":[{\"name\":\"Blog\",\"tasks\":[{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}]}]}";
 
-fn system_prompt(events: &[Event], settings: &Settings, examples: &str) -> String {
+fn system_prompt(events: &[Event], settings: &Settings, memory: &[String], examples: &str) -> String {
     let now = Local::now().naive_local();
     let calendar = calendar_listing(events);
+    // Auto-recalled vault notes the user has saved — kept short (small models are prompt-sensitive)
+    // so the planner can honor stated preferences without bloating the prompt.
+    let memory_block = if memory.is_empty() {
+        String::new()
+    } else {
+        let lines: String = memory.iter().map(|m| format!("- {}\n", m.replace('\n', " "))).collect();
+        format!("Notes the user has saved (use only if relevant; never invent events from these):\n{lines}")
+    };
 
     format!(
         "Convert the user's message (use the whole conversation for context) into JSON with \
@@ -388,12 +400,14 @@ If no day is given, assume today; don't ask.\n\
 - Only output items from THIS message. The examples below are formatting samples — never copy \
 their titles (e.g. \"Blog\", \"Pick platform\") unless the user actually mentions them.\n\
 {routine}\
+{memory_block}\
 Events already on the calendar (reference these to change or remove them):\n\
 {calendar}\n\
 {examples}",
         now = now.format("%Y-%m-%d %H:%M"),
         weekday = now.format("%A"),
         routine = routine_summary(settings),
+        memory_block = memory_block,
         calendar = calendar,
         examples = examples,
     )
@@ -412,6 +426,7 @@ pub async fn plan(
     current_events: &[Event],
     history: &[ChatTurn],
     user_text: &str,
+    memory: &[String],
 ) -> Result<ParsedPlan> {
     // **Single-call union extraction is the default.** On the eval battery it matches the Tier-2
     // router's accuracy (~84% of checks — equal to the 14B) while making ONE model call instead of
@@ -419,7 +434,7 @@ pub async fn plan(
     // deterministic recovery layer was tuned against. The router pipeline is retained as a fallback
     // for the rare case the union call fails outright (network/HTTP error or unparseable JSON), so a
     // clear request never silently does nothing.
-    let mut parsed = match union_extract(client, settings, current_events, history, user_text).await {
+    let mut parsed = match union_extract(client, settings, current_events, history, user_text, memory).await {
         Ok(p) => p,
         Err(_) => match route_intents(client, settings, current_events, history, user_text).await {
             Ok(intents) if !intents.is_empty() => {
@@ -431,6 +446,37 @@ pub async fn plan(
 
     apply_recovery(&mut parsed, user_text, Local::now().naive_local().date());
     Ok(parsed)
+}
+
+/// Pull **durable** personal facts/preferences worth remembering long-term out of a chat message
+/// (e.g. "Sarah prefers afternoon meetings", "I don't work Fridays") — NOT one-off scheduling. One
+/// small `chat_json` call with a tight, capped schema; returns at most a few short facts (possibly
+/// none). The caller confirms before saving, so a stray result is harmless. Holds no DB lock.
+pub async fn extract_memories(client: &reqwest::Client, settings: &Settings, user_text: &str) -> Result<Vec<String>> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "facts": {
+                "type": "array",
+                "maxItems": 3,
+                "items": { "type": "string", "minLength": 4, "maxLength": 160 }
+            }
+        },
+        "required": ["facts"]
+    });
+    let system = "Extract DURABLE personal facts or preferences from the user's message that are worth \
+remembering long-term — people's preferences, recurring constraints, stable facts about the user or \
+their world (e.g. \"Sarah prefers afternoon meetings\", \"I don't work Fridays\", \"my manager is Alex\"). \
+Do NOT include one-off tasks, events, dates, or scheduling for this week. If there is nothing durable, \
+return an empty list. Each fact is a short standalone sentence in third person.";
+    let messages = build_messages(system.to_string(), &[], user_text);
+    let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages, schema).await?;
+    let facts = raw["facts"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    Ok(facts)
 }
 
 /// **Eval only** (`PUSHIN_EVAL_ROUTER=1`). Force the router pipeline (classify + per-intent extract
@@ -605,7 +651,7 @@ fn is_past_completion(text: &str) -> bool {
 /// router's correctness into the one-call format the student uses.
 pub fn union_messages(settings: &Settings, current_events: &[Event], history: &[ChatTurn], user_text: &str) -> Value {
     // Datagen uses the static example block (no embed server in the finetune toolchain).
-    build_messages(system_prompt(current_events, settings, STATIC_EXAMPLES), history, user_text)
+    build_messages(system_prompt(current_events, settings, &[], STATIC_EXAMPLES), history, user_text)
 }
 
 /// **Datagen only** (see `finetune/`). Run the SINGLE union extraction (no router) against a teacher
@@ -623,7 +669,7 @@ pub async fn union_label(
     history: &[ChatTurn],
     user_text: &str,
 ) -> Result<(Value, Value, ParsedPlan)> {
-    let system = system_prompt(current_events, settings, STATIC_EXAMPLES);
+    let system = system_prompt(current_events, settings, &[], STATIC_EXAMPLES);
     let messages = build_messages(system, history, user_text);
     let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages.clone(), response_schema()).await?;
     let mut plan: ParsedPlan = serde_json::from_value(raw.clone()).unwrap_or_default();
@@ -974,6 +1020,7 @@ async fn union_extract(
     events: &[Event],
     history: &[ChatTurn],
     user_text: &str,
+    memory: &[String],
 ) -> Result<ParsedPlan> {
     // Dynamic few-shot: swap the static example block for the exemplars most relevant to THIS
     // message (best-effort; falls back to the static block when embeddings are unavailable).
@@ -982,7 +1029,7 @@ async fn union_extract(
         (Some(q), Some(b)) => union_examples_block(&select_union_exemplars(q, b)),
         _ => STATIC_EXAMPLES.to_string(),
     };
-    let messages = build_messages(system_prompt(events, settings, &examples), history, user_text);
+    let messages = build_messages(system_prompt(events, settings, memory, &examples), history, user_text);
     let raw = llm::chat_json(client, &settings.llm_base_url, &settings.model_id, messages, response_schema()).await?;
     Ok(serde_json::from_value(raw)?)
 }
@@ -2754,6 +2801,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         removed_event_titles,
         created_habit_names,
         clarifications,
+        recalled_notes: Vec::new(),
     })
 }
 
@@ -2775,6 +2823,22 @@ mod tests {
 
     fn d() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
+    }
+
+    #[test]
+    fn system_prompt_injects_memory_only_when_present() {
+        let s = Settings::default();
+        // No memory → no memory block, prompt unchanged in that respect.
+        let without = system_prompt(&[], &s, &[], "EXAMPLES");
+        assert!(!without.contains("Notes the user has saved"));
+        // With memory → the facts appear, newlines flattened, under the labeled block.
+        let mem = vec!["Sarah prefers afternoon meetings".to_string(), "line one\nline two".to_string()];
+        let with = system_prompt(&[], &s, &mem, "EXAMPLES");
+        assert!(with.contains("Notes the user has saved"));
+        assert!(with.contains("Sarah prefers afternoon meetings"));
+        assert!(with.contains("line one line two"), "newlines in a fact are flattened");
+        // Memory sits before the calendar/examples, not appended at the very end.
+        assert!(with.find("Notes the user has saved").unwrap() < with.find("EXAMPLES").unwrap());
     }
 
     #[test]

@@ -178,6 +178,89 @@ pub struct Note {
     pub score: Option<f32>,
 }
 
+/// A vault page — a Notion-style document with an Obsidian-style place in the page tree. Backed by
+/// the same `notes` table as Hermes (so embeddings/recall keep working over `content`, the derived
+/// plaintext). `content_json` is the BlockNote block array (None on legacy notes → rendered as a
+/// plain paragraph doc). `indexed`/`score` mirror `Note`: `score` is set only on recall results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    pub id: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i64>,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_json: Option<String>,
+    pub sort_order: f64,
+    pub archived: bool,
+    /// Set when this page IS a calendar day's note ('YYYY-MM-DD'); None for normal pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_date: Option<String>,
+    /// True while the page is an unsorted quick-capture in the Inbox.
+    pub inbox: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub indexed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+}
+
+/// A reference from a page to another entity (a task or event) — the join that turns the calendar
+/// into an index into the vault. The frontend resolves `id` to a title from its loaded store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityRef {
+    pub kind: String, // "task" | "event"
+    pub id: i64,
+}
+
+/// A markdown file found by the vault importer — its derived title + raw markdown. The frontend
+/// converts the markdown to BlockNote blocks (so formatting survives) and creates the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDoc {
+    pub title: String,
+    pub markdown: String,
+}
+
+/// An answer from "ask your vault" (local RAG): the generated answer plus the page ids it cited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultAnswer {
+    pub answer: String,
+    pub citations: Vec<i64>,
+}
+
+/// One node in the vault connection graph (a page) plus its link degree (used to size the node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<i64>,
+    pub degree: u32,
+}
+
+/// A directed wikilink edge between two pages in the connection graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    pub source: i64,
+    pub target: i64,
+}
+
+/// The whole vault graph: every (non-archived) page and the resolved links between them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageGraph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
 /// A recurring personal commitment the scheduler must keep free — a bedtime routine, a
 /// daily lunch, a standing gym slot, "no work after 6pm", etc. Times are wall-clock "HH:MM";
 /// if `end` <= `start` the window runs overnight (e.g. 22:00→06:00). An empty `days` means

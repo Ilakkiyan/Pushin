@@ -947,7 +947,7 @@ async fn llm_eval() {
         } else if router_mode {
             parser::route_eval(&client, &settings, &current, &history, case.prompt).await
         } else {
-            parser::plan(&client, &settings, &current, &history, case.prompt).await
+            parser::plan(&client, &settings, &current, &history, case.prompt, &[]).await
         };
         let (checks, outcome): (Vec<(String, bool)>, Option<PlanOutcome>) =
             match plan_result {

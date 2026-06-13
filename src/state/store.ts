@@ -10,6 +10,8 @@ import {
   type HabitStats,
   type LlmStatus,
   type Note,
+  type Page,
+  type VaultAnswer,
   type PlanOutcome,
   type Project,
   type RecallResult,
@@ -19,7 +21,7 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "projects" | "habits" | "hermes" | "booking" | "settings";
+type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "booking" | "settings";
 type CalMode = "week" | "month";
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
@@ -31,6 +33,7 @@ interface State {
   loaded: boolean;
   busy: boolean;
   view: View;
+  sidebarCollapsed: boolean;
   settings: Settings | null;
   projects: Project[];
   tasks: Task[];
@@ -50,11 +53,19 @@ interface State {
   // Hermes (memory layer): the user's notes.
   notes: Note[];
 
+  // Vault: the page tree (lightweight rows) + which page is open in the editor.
+  pages: Page[];
+  currentPageId: number | null;
+  // Inbox: unsorted quick captures + the quick-capture modal's open flag.
+  inbox: Page[];
+  captureOpen: boolean;
+
   // Chat transcript, persisted for the session so it isn't lost on page/settings changes.
   chatMessages: ChatMsg[];
   setChatMessages: (m: ChatMsg[] | ((prev: ChatMsg[]) => ChatMsg[])) => void;
 
   setView: (v: View) => void;
+  setSidebarCollapsed: (c: boolean) => void;
   setCalMode: (m: CalMode) => void;
   setFocusDate: (iso: string | null) => void;
   load: () => Promise<void>;
@@ -72,6 +83,20 @@ interface State {
   addNote: (content: string) => Promise<void>;
   deleteNote: (id: number) => Promise<void>;
   recallNotes: (query: string, k?: number) => Promise<RecallResult>;
+
+  loadPages: () => Promise<void>;
+  openPage: (id: number) => void;
+  openDaily: (date: string) => Promise<void>;
+  openEntityNote: (kind: "task" | "event", id: number, title: string) => Promise<void>;
+  createPage: (parentId?: number | null) => Promise<Page>;
+  savePage: (id: number, title: string, icon: string | null, content: string, contentJson: string | null, linkTitles: string[]) => Promise<void>;
+  deletePage: (id: number) => Promise<void>;
+  movePage: (id: number, parentId: number | null, sortOrder: number) => Promise<void>;
+  askVault: (question: string) => Promise<VaultAnswer>;
+  loadInbox: () => Promise<void>;
+  captureNote: (text: string) => Promise<void>;
+  keepInboxNote: (id: number) => Promise<void>;
+  setCaptureOpen: (open: boolean) => void;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
@@ -135,6 +160,7 @@ export const useStore = create<State>((set, get) => {
     busy: false,
     syncing: false,
     view: "calendar",
+    sidebarCollapsed: false,
     settings: null,
     projects: [],
     tasks: [],
@@ -148,16 +174,23 @@ export const useStore = create<State>((set, get) => {
     focusDateIso: null,
     habits: [],
     notes: [],
+    pages: [],
+    currentPageId: null,
+    inbox: [],
+    captureOpen: false,
     chatMessages: [],
 
     setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
 
     setView: (v) => set({ view: v }),
+    setSidebarCollapsed: (c) => set({ sidebarCollapsed: c }),
     setCalMode: (m) => set({ calMode: m }),
     setFocusDate: (iso) => set({ focusDateIso: iso }),
 
     load: async () => {
       await refreshData();
+      get().loadPages().catch(() => {});
+      get().loadInbox().catch(() => {});
       await get().refreshLlm();
       // Auto-start the local inference server on open if it isn't already up, so the app is
       // "AI ready" without a manual click. ensure_inference is safe to call blindly: it no-ops
@@ -239,6 +272,51 @@ export const useStore = create<State>((set, get) => {
     addNote: async (content) => set({ notes: await api.hermesAddNote(content) }),
     deleteNote: async (id) => set({ notes: await api.hermesDeleteNote(id) }),
     recallNotes: (query, k) => api.hermesRecall(query, k),
+
+    // Vault pages. The tree is lightweight (no bodies); the editor fetches a full page via getPage.
+    loadPages: async () => set({ pages: await api.listPages() }),
+    openPage: (id) => set({ currentPageId: id, view: "vault" }),
+    // Open (creating on first access) the note for a calendar day, then refresh the tree so it
+    // appears under the Journal section.
+    openDaily: async (date) => {
+      const page = await api.dailyNote(date);
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+    },
+    // Open the page a task/event is linked to, creating + linking one (titled after the entity) on
+    // first use — the bridge from the calendar into the vault.
+    openEntityNote: async (kind, id, title) => {
+      const existing = await api.entityPages(kind, id);
+      const page = existing[0] ?? (await api.createPage(title, null));
+      if (!existing.length) await api.linkPageEntity(page.id, kind, id);
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+    },
+    createPage: async (parentId = null) => {
+      const page = await api.createPage("Untitled", parentId ?? null);
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+      return page;
+    },
+    savePage: async (id, title, icon, content, contentJson, linkTitles) => {
+      await api.updatePage(id, title, icon, content, contentJson, linkTitles);
+      // Refresh the tree so the sidebar title/order stays in sync (cheap, no bodies).
+      set({ pages: await api.listPages() });
+    },
+    deletePage: async (id) => {
+      const pages = await api.deletePage(id);
+      set((s) => ({ pages, currentPageId: s.currentPageId === id ? null : s.currentPageId }));
+    },
+    movePage: async (id, parentId, sortOrder) => set({ pages: await api.movePage(id, parentId, sortOrder) }),
+    askVault: (question) => api.vaultAsk(question),
+    loadInbox: async () => set({ inbox: await api.listInbox() }),
+    captureNote: async (text) => {
+      await api.captureNote(text);
+      set({ inbox: await api.listInbox() });
+    },
+    keepInboxNote: async (id) => {
+      await api.keepInboxNote(id);
+      set({ inbox: await api.listInbox() });
+      await get().loadPages();
+    },
+    setCaptureOpen: (open) => set({ captureOpen: open }),
 
     saveSettings: async (s) => {
       await api.saveSettings(s);

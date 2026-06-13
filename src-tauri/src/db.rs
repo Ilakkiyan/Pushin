@@ -12,6 +12,8 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_habit_duration.sql
 const MIGRATION_0005: &str = include_str!("../migrations/0005_project_archive.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_notes.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_habit_cadence.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_pages.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_brain.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -50,6 +52,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 7 {
         conn.execute_batch(MIGRATION_0007)?;
         conn.pragma_update(None, "user_version", 7)?;
+    }
+    if version < 8 {
+        conn.execute_batch(MIGRATION_0008)?;
+        conn.pragma_update(None, "user_version", 8)?;
+    }
+    if version < 9 {
+        conn.execute_batch(MIGRATION_0009)?;
+        conn.pragma_update(None, "user_version", 9)?;
     }
     Ok(())
 }
@@ -661,4 +671,676 @@ pub fn notes_for_recall(conn: &Connection) -> Result<Vec<(Note, Option<Vec<u8>>)
         Ok((note, emb))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+// ---------- Pages (vault: the notes table viewed as Notion-style documents) ----------
+
+/// A display title for a page: its explicit `title`, else the first non-empty line of the body
+/// (truncated), else "Untitled". Keeps legacy Hermes notes (no title column) readable in the tree.
+pub fn derive_title(title: &Option<String>, content: &str) -> String {
+    if let Some(t) = title {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    let first = content.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if first.is_empty() {
+        return "Untitled".to_string();
+    }
+    let truncated: String = first.chars().take(80).collect();
+    truncated
+}
+
+/// Map a row to a `Page`. When `with_body` is false the heavy `content`/`content_json` are left
+/// empty (the sidebar tree and graph don't need them); the title is still derived from the body.
+fn row_to_page(r: &Row, indexed: bool, with_body: bool) -> rusqlite::Result<Page> {
+    let raw_title: Option<String> = r.get("title")?;
+    let content: String = r.get("content")?;
+    let title = derive_title(&raw_title, &content);
+    Ok(Page {
+        id: r.get("id")?,
+        title,
+        icon: r.get("icon")?,
+        parent_id: r.get("parent_id")?,
+        content_json: if with_body { r.get("content_json")? } else { None },
+        content: if with_body { content } else { String::new() },
+        sort_order: r.get("sort_order")?,
+        archived: r.get::<_, i64>("archived")? != 0,
+        daily_date: r.get("daily_date")?,
+        inbox: r.get::<_, i64>("inbox")? != 0,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        indexed,
+        score: None,
+    })
+}
+
+/// All non-archived pages (lightweight: no bodies), ordered for the sidebar tree.
+pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+                created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes WHERE archived = 0 ORDER BY sort_order, created_at",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, false)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A single page with its full body.
+pub fn get_page(conn: &Connection, id: i64) -> Result<Page> {
+    let page = conn.query_row(
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox,
+                created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes WHERE id = ?1",
+        params![id],
+        |r| {
+            let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+            row_to_page(r, indexed, true)
+        },
+    )?;
+    Ok(page)
+}
+
+/// Create a page. `sort_order` is placed after existing siblings under the same parent.
+pub fn insert_page(
+    conn: &Connection,
+    title: &str,
+    parent_id: Option<i64>,
+    content: &str,
+    content_json: Option<&str>,
+    embedding: Option<&[u8]>,
+    model: Option<&str>,
+) -> Result<i64> {
+    let now = now_iso();
+    let next_order: f64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM notes WHERE parent_id IS ?1",
+        params![parent_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO notes(content, title, parent_id, content_json, sort_order, embedding, embedding_model, created_at, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![content, title, parent_id, content_json, next_order, embedding, model, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Update a page's title/icon/body. The embedding is rewritten only when a fresh one is supplied
+/// (a transient embed failure leaves the prior vector intact rather than wiping it).
+pub fn update_page(
+    conn: &Connection,
+    id: i64,
+    title: &str,
+    icon: Option<&str>,
+    content: &str,
+    content_json: Option<&str>,
+    embedding: Option<&[u8]>,
+    model: Option<&str>,
+) -> Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "UPDATE notes SET title = ?2, icon = ?3, content = ?4, content_json = ?5, updated_at = ?6 WHERE id = ?1",
+        params![id, title, icon, content, content_json, now],
+    )?;
+    if let Some(emb) = embedding {
+        conn.execute("UPDATE notes SET embedding = ?2, embedding_model = ?3 WHERE id = ?1", params![id, emb, model])?;
+    }
+    Ok(())
+}
+
+/// Reparent / reorder a page in the tree.
+pub fn move_page(conn: &Connection, id: i64, parent_id: Option<i64>, sort_order: f64) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET parent_id = ?2, sort_order = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, parent_id, sort_order, now_iso()],
+    )?;
+    Ok(())
+}
+
+/// A (title → id) map over all pages, used to resolve wikilink targets by title (titles may be
+/// derived, so resolution happens in Rust rather than SQL). Lowercased keys for case-insensitivity.
+fn title_index(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
+    let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0")?;
+    let rows = stmt.query_map([], |r| {
+        let id: i64 = r.get("id")?;
+        let title: Option<String> = r.get("title")?;
+        let content: String = r.get("content")?;
+        Ok((derive_title(&title, &content).to_lowercase(), id))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (k, v) = row?;
+        map.entry(k).or_insert(v); // first (lowest sort) wins on duplicate titles
+    }
+    Ok(map)
+}
+
+/// Replace the outgoing wikilinks for `source_id`. Each link is resolved to a target page by title
+/// when one exists; otherwise it's stored as a ghost (target_id NULL) to resolve later.
+pub fn set_page_links(conn: &Connection, source_id: i64, target_titles: &[String]) -> Result<()> {
+    let index = title_index(conn)?;
+    conn.execute("DELETE FROM page_links WHERE source_id = ?1", params![source_id])?;
+    for title in target_titles {
+        let t = title.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let target_id = index.get(&t.to_lowercase()).copied().filter(|id| *id != source_id);
+        conn.execute(
+            "INSERT OR IGNORE INTO page_links(source_id, target_id, target_title) VALUES(?1, ?2, ?3)",
+            params![source_id, target_id, t],
+        )?;
+    }
+    Ok(())
+}
+
+/// Pages that link TO `target_id` (the "Linked references" panel). Resolves ghost links by title so
+/// references created before this page existed still show up.
+pub fn page_backlinks(conn: &Connection, target_id: i64) -> Result<Vec<Page>> {
+    let this = get_page(conn, target_id)?;
+    let this_title = this.title.to_lowercase();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived,
+                n.daily_date, n.inbox, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+         FROM page_links l JOIN notes n ON n.id = l.source_id
+         WHERE n.archived = 0 AND (l.target_id = ?1 OR (l.target_id IS NULL AND lower(l.target_title) = ?2))
+         ORDER BY n.updated_at DESC, n.id DESC",
+    )?;
+    let rows = stmt.query_map(params![target_id, this_title], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, false)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Pages that *mention* this page's title in their body but don't yet link it (Obsidian-style
+/// "unlinked mentions" — a discovery surface). Match is case-insensitive substring via `instr`,
+/// excluding the page itself and any page that already links here (resolved or by title).
+pub fn unlinked_mentions(conn: &Connection, page_id: i64) -> Result<Vec<Page>> {
+    let this = get_page(conn, page_id)?;
+    let needle = this.title.trim().to_lowercase();
+    if needle.len() < 3 {
+        return Ok(vec![]); // too-short titles ("a") would match everything
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+                created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes
+         WHERE archived = 0 AND id != ?1 AND instr(lower(content), ?2) > 0
+           AND id NOT IN (
+               SELECT source_id FROM page_links
+               WHERE target_id = ?1 OR (target_id IS NULL AND lower(target_title) = ?3)
+           )
+         ORDER BY updated_at DESC, id DESC LIMIT 20",
+    )?;
+    let rows = stmt.query_map(params![page_id, needle, this.title.to_lowercase()], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, false)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Free-text search over page titles + bodies (lightweight rows, no body returned).
+pub fn search_pages(conn: &Connection, query: &str) -> Result<Vec<Page>> {
+    let like = format!("%{}%", query.trim());
+    let mut stmt = conn.prepare(
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+                created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes WHERE archived = 0 AND (title LIKE ?1 OR content LIKE ?1)
+         ORDER BY updated_at DESC, id DESC LIMIT 50",
+    )?;
+    let rows = stmt.query_map(params![like], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, false)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+// ---------- Daily notes (a page that IS a calendar day) ----------
+
+/// The page for `date` ('YYYY-MM-DD'), creating it (titled `title`) on first access. Idempotent.
+pub fn get_or_create_daily(conn: &Connection, date: &str, title: &str) -> Result<Page> {
+    let existing: rusqlite::Result<i64> =
+        conn.query_row("SELECT id FROM notes WHERE daily_date = ?1", params![date], |r| r.get(0));
+    let id = match existing {
+        Ok(id) => id,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let now = now_iso();
+            conn.execute(
+                "INSERT INTO notes(content, title, daily_date, sort_order, created_at, updated_at)
+                 VALUES('', ?1, ?2, 0, ?3, ?3)",
+                params![title, date, now],
+            )?;
+            conn.last_insert_rowid()
+        }
+        Err(e) => return Err(e.into()),
+    };
+    get_page(conn, id)
+}
+
+// ---------- Inbox (one-box quick capture) ----------
+
+/// Save a quick capture into the Inbox (a page flagged `inbox=1`, title derived from the text).
+pub fn capture(conn: &Connection, content: &str, embedding: Option<&[u8]>, model: Option<&str>) -> Result<i64> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO notes(content, inbox, sort_order, embedding, embedding_model, created_at, updated_at)
+         VALUES(?1, 1, 0, ?2, ?3, ?4, ?4)",
+        params![content, embedding, model, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// The unsorted Inbox, newest first.
+pub fn list_inbox(conn: &Connection) -> Result<Vec<Page>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox,
+                created_at, updated_at, embedding IS NOT NULL AS indexed
+         FROM notes WHERE inbox = 1 ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, true)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Clear the inbox flag — the capture graduates into a normal vault page.
+pub fn clear_inbox(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE notes SET inbox = 0, updated_at = ?2 WHERE id = ?1", params![id, now_iso()])?;
+    Ok(())
+}
+
+// ---------- Entity links (page ↔ task/event) ----------
+
+/// Link a page to a task or event (idempotent).
+pub fn link_entity(conn: &Connection, page_id: i64, kind: &str, entity_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO entity_links(page_id, entity_kind, entity_id) VALUES(?1, ?2, ?3)",
+        params![page_id, kind, entity_id],
+    )?;
+    Ok(())
+}
+
+/// Remove a page↔entity link.
+pub fn unlink_entity(conn: &Connection, page_id: i64, kind: &str, entity_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM entity_links WHERE page_id = ?1 AND entity_kind = ?2 AND entity_id = ?3",
+        params![page_id, kind, entity_id],
+    )?;
+    Ok(())
+}
+
+/// The tasks/events a page references (for the editor's "Linked tasks & events" strip).
+pub fn page_entities(conn: &Connection, page_id: i64) -> Result<Vec<EntityRef>> {
+    let mut stmt = conn.prepare("SELECT entity_kind, entity_id FROM entity_links WHERE page_id = ?1")?;
+    let rows = stmt.query_map(params![page_id], |r| Ok(EntityRef { kind: r.get(0)?, id: r.get(1)? }))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The (non-archived) pages that reference a given task/event (for a "Notes" affordance on it).
+pub fn entity_pages(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec<Page>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived, n.daily_date,
+                n.inbox, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+         FROM entity_links l JOIN notes n ON n.id = l.page_id
+         WHERE n.archived = 0 AND l.entity_kind = ?1 AND l.entity_id = ?2
+         ORDER BY n.updated_at DESC, n.id DESC",
+    )?;
+    let rows = stmt.query_map(params![kind, entity_id], |r| {
+        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
+        row_to_page(r, indexed, false)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The whole vault graph: every non-archived page as a node, every resolved wikilink as an edge.
+/// Ghost links (target_id NULL) are resolved by title here so the graph reflects current pages.
+pub fn page_graph(conn: &Connection) -> Result<PageGraph> {
+    let index = title_index(conn)?;
+    let pages = list_pages(conn)?;
+    let valid: std::collections::HashSet<i64> = pages.iter().map(|p| p.id).collect();
+
+    // Collect distinct, resolved, self-loop-free directed edges.
+    let mut edge_set: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+    let mut stmt = conn.prepare("SELECT source_id, target_id, target_title FROM page_links")?;
+    let rows = stmt.query_map([], |r| {
+        let source: i64 = r.get("source_id")?;
+        let target_id: Option<i64> = r.get("target_id")?;
+        let target_title: String = r.get("target_title")?;
+        Ok((source, target_id, target_title))
+    })?;
+    for row in rows {
+        let (source, target_id, target_title) = row?;
+        let target = target_id.or_else(|| index.get(&target_title.to_lowercase()).copied());
+        if let Some(target) = target {
+            if source != target && valid.contains(&source) && valid.contains(&target) {
+                edge_set.insert((source, target));
+            }
+        }
+    }
+
+    // Node degree = number of incident edges (in + out).
+    let mut degree: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
+    for (s, t) in &edge_set {
+        *degree.entry(*s).or_insert(0) += 1;
+        *degree.entry(*t).or_insert(0) += 1;
+    }
+    let nodes = pages
+        .iter()
+        .map(|p| GraphNode {
+            id: p.id,
+            title: p.title.clone(),
+            parent_id: p.parent_id,
+            degree: degree.get(&p.id).copied().unwrap_or(0),
+        })
+        .collect();
+    let edges = edge_set.into_iter().map(|(source, target)| GraphEdge { source, target }).collect();
+    Ok(PageGraph { nodes, edges })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn daily_note_is_idempotent() {
+        let conn = mem();
+        let a = get_or_create_daily(&conn, "2026-06-14", "Sat").unwrap();
+        let b = get_or_create_daily(&conn, "2026-06-14", "Sat").unwrap();
+        assert_eq!(a.id, b.id, "same date returns the same page");
+        assert_eq!(a.daily_date.as_deref(), Some("2026-06-14"));
+        // A different date is a distinct page; daily pages still show up in the tree listing.
+        let c = get_or_create_daily(&conn, "2026-06-15", "Sun").unwrap();
+        assert_ne!(a.id, c.id);
+        assert_eq!(list_pages(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn entity_links_round_trip_and_cascade() {
+        let conn = mem();
+        let page = insert_page(&conn, "Project notes", None, "", None, None, None).unwrap();
+        link_entity(&conn, page, "task", 42).unwrap();
+        link_entity(&conn, page, "event", 7).unwrap();
+        link_entity(&conn, page, "task", 42).unwrap(); // idempotent
+
+        let refs = page_entities(&conn, page).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(entity_pages(&conn, "task", 42).unwrap().iter().map(|p| p.id).collect::<Vec<_>>(), vec![page]);
+        assert!(entity_pages(&conn, "task", 99).unwrap().is_empty());
+
+        unlink_entity(&conn, page, "event", 7).unwrap();
+        assert_eq!(page_entities(&conn, page).unwrap().len(), 1);
+
+        // Deleting the page cascades its entity links away.
+        delete_note(&conn, page).unwrap();
+        assert!(entity_pages(&conn, "task", 42).unwrap().is_empty());
+    }
+
+    #[test]
+    fn title_derivation() {
+        // Explicit title wins (and is trimmed).
+        assert_eq!(derive_title(&Some("  Roadmap  ".into()), "body"), "Roadmap");
+        // Falls back to the first non-empty body line for legacy notes.
+        assert_eq!(derive_title(&None, "\n\nFirst line\nsecond"), "First line");
+        assert_eq!(derive_title(&Some("".into()), "Derived"), "Derived");
+        // Empty everything → Untitled.
+        assert_eq!(derive_title(&None, "   "), "Untitled");
+        // Long first lines are truncated to 80 chars.
+        let long = "x".repeat(200);
+        assert_eq!(derive_title(&None, &long).chars().count(), 80);
+    }
+
+    #[test]
+    fn links_resolve_into_graph_and_backlinks() {
+        let conn = mem();
+        let a = insert_page(&conn, "Alpha", None, "", None, None, None).unwrap();
+        let b = insert_page(&conn, "Beta", None, "", None, None, None).unwrap();
+
+        // Alpha links to Beta (by title) and to a not-yet-existing "Gamma" (ghost).
+        set_page_links(&conn, a, &["Beta".into(), "Gamma".into()]).unwrap();
+
+        let g = page_graph(&conn).unwrap();
+        assert_eq!(g.nodes.len(), 2, "ghost targets are not nodes");
+        assert_eq!(g.edges, vec![GraphEdge { source: a, target: b }]);
+
+        // Beta's backlinks include Alpha; degree reflects the single resolved edge.
+        let back = page_backlinks(&conn, b).unwrap();
+        assert_eq!(back.iter().map(|p| p.id).collect::<Vec<_>>(), vec![a]);
+
+        // Create Gamma → the ghost link resolves at read time without rewriting page_links.
+        let c = insert_page(&conn, "Gamma", None, "", None, None, None).unwrap();
+        let g2 = page_graph(&conn).unwrap();
+        assert!(g2.edges.contains(&GraphEdge { source: a, target: c }));
+        assert_eq!(g2.edges.len(), 2);
+        assert_eq!(page_backlinks(&conn, c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unlinked_mentions_finds_mentions_without_links() {
+        let conn = mem();
+        let target = insert_page(&conn, "Budget", None, "", None, None, None).unwrap();
+        let mentions_it = insert_page(&conn, "Meeting", None, "Discussed the Budget at length", None, None, None).unwrap();
+        let links_it = insert_page(&conn, "Plan", None, "see Budget", None, None, None).unwrap();
+        set_page_links(&conn, links_it, &["Budget".into()]).unwrap();
+        insert_page(&conn, "Unrelated", None, "nothing here", None, None, None).unwrap();
+
+        let found = unlinked_mentions(&conn, target).unwrap();
+        let ids: Vec<i64> = found.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&mentions_it), "page that mentions but doesn't link shows up");
+        assert!(!ids.contains(&links_it), "already-linked page is excluded");
+        assert!(!ids.contains(&target), "the page itself is excluded");
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn self_links_are_ignored() {
+        let conn = mem();
+        let a = insert_page(&conn, "Solo", None, "", None, None, None).unwrap();
+        set_page_links(&conn, a, &["Solo".into()]).unwrap();
+        assert!(page_graph(&conn).unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn delete_cascades_links_and_orphans_children() {
+        let conn = mem();
+        let parent = insert_page(&conn, "Parent", None, "", None, None, None).unwrap();
+        let child = insert_page(&conn, "Child", Some(parent), "", None, None, None).unwrap();
+        set_page_links(&conn, child, &["Parent".into()]).unwrap();
+
+        delete_note(&conn, parent).unwrap();
+        // Child survives, re-parented to root (ON DELETE SET NULL).
+        let pages = list_pages(&conn).unwrap();
+        let surviving = pages.iter().find(|p| p.id == child).expect("child kept");
+        assert_eq!(surviving.parent_id, None);
+        // The link to the deleted parent cascaded away.
+        assert!(page_graph(&conn).unwrap().edges.is_empty());
+    }
+
+    // ============================ Pressure tests (new features) ============================
+
+    fn p(conn: &Connection, title: &str, parent: Option<i64>, body: &str) -> i64 {
+        insert_page(conn, title, parent, body, None, None, None).unwrap()
+    }
+
+    // ---- Daily notes ----
+
+    #[test]
+    fn daily_note_survives_edits_and_is_flagged() {
+        let conn = mem();
+        let d = get_or_create_daily(&conn, "2026-06-14", "Sat").unwrap();
+        assert!(d.daily_date.is_some() && !d.inbox);
+        // Editing the daily note must not lose its daily_date (re-fetch by date returns same id).
+        update_page(&conn, d.id, "Sat", None, "did stuff", Some("[]"), None, None).unwrap();
+        let again = get_or_create_daily(&conn, "2026-06-14", "Sat").unwrap();
+        assert_eq!(again.id, d.id);
+        assert_eq!(again.content, "did stuff");
+        assert_eq!(again.daily_date.as_deref(), Some("2026-06-14"));
+    }
+
+    // ---- Entity links ----
+
+    #[test]
+    fn entity_links_distinguish_kind_and_order_by_recency() {
+        let conn = mem();
+        let older = p(&conn, "Older", None, "");
+        let newer = p(&conn, "Newer", None, "");
+        // task 5 and event 5 are different entities.
+        link_entity(&conn, older, "task", 5).unwrap();
+        link_entity(&conn, newer, "event", 5).unwrap();
+        assert_eq!(entity_pages(&conn, "task", 5).unwrap().len(), 1);
+        assert_eq!(entity_pages(&conn, "event", 5).unwrap().len(), 1);
+
+        // Two pages linking the same task come back newest-updated first.
+        link_entity(&conn, older, "task", 9).unwrap();
+        update_page(&conn, newer, "Newer", None, "touch", None, None, None).unwrap();
+        link_entity(&conn, newer, "task", 9).unwrap();
+        let pages = entity_pages(&conn, "task", 9).unwrap();
+        assert_eq!(pages.iter().map(|p| p.id).collect::<Vec<_>>(), vec![newer, older]);
+
+        // Unlinking something that isn't linked is a no-op (no error, no change).
+        unlink_entity(&conn, older, "event", 123).unwrap();
+        assert_eq!(page_entities(&conn, older).unwrap().len(), 2);
+    }
+
+    // ---- Inbox / quick capture ----
+
+    #[test]
+    fn inbox_capture_list_and_graduate() {
+        let conn = mem();
+        let a = capture(&conn, "first thought", None, None).unwrap();
+        let _b = capture(&conn, "second thought", None, None).unwrap();
+        let inbox = list_inbox(&conn).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0].content, "second thought", "newest first");
+        assert!(inbox.iter().all(|p| p.inbox));
+
+        // Graduating clears the flag; the page persists and leaves the inbox.
+        clear_inbox(&conn, a).unwrap();
+        let inbox = list_inbox(&conn).unwrap();
+        assert_eq!(inbox.len(), 1);
+        let kept = get_page(&conn, a).unwrap();
+        assert!(!kept.inbox);
+        assert_eq!(kept.content, "first thought");
+    }
+
+    // ---- Page links / graph ----
+
+    #[test]
+    fn graph_dedupes_links_and_counts_degree() {
+        let conn = mem();
+        let a = p(&conn, "A", None, "");
+        let b = p(&conn, "B", None, "");
+        let c = p(&conn, "C", None, "");
+        // A → B (with a duplicate title that must collapse), A → C, C → A (bidirectional with A).
+        set_page_links(&conn, a, &["B".into(), "b".into(), "C".into()]).unwrap();
+        set_page_links(&conn, c, &["A".into()]).unwrap();
+
+        let g = page_graph(&conn).unwrap();
+        assert_eq!(g.edges.len(), 3, "A→B, A→C, C→A — the duplicate B collapses");
+        let deg = |id: i64| g.nodes.iter().find(|n| n.id == id).unwrap().degree;
+        assert_eq!(deg(a), 3); // A→B, A→C, C→A all touch A
+        assert_eq!(deg(b), 1);
+        assert_eq!(deg(c), 2);
+    }
+
+    #[test]
+    fn set_page_links_replaces_previous_set() {
+        let conn = mem();
+        let a = p(&conn, "A", None, "");
+        p(&conn, "B", None, "");
+        let c = p(&conn, "C", None, "");
+        set_page_links(&conn, a, &["B".into()]).unwrap();
+        set_page_links(&conn, a, &["C".into()]).unwrap(); // replaces, not appends
+        let g = page_graph(&conn).unwrap();
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].target, c, "links now point only to C");
+    }
+
+    #[test]
+    fn archived_pages_drop_out_of_listings_and_graph() {
+        let conn = mem();
+        let a = p(&conn, "Alive", None, "mentions Ghost");
+        let ghost = p(&conn, "Ghost", None, "");
+        set_page_links(&conn, a, &["Ghost".into()]).unwrap();
+        conn.execute("UPDATE notes SET archived = 1 WHERE id = ?1", params![ghost]).unwrap();
+
+        assert!(list_pages(&conn).unwrap().iter().all(|p| p.id != ghost), "archived hidden from tree");
+        assert!(search_pages(&conn, "Ghost").unwrap().iter().all(|p| p.id != ghost), "archived hidden from search");
+        // The edge to an archived node is dropped from the graph.
+        assert!(page_graph(&conn).unwrap().edges.is_empty());
+    }
+
+    // ---- Unlinked mentions ----
+
+    #[test]
+    fn unlinked_mentions_case_insensitive_short_title_and_ghost_excluded() {
+        let conn = mem();
+        let budget = p(&conn, "Budget", None, "");
+        let m1 = p(&conn, "Notes", None, "we cut the BUDGET hard"); // case-insensitive match
+        let ghostlinker = p(&conn, "Plan", None, "talk to budget team");
+        // Plan links Budget by title even though it also mentions it → excluded as already-linked.
+        set_page_links(&conn, ghostlinker, &["Budget".into()]).unwrap();
+
+        let found = unlinked_mentions(&conn, budget).unwrap();
+        let ids: Vec<i64> = found.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![m1], "only the genuinely-unlinked mention");
+
+        // A title under 3 chars matches too much → guarded to empty.
+        let short = p(&conn, "Q", None, "");
+        p(&conn, "X", None, "Q1 results and Quarterly stuff");
+        assert!(unlinked_mentions(&conn, short).unwrap().is_empty());
+    }
+
+    // ---- Search ----
+
+    #[test]
+    fn search_matches_title_and_body_case_insensitively() {
+        let conn = mem();
+        let t = p(&conn, "Quarterly Review", None, "nothing special");
+        let b = p(&conn, "Random", None, "the QUARTERLY numbers");
+        let hits: Vec<i64> = search_pages(&conn, "quarterly").unwrap().iter().map(|p| p.id).collect();
+        assert!(hits.contains(&t) && hits.contains(&b));
+        assert!(search_pages(&conn, "zebra").unwrap().is_empty());
+    }
+
+    // ---- Reparent / move ----
+
+    #[test]
+    fn move_page_reparents_and_reorders() {
+        let conn = mem();
+        let a = p(&conn, "A", None, "");
+        let b = p(&conn, "B", None, "");
+        move_page(&conn, b, Some(a), 2.5).unwrap();
+        let moved = get_page(&conn, b).unwrap();
+        assert_eq!(moved.parent_id, Some(a));
+        assert_eq!(moved.sort_order, 2.5);
+        // Back to root.
+        move_page(&conn, b, None, 0.0).unwrap();
+        assert_eq!(get_page(&conn, b).unwrap().parent_id, None);
+    }
+
+    // ---- content_json round-trip ----
+
+    #[test]
+    fn content_json_round_trips_through_get_page() {
+        let conn = mem();
+        let id = insert_page(&conn, "Doc", None, "plain text", Some("[{\"type\":\"paragraph\"}]"), None, None).unwrap();
+        let got = get_page(&conn, id).unwrap();
+        assert_eq!(got.content_json.as_deref(), Some("[{\"type\":\"paragraph\"}]"));
+        // list_pages is lightweight: no body shipped.
+        let listed = list_pages(&conn).unwrap().into_iter().find(|p| p.id == id).unwrap();
+        assert_eq!(listed.content, "");
+        assert!(listed.content_json.is_none());
+    }
 }
