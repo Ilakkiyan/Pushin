@@ -1,4 +1,5 @@
 mod booking;
+mod booking_server;
 mod calendar;
 mod commands;
 // Public so the LLM-evaluation harness (`tests/llm_eval.rs`) can drive the real parsing
@@ -11,10 +12,11 @@ pub mod model;
 mod model_manager;
 pub mod parser;
 mod scheduler;
+mod schedule_service;
 mod secrets;
 
 use commands::AppState;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,10 +36,11 @@ pub fn run() {
             }
 
             app.manage(AppState {
-                db: Mutex::new(conn),
+                db: Arc::new(Mutex::new(conn)),
                 http: reqwest::Client::new(),
                 server: Mutex::new(None),
                 embed_server: Mutex::new(None),
+                booking_server: Mutex::new(None),
             });
 
             // On macOS, native traffic-light controls are the reliable way out of fullscreen/
@@ -64,9 +67,15 @@ pub fn run() {
             commands::lock_block,
             commands::list_event_types,
             commands::create_event_type,
+            commands::update_event_type,
+            commands::regenerate_event_type_token,
             commands::delete_event_type,
+            commands::booking_server_status,
+            commands::start_booking_server,
+            commands::stop_booking_server,
             commands::booking_slots,
             commands::create_booking,
+            commands::cancel_booking,
             commands::list_habits,
             commands::create_habit,
             commands::update_habit,
@@ -123,6 +132,11 @@ pub fn run() {
             // Make sure we don't leave a llama-server orphaned on exit (chat + embeddings).
             if let RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Ok(mut guard) = state.booking_server.lock() {
+                        if let Some(server) = guard.take() {
+                            server.stop();
+                        }
+                    }
                     for slot in [&state.server, &state.embed_server] {
                         if let Ok(mut guard) = slot.lock() {
                             if let Some(mut child) = guard.take() {

@@ -2,10 +2,12 @@
 //! held across an `.await` (so async commands stay `Send`).
 
 use crate::booking::{self, BookingSlot};
+use crate::booking_server::{self, BookingServerHandle, BookingServerStatus};
 use crate::calendar::google;
 use crate::model::*;
 use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
+use crate::schedule_service::reschedule_inner;
 use crate::scheduler::{self, Interval};
 use crate::{db, habits, hermes, llm};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
@@ -13,15 +15,16 @@ use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::process::Child;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 pub struct AppState {
-    pub db: Mutex<Connection>,
+    pub db: Arc<Mutex<Connection>>,
     pub http: reqwest::Client,
     pub server: Mutex<Option<Child>>,
     /// The second llama-server, in embeddings mode, powering Hermes semantic recall.
     pub embed_server: Mutex<Option<Child>>,
+    pub booking_server: Mutex<Option<BookingServerHandle>>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -49,53 +52,6 @@ pub struct LlmStatus {
     model_present: bool,
     model_id: String,
     models: Vec<ModelInfo>,
-}
-
-// ---------- core scheduling ----------
-
-/// Recompute the schedule from the current DB state and persist the new blocks.
-fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> anyhow::Result<ScheduleResult> {
-    let tasks = db::list_tasks(conn)?;
-    let events = db::list_events(conn)?;
-    let blocks = db::list_blocks(conn)?;
-
-    let fixed: Vec<Interval> = events
-        .iter()
-        .filter_map(|e| match (scheduler::parse_dt(&e.start), scheduler::parse_dt(&e.end)) {
-            (Some(s), Some(en)) => Some(Interval { start: s, end: en }),
-            _ => None,
-        })
-        .collect();
-
-    let locked: Vec<(i64, Interval)> = blocks
-        .iter()
-        .filter(|b| b.locked)
-        .filter_map(|b| match (scheduler::parse_dt(&b.start), scheduler::parse_dt(&b.end)) {
-            (Some(s), Some(en)) => Some((b.task_id, Interval { start: s, end: en })),
-            _ => None,
-        })
-        .collect();
-
-    // Label-derived scheduling prefs (preferred window / min-chunk) bias placement — soft, never blocks.
-    let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
-    let prefs = db::resolve_task_prefs(conn, &task_ids).unwrap_or_default();
-    let now = Local::now().naive_local();
-    let result = scheduler::schedule_with_prefs(now, settings, &tasks, &fixed, &locked, &prefs);
-    db::replace_unlocked_blocks(conn, &result.blocks)?;
-
-    // Light status sync: tasks with any block become "scheduled" (unless done).
-    let scheduled_ids: std::collections::HashSet<i64> =
-        db::list_blocks(conn)?.iter().map(|b| b.task_id).collect();
-    for t in &tasks {
-        if t.status == "done" || t.status == "in_progress" {
-            continue;
-        }
-        let new = if scheduled_ids.contains(&t.id) { "scheduled" } else { "todo" };
-        if new != t.status {
-            db::set_task_status(conn, t.id, new)?;
-        }
-    }
-    Ok(result)
 }
 
 #[tauri::command]
@@ -322,9 +278,56 @@ pub fn create_event_type(
 }
 
 #[tauri::command]
+pub fn update_event_type(
+    state: State<AppState>,
+    id: i64,
+    name: String,
+    duration_minutes: i64,
+    buffer_minutes: i64,
+    color: String,
+    enabled: bool,
+) -> Result<EventType, String> {
+    let conn = state.db.lock().unwrap();
+    db::update_event_type(&conn, id, &name, duration_minutes, buffer_minutes, &color, enabled).map_err(err)
+}
+
+#[tauri::command]
+pub fn regenerate_event_type_token(state: State<AppState>, id: i64) -> Result<EventType, String> {
+    let conn = state.db.lock().unwrap();
+    db::regenerate_event_type_token(&conn, id).map_err(err)
+}
+
+#[tauri::command]
 pub fn delete_event_type(state: State<AppState>, id: i64) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_event_type(&conn, id).map_err(err)
+}
+
+#[tauri::command]
+pub fn booking_server_status(state: State<AppState>) -> Result<BookingServerStatus, String> {
+    let guard = state.booking_server.lock().unwrap();
+    Ok(guard.as_ref().map(|s| s.status()).unwrap_or_else(booking_server::stopped_status))
+}
+
+#[tauri::command]
+pub fn start_booking_server(state: State<AppState>, port: Option<u16>) -> Result<BookingServerStatus, String> {
+    let mut guard = state.booking_server.lock().unwrap();
+    if let Some(server) = guard.as_ref() {
+        return Ok(server.status());
+    }
+    let server = booking_server::start(Arc::clone(&state.db), state.http.clone(), port).map_err(err)?;
+    let status = server.status();
+    *guard = Some(server);
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn stop_booking_server(state: State<AppState>) -> Result<BookingServerStatus, String> {
+    let mut guard = state.booking_server.lock().unwrap();
+    if let Some(server) = guard.take() {
+        server.stop();
+    }
+    Ok(booking_server::stopped_status())
 }
 
 // ---------- habits ----------
@@ -546,7 +549,16 @@ pub fn create_booking(
 ) -> Result<ScheduleResult, String> {
     let mut conn = state.db.lock().unwrap();
     let settings = db::get_settings(&conn).map_err(err)?;
-    db::insert_booking(&mut conn, event_type_id, &name, &email, &start, &end).map_err(err)?;
+    let et = db::get_event_type(&conn, event_type_id).map_err(err)?;
+    booking::confirm_booking(&mut conn, &settings, &et, &name, &email, &start, &end).map_err(err)?;
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
+#[tauri::command]
+pub fn cancel_booking(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    db::cancel_booking(&mut conn, id).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
@@ -592,7 +604,7 @@ pub fn disconnect_google(state: State<AppState>) -> Result<(), String> {
 /// Two-way sync with Google Calendar, then re-plan around anything newly pulled in.
 #[tauri::command]
 pub async fn sync_google(state: State<'_, AppState>) -> Result<google::SyncSummary, String> {
-    let summary = google::sync(&state.db, &state.http).await.map_err(err)?;
+    let summary = google::sync(state.db.as_ref(), &state.http).await.map_err(err)?;
     {
         let mut conn = state.db.lock().unwrap();
         let settings = db::get_settings(&conn).map_err(err)?;

@@ -45,6 +45,7 @@ export default defineConfig({
           { text: "Notes and Vault", link: "/user-guide/notes-vault" },
           { text: "Labels", link: "/user-guide/labels" },
           { text: "Quick Capture and Inbox", link: "/user-guide/inbox" },
+          { text: "Booking", link: "/user-guide/booking" },
           { text: "Google Calendar Sync", link: "/user-guide/google-calendar" },
           { text: "Troubleshooting", link: "/user-guide/troubleshooting" },
         ],

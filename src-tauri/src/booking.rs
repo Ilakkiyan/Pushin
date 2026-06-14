@@ -5,7 +5,7 @@
 use crate::db;
 use crate::model::{EventType, Settings};
 use crate::scheduler::{self, fmt_dt, parse_dt, Interval};
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use chrono::Local;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 pub struct BookingSlot {
     pub start: String,
     pub end: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicEventType {
+    pub name: String,
+    pub duration_minutes: i64,
+    pub buffer_minutes: i64,
+    pub color: String,
+    pub slug: String,
 }
 
 /// Bookable slots for an event type over the next `horizon_days`, derived from the
@@ -59,13 +69,85 @@ pub fn available_slots(
     Ok(slots)
 }
 
+pub fn public_event_type(et: &EventType) -> PublicEventType {
+    PublicEventType {
+        name: et.name.clone(),
+        duration_minutes: et.duration_minutes,
+        buffer_minutes: et.buffer_minutes,
+        color: et.color.clone(),
+        slug: et.slug.clone(),
+    }
+}
+
+pub fn validate_invitee(name: &str, email: &str) -> Result<(String, String)> {
+    let name = name.trim();
+    let email = email.trim().to_lowercase();
+    if name.is_empty() {
+        bail!("name is required");
+    }
+    let Some((local, domain)) = email.split_once('@') else {
+        bail!("valid email is required");
+    };
+    if local.is_empty() || !domain.contains('.') || domain.ends_with('.') {
+        bail!("valid email is required");
+    }
+    Ok((name.to_string(), email))
+}
+
+pub fn confirm_booking(
+    conn: &mut Connection,
+    settings: &Settings,
+    event_type: &EventType,
+    name: &str,
+    email: &str,
+    start: &str,
+    end: &str,
+) -> Result<i64> {
+    if !event_type.enabled {
+        bail!("event type is disabled");
+    }
+    let (name, email) = validate_invitee(name, email)?;
+    let start_dt = parse_dt(start).ok_or_else(|| anyhow!("invalid start time"))?;
+    let end_dt = parse_dt(end).ok_or_else(|| anyhow!("invalid end time"))?;
+    if end_dt <= start_dt {
+        bail!("invalid booking time");
+    }
+    let expected = event_type.duration_minutes.max(15);
+    if (end_dt - start_dt).num_minutes() != expected {
+        bail!("booking duration no longer matches this event type");
+    }
+
+    let slots = available_slots(conn, settings, event_type, settings.horizon_days.clamp(1, 60))?;
+    let wanted = BookingSlot { start: fmt_dt(start_dt), end: fmt_dt(end_dt) };
+    if !slots.iter().any(|slot| slot.start == wanted.start && slot.end == wanted.end) {
+        bail!("that time is no longer available");
+    }
+
+    let title = format!("{}: {}", event_type.name, name);
+    db::insert_booking(conn, event_type.id, &title, &name, &email, &wanted.start, &wanted.end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scheduler::parse_dt;
 
     fn et(dur: i64, buf: i64) -> EventType {
-        EventType { id: 1, name: "Call".into(), duration_minutes: dur, buffer_minutes: buf, color: "#000".into() }
+        EventType {
+            id: 1,
+            name: "Call".into(),
+            duration_minutes: dur,
+            buffer_minutes: buf,
+            color: "#000".into(),
+            slug: "call-1".into(),
+            share_token: "token".into(),
+            enabled: true,
+        }
+    }
+
+    fn inserted_et(conn: &Connection, dur: i64, buf: i64) -> EventType {
+        let id = db::insert_event_type(conn, "Call", dur, buf, "#000").unwrap();
+        db::get_event_type(conn, id).unwrap()
     }
 
     #[test]
@@ -106,5 +188,37 @@ mod tests {
         let few = available_slots(&conn, &Settings::default(), &et(60, 0), 2).unwrap();
         let many = available_slots(&conn, &Settings::default(), &et(60, 0), 7).unwrap();
         assert!(many.len() >= few.len());
+    }
+
+    #[test]
+    fn confirm_booking_rejects_invalid_email() {
+        let mut conn = db::test_conn();
+        let settings = Settings::default();
+        let event_type = inserted_et(&conn, 30, 0);
+        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        let err = confirm_booking(&mut conn, &settings, &event_type, "Ava", "not-email", &slot.start, &slot.end).unwrap_err();
+        assert!(err.to_string().contains("email"));
+    }
+
+    #[test]
+    fn confirm_booking_creates_booking_and_event() {
+        let mut conn = db::test_conn();
+        let settings = Settings::default();
+        let event_type = inserted_et(&conn, 30, 0);
+        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
+        assert_eq!(db::list_bookings(&conn).unwrap().len(), 1);
+        assert!(db::list_events(&conn).unwrap().iter().any(|e| e.title.contains("Ava")));
+    }
+
+    #[test]
+    fn confirm_booking_rejects_stale_slot() {
+        let mut conn = db::test_conn();
+        let settings = Settings::default();
+        let event_type = inserted_et(&conn, 30, 0);
+        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
+        let err = confirm_booking(&mut conn, &settings, &event_type, "Bea", "bea@example.com", &slot.start, &slot.end).unwrap_err();
+        assert!(err.to_string().contains("available"));
     }
 }

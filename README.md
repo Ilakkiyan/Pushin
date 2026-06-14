@@ -284,7 +284,9 @@ Markdown folder and your files + `[[links]]` come across.
 = more links), every `[[link]]` is an edge. Click a node to open that page. It's the bird's‑eye view
 of how your notes connect.
 
-**Booking** — a local mock‑up of a public booking page that reuses the scheduler's free‑slot logic.
+**Booking** — a tunnel-ready public booking page served by Pushin while the app is running. Share a
+tokenized event-type link through ngrok or Cloudflare Tunnel; confirmed bookings become fixed events
+and the scheduler replans around them.
 
 **Settings** — working hours, **your routine** (sleep window + recurring blocked time like meals,
 gym, or the commute), model choice, inference server URL, and Google Calendar connection. The

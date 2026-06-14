@@ -17,6 +17,7 @@ const MIGRATION_0007: &str = include_str!("../migrations/0007_habit_cadence.sql"
 const MIGRATION_0008: &str = include_str!("../migrations/0008_pages.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_brain.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_labels.sql");
+const MIGRATION_0011: &str = include_str!("../migrations/0011_booking_public.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -68,11 +69,63 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(MIGRATION_0010)?;
         conn.pragma_update(None, "user_version", 10)?;
     }
+    if version < 11 {
+        conn.execute_batch(MIGRATION_0011)?;
+        conn.pragma_update(None, "user_version", 11)?;
+    }
+    ensure_booking_public_fields(conn)?;
     Ok(())
 }
 
 fn now_iso() -> String {
     chrono::Local::now().naive_local().format(DT_FMT).to_string()
+}
+
+fn slugify_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in name.chars().flat_map(|c| c.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() { "event".into() } else { out }
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("could not generate booking token: {e}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn ensure_booking_public_fields(conn: &Connection) -> Result<()> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let mut stmt = conn.prepare("SELECT id, name, slug, share_token FROM event_types")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    for (id, name, slug, token) in rows {
+        let next_slug = if slug.trim().is_empty() {
+            format!("{}-{id}", slugify_name(&name))
+        } else {
+            slug
+        };
+        let next_token = if token.trim().is_empty() { random_token()? } else { token };
+        conn.execute(
+            "UPDATE event_types SET slug = ?1, share_token = ?2 WHERE id = ?3",
+            params![next_slug, next_token, id],
+        )?;
+    }
+    Ok(())
 }
 
 // ---------- Settings ----------
@@ -561,6 +614,9 @@ fn row_to_event_type(r: &Row) -> rusqlite::Result<EventType> {
         duration_minutes: r.get("duration_minutes")?,
         buffer_minutes: r.get("buffer_minutes")?,
         color: r.get("color")?,
+        slug: r.get("slug")?,
+        share_token: r.get("share_token")?,
+        enabled: r.get::<_, i64>("enabled")? != 0,
     })
 }
 
@@ -572,10 +628,47 @@ pub fn list_event_types(conn: &Connection) -> Result<Vec<EventType>> {
 
 pub fn insert_event_type(conn: &Connection, name: &str, duration: i64, buffer: i64, color: &str) -> Result<i64> {
     conn.execute(
-        "INSERT INTO event_types(name, duration_minutes, buffer_minutes, color) VALUES(?1, ?2, ?3, ?4)",
-        params![name, duration, buffer, color],
+        "INSERT INTO event_types(name, duration_minutes, buffer_minutes, color, slug, share_token, enabled)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        params![name, duration, buffer, color, slugify_name(name), random_token()?],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    conn.execute("UPDATE event_types SET slug = ?1 WHERE id = ?2", params![format!("{}-{id}", slugify_name(name)), id])?;
+    Ok(id)
+}
+
+pub fn update_event_type(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    duration: i64,
+    buffer: i64,
+    color: &str,
+    enabled: bool,
+) -> Result<EventType> {
+    conn.execute(
+        "UPDATE event_types
+         SET name = ?1, duration_minutes = ?2, buffer_minutes = ?3, color = ?4, slug = ?5, enabled = ?6
+         WHERE id = ?7",
+        params![name, duration, buffer, color, format!("{}-{id}", slugify_name(name)), if enabled { 1 } else { 0 }, id],
+    )?;
+    get_event_type(conn, id)
+}
+
+pub fn get_event_type(conn: &Connection, id: i64) -> Result<EventType> {
+    let mut stmt = conn.prepare("SELECT * FROM event_types WHERE id = ?1")?;
+    Ok(stmt.query_row(params![id], row_to_event_type)?)
+}
+
+pub fn public_event_type(conn: &Connection, token: &str, slug: &str) -> Result<Option<EventType>> {
+    let mut stmt = conn.prepare("SELECT * FROM event_types WHERE share_token = ?1 AND slug = ?2 AND enabled = 1 LIMIT 1")?;
+    let mut rows = stmt.query_map(params![token, slug], row_to_event_type)?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn regenerate_event_type_token(conn: &Connection, id: i64) -> Result<EventType> {
+    conn.execute("UPDATE event_types SET share_token = ?1 WHERE id = ?2", params![random_token()?, id])?;
+    get_event_type(conn, id)
 }
 
 pub fn delete_event_type(conn: &Connection, id: i64) -> Result<()> {
@@ -590,6 +683,7 @@ pub fn list_bookings(conn: &Connection) -> Result<Vec<Booking>> {
             Ok(Booking {
                 id: r.get("id")?,
                 event_type_id: r.get("event_type_id")?,
+                event_id: r.get("event_id")?,
                 invitee_name: r.get("invitee_name")?,
                 invitee_email: r.get("invitee_email")?,
                 start: r.get("start")?,
@@ -606,6 +700,7 @@ pub fn list_bookings(conn: &Connection) -> Result<Vec<Booking>> {
 pub fn insert_booking(
     conn: &mut Connection,
     event_type_id: i64,
+    event_title: &str,
     name: &str,
     email: &str,
     start: &str,
@@ -613,18 +708,30 @@ pub fn insert_booking(
 ) -> Result<i64> {
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO bookings(event_type_id, invitee_name, invitee_email, start, end, status, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, 'confirmed', ?6)",
-        params![event_type_id, name, email, start, end, now_iso()],
-    )?;
-    let id = tx.last_insert_rowid();
-    tx.execute(
         "INSERT INTO events(title, start, end, kind, source, created_at)
          VALUES(?1, ?2, ?3, 'fixed', 'manual', ?4)",
-        params![format!("Call: {name}"), start, end, now_iso()],
+        params![event_title, start, end, now_iso()],
     )?;
+    let event_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO bookings(event_type_id, event_id, invitee_name, invitee_email, start, end, status, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'confirmed', ?7)",
+        params![event_type_id, event_id, name, email, start, end, now_iso()],
+    )?;
+    let id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(id)
+}
+
+pub fn cancel_booking(conn: &mut Connection, id: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    let event_id: Option<i64> = tx.query_row("SELECT event_id FROM bookings WHERE id = ?1", params![id], |r| r.get(0))?;
+    tx.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?1", params![id])?;
+    if let Some(event_id) = event_id {
+        tx.execute("DELETE FROM events WHERE id = ?1", params![event_id])?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 // ---------- Notes (Hermes memory layer) ----------

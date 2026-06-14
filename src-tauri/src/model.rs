@@ -73,6 +73,9 @@ pub struct EventType {
     pub duration_minutes: i64,
     pub buffer_minutes: i64,
     pub color: String,
+    pub slug: String,
+    pub share_token: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +83,7 @@ pub struct EventType {
 pub struct Booking {
     pub id: i64,
     pub event_type_id: i64,
+    pub event_id: Option<i64>,
     pub invitee_name: String,
     pub invitee_email: String,
     pub start: String,

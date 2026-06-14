@@ -97,11 +97,15 @@ export interface EventType {
   durationMinutes: number;
   bufferMinutes: number;
   color: string;
+  slug: string;
+  shareToken: string;
+  enabled: boolean;
 }
 
 export interface Booking {
   id: number;
   eventTypeId: number;
+  eventId: number | null;
   inviteeName: string;
   inviteeEmail: string;
   start: string;
@@ -163,6 +167,13 @@ export interface LlmStatus {
 export interface BookingSlot {
   start: string;
   end: string;
+}
+
+export interface BookingServerStatus {
+  running: boolean;
+  localUrl: string | null;
+  host: string;
+  port: number | null;
 }
 
 export interface HabitDay {
@@ -326,11 +337,18 @@ export const api = {
   listEventTypes: () => invoke<EventType[]>("list_event_types"),
   createEventType: (name: string, durationMinutes: number, bufferMinutes: number, color: string) =>
     invoke<number>("create_event_type", { name, durationMinutes, bufferMinutes, color }),
+  updateEventType: (id: number, name: string, durationMinutes: number, bufferMinutes: number, color: string, enabled: boolean) =>
+    invoke<EventType>("update_event_type", { id, name, durationMinutes, bufferMinutes, color, enabled }),
+  regenerateEventTypeToken: (id: number) => invoke<EventType>("regenerate_event_type_token", { id }),
   deleteEventType: (id: number) => invoke<void>("delete_event_type", { id }),
+  bookingServerStatus: () => invoke<BookingServerStatus>("booking_server_status"),
+  startBookingServer: (port?: number | null) => invoke<BookingServerStatus>("start_booking_server", { port: port ?? null }),
+  stopBookingServer: () => invoke<BookingServerStatus>("stop_booking_server"),
   bookingSlots: (eventTypeId: number, horizonDays: number) =>
     invoke<BookingSlot[]>("booking_slots", { eventTypeId, horizonDays }),
   createBooking: (eventTypeId: number, name: string, email: string, start: string, end: string) =>
     invoke<ScheduleResult>("create_booking", { eventTypeId, name, email, start, end }),
+  cancelBooking: (id: number) => invoke<ScheduleResult>("cancel_booking", { id }),
 
   listHabits: () => invoke<HabitStats[]>("list_habits"),
   createHabit: (name: string, color: string, cadence: string, days: number[], intervalDays: number, durationMinutes: number) =>

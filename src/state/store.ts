@@ -125,6 +125,7 @@ interface State {
   reschedule: () => Promise<void>;
   saveSettings: (s: Settings) => Promise<void>;
   createBooking: (eventTypeId: number, name: string, email: string, start: string, end: string) => Promise<void>;
+  cancelBooking: (id: number) => Promise<void>;
 
   syncing: boolean;
   connectGoogle: () => Promise<string>;
@@ -277,6 +278,7 @@ export const useStore = create<State>((set, get) => {
     reschedule: () => mutate(() => api.reschedule()),
     createBooking: (eventTypeId, name, email, start, end) =>
       mutate(() => api.createBooking(eventTypeId, name, email, start, end)),
+    cancelBooking: (id) => mutate(() => api.cancelBooking(id)),
 
     // Habit commands return the full recomputed list, so we just store the result.
     loadHabits: async () => set({ habits: await api.listHabits() }),
