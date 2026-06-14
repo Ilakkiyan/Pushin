@@ -72,7 +72,7 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
 | 🌙 **Personalized routine** | A first‑run welcome captures your sleep, working hours, and recurring blocked time (meals, gym, commute); the scheduler keeps them free and the AI plans around them. |
 | ✅ **Task list** | Auto‑scheduled work blocks with status, priority, and deadlines. |
 | 🔗 **Two‑way Google Calendar sync** | Mirror events and task blocks to your primary calendar (optional). |
-| 🪟 **Polished desktop shell** | A collapsible left sidebar and a custom frameless title bar that tucks away in fullscreen (F11). |
+| 🪟 **Polished desktop shell** | A collapsible left sidebar and a custom frameless title bar that auto‑hides when maximized/fullscreen (reveals on a top‑edge hover; F11 toggles fullscreen). |
 | 🔒 **100% on‑device** | Both the language model and the embedding model run locally via llama.cpp or Ollama. The app works fully offline. |
 
 ---
@@ -472,11 +472,21 @@ npm install            # install frontend dependencies
 npm run tauri dev      # run the app with hot reload (Rust rebuilds, Vite HMR)
 npm run build          # type‑check + bundle the frontend (tsc && vite build)
 
+# Frontend tests (Vitest + Testing‑Library + jsdom)
+npm test               # unit + component + IPC‑contract tests
+npm run coverage       # the same, with a coverage report
+npm run test:e2e       # Playwright mocked‑IPC end‑to‑end (drives the real React app)
+
 # Rust core
 cd src-tauri
-cargo test             # run the scheduler / parser / habit unit tests
+cargo test --lib       # scheduler / parser / habits / db / hermes / booking + httpmock integration
 cargo build            # compile the backend
 ```
+
+> **Layered test suite** (CI: [`.github/workflows/test.yml`](.github/workflows/test.yml)): Rust unit +
+> `httpmock` integration (LLM client, embeddings, Google Calendar leaf fns), Vitest unit/component +
+> an **IPC contract test** (catches command drift), and Playwright **mocked‑IPC E2E**. The live model
+> battery (`cargo test --test llm_eval -- --ignored`, needs a running `:8080`) stays a manual gate.
 
 > **Testing the model directly:** while the app is running, `llama-server` is live on
 > `:8080`. You can `POST` to `/v1/chat/completions` with a `json_schema` body to validate parser

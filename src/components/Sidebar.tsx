@@ -59,6 +59,34 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   return <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600">{children}</div>;
 }
 
+/** Labels list in the sidebar — click a label to open its cross-cutting filtered view. */
+function LabelsSection() {
+  const labels = useStore((s) => s.labels);
+  const currentLabelId = useStore((s) => s.currentLabelId);
+  const view = useStore((s) => s.view);
+  const openLabel = useStore((s) => s.openLabel);
+  if (labels.length === 0) return null;
+  return (
+    <div className="mt-1">
+      <SectionLabel>Labels</SectionLabel>
+      {labels.map((l) => (
+        <button
+          key={l.id}
+          onClick={() => openLabel(l.id)}
+          className={clsx(
+            "w-full flex items-center gap-2 rounded-md px-3 py-1 text-sm",
+            view === "label" && currentLabelId === l.id ? "bg-white/10 text-white" : "text-gray-400 hover:bg-white/5 hover:text-white",
+          )}
+        >
+          <span className="size-2 rounded-full shrink-0" style={{ background: l.color }} />
+          <span className="truncate flex-1 text-left">{l.name}</span>
+          {l.count > 0 && <span className="text-[10px] text-gray-600">{l.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function Sidebar() {
   const view = useStore((s) => s.view);
   const setView = useStore((s) => s.setView);
@@ -129,6 +157,7 @@ export default function Sidebar() {
         <NavItem active={view === "inbox"} collapsed={collapsed} onClick={go("inbox")} icon={<Inbox className="size-4" />} label="Inbox" badge={inboxCount} />
         <NavItem active={view === "graph"} collapsed={collapsed} onClick={go("graph")} icon={<Network className="size-4" />} label="Graph" />
         {!collapsed && <VaultTree />}
+        {!collapsed && <LabelsSection />}
       </nav>
 
       {/* Bottom: AI status + settings */}

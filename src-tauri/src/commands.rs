@@ -76,8 +76,11 @@ fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> anyhow::Resul
         })
         .collect();
 
+    // Label-derived scheduling prefs (preferred window / min-chunk) bias placement — soft, never blocks.
+    let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let prefs = db::resolve_task_prefs(conn, &task_ids).unwrap_or_default();
     let now = Local::now().naive_local();
-    let result = scheduler::schedule(now, settings, &tasks, &fixed, &locked);
+    let result = scheduler::schedule_with_prefs(now, settings, &tasks, &fixed, &locked, &prefs);
     db::replace_unlocked_blocks(conn, &result.blocks)?;
 
     // Light status sync: tasks with any block become "scheduled" (unless done).
@@ -702,23 +705,12 @@ pub struct RecallResult {
     notes: Vec<Note>,
 }
 
+/// Save a durable fact as a vault note, embedding it on-device (best effort) so it's available for
+/// semantic recall. If there's no embeddings backend the note is stored unindexed and still found via
+/// keyword. (Used by the chat→memory "Remember this?" chip; the old standalone notes list/delete
+/// commands were retired with `HermesPane`.)
 #[tauri::command]
-pub fn hermes_list_notes(state: State<AppState>) -> Result<Vec<Note>, String> {
-    let conn = state.db.lock().unwrap();
-    db::list_notes(&conn).map_err(err)
-}
-
-#[tauri::command]
-pub fn hermes_delete_note(state: State<AppState>, id: i64) -> Result<Vec<Note>, String> {
-    let conn = state.db.lock().unwrap();
-    db::delete_note(&conn, id).map_err(err)?;
-    db::list_notes(&conn).map_err(err)
-}
-
-/// Save a note, embedding it on-device (best effort) so it's available for semantic recall. If the
-/// backend has no embeddings endpoint the note is stored unindexed and still found via keyword.
-#[tauri::command]
-pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Result<Vec<Note>, String> {
+pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Result<(), String> {
     let content = content.trim().to_string();
     if content.is_empty() {
         return Err("Note is empty.".into());
@@ -736,7 +728,7 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
     };
     let conn = state.db.lock().unwrap();
     db::insert_note(&conn, &content, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
-    db::list_notes(&conn).map_err(err)
+    Ok(())
 }
 
 /// Recall the notes most relevant to `query` (shared by the recall command, the planner's auto-recall,
@@ -1006,6 +998,73 @@ pub fn page_entities(state: State<AppState>, page_id: i64) -> Result<Vec<EntityR
 pub fn entity_pages(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Page>, String> {
     let conn = state.db.lock().unwrap();
     db::entity_pages(&conn, &kind, entity_id).map_err(err)
+}
+
+// ---------- Labels (cross-cutting taxonomy) ----------
+
+/// All non-archived labels with usage counts.
+#[tauri::command]
+pub fn list_labels(state: State<AppState>) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_labels(&conn).map_err(err)
+}
+
+/// Create a label; returns the refreshed list.
+#[tauri::command]
+pub fn create_label(state: State<AppState>, input: LabelInput) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::create_label(&conn, &input).map_err(err)?;
+    db::list_labels(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn update_label(state: State<AppState>, id: i64, input: LabelInput) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::update_label(&conn, id, &input).map_err(err)?;
+    db::list_labels(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_label(state: State<AppState>, id: i64) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_label(&conn, id).map_err(err)?;
+    db::list_labels(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn merge_labels(state: State<AppState>, from: i64, into: i64) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::merge_labels(&conn, from, into).map_err(err)?;
+    db::list_labels(&conn).map_err(err)
+}
+
+/// Replace the full label set on an entity (`kind` = task|event|habit|page|project).
+#[tauri::command]
+pub fn set_entity_labels(state: State<AppState>, kind: String, entity_id: i64, label_ids: Vec<i64>) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::set_entity_labels(&conn, &kind, entity_id, &label_ids).map_err(err)
+}
+
+/// The labels on an entity.
+#[tauri::command]
+pub fn labels_for(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::labels_for(&conn, &kind, entity_id).map_err(err)
+}
+
+/// Quick "create on the fly" from the picker — find-or-create by name; returns the refreshed list.
+#[tauri::command]
+pub fn quick_label(state: State<AppState>, name: String, color: String) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    db::get_or_create_label(&conn, &name, &color).map_err(err)?;
+    db::list_labels(&conn).map_err(err)
+}
+
+/// Every entity tagged with a label (for the cross-cutting filtered view).
+#[tauri::command]
+pub fn entities_for_label(state: State<AppState>, label_id: i64) -> Result<Vec<EntityRef>, String> {
+    let conn = state.db.lock().unwrap();
+    db::entities_for_label(&conn, label_id).map_err(err)
 }
 
 /// Ask-your-vault (local RAG): recall the most relevant pages, then have the on-device chat model

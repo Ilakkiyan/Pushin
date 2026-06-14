@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Task } from "../lib/ipc";
 import { humanMinutes, parseLocal } from "../lib/time";
+import LabelPicker from "../components/LabelPicker";
 
 const PRIORITY: Record<number, { label: string; cls: string }> = {
   1: { label: "Low", cls: "text-gray-400 bg-gray-400/10" },
@@ -42,6 +43,9 @@ function TaskRow({ task }: { task: Task }) {
           <span>{humanMinutes(task.estimatedMinutes)}</span>
           {task.deadline && <span>· due {parseLocal(task.deadline).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
+        </div>
+        <div className="mt-0.5">
+          <LabelPicker kind="task" entityId={task.id} compact />
         </div>
       </div>
 

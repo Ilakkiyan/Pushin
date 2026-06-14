@@ -9,6 +9,7 @@ import HabitsPane from "./panes/HabitsPane";
 import VaultPane from "./panes/VaultPane";
 import GraphPane from "./panes/GraphPane";
 import InboxPane from "./panes/InboxPane";
+import LabelPane from "./panes/LabelPane";
 import QuickCapture from "./components/QuickCapture";
 import ChatPane from "./panes/ChatPane";
 import TaskListPane from "./panes/TaskListPane";
@@ -64,6 +65,7 @@ export default function App() {
           {view === "vault" && <VaultPane />}
           {view === "graph" && <GraphPane />}
           {view === "inbox" && <InboxPane />}
+          {view === "label" && <LabelPane />}
           {view === "booking" && <BookingPane />}
           {view === "settings" && <SettingsPane />}
           </main>

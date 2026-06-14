@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.2.2"
+version = "0.3.0"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"

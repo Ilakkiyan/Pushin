@@ -15,6 +15,7 @@ vi.mock("../lib/ipc", () => ({
     createPage: vi.fn().mockResolvedValue({ id: 7, title: "Write slides" }),
     linkPageEntity: vi.fn().mockResolvedValue(undefined),
     listPages: vi.fn().mockResolvedValue([]),
+    labelsFor: vi.fn().mockResolvedValue([]),
   },
 }));
 

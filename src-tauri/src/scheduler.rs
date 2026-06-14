@@ -251,6 +251,63 @@ fn cmp_task(a: &Task, b: &Task) -> Ordering {
         .then(a.id.cmp(&b.id))
 }
 
+/// Label-derived scheduling preferences merged across a task's labels. All empty = no effect.
+/// `window` is a preferred daily time-of-day (a SOFT preference — always falls back to any free slot).
+#[derive(Debug, Clone, Default)]
+pub struct SchedulePref {
+    pub window: Option<(NaiveTime, NaiveTime)>,
+    pub min_chunk: Option<i64>,
+    pub batch: bool,
+}
+
+/// Merge overlapping/adjacent intervals (sorted by start) back into a tidy free list.
+fn coalesce(mut ivs: Vec<Interval>) -> Vec<Interval> {
+    ivs.retain(|iv| iv.end > iv.start);
+    ivs.sort_by_key(|iv| iv.start);
+    let mut out: Vec<Interval> = Vec::new();
+    for iv in ivs {
+        match out.last_mut() {
+            Some(last) if iv.start <= last.end => {
+                if iv.end > last.end {
+                    last.end = iv.end;
+                }
+            }
+            _ => out.push(iv),
+        }
+    }
+    out
+}
+
+/// Split free intervals into (in-window, out-of-window) pieces for a daytime window `[ws, we)`.
+/// Multi-day intervals (rare — free slots are intra-day) fall wholesale into out-of-window.
+fn partition_by_window(free: Vec<Interval>, ws: NaiveTime, we: NaiveTime) -> (Vec<Interval>, Vec<Interval>) {
+    let (mut inw, mut outw) = (Vec::new(), Vec::new());
+    for iv in free {
+        if we <= ws || iv.start.date() != iv.end.date() {
+            outw.push(iv);
+            continue;
+        }
+        let win_start = iv.start.date().and_time(ws);
+        let win_end = iv.start.date().and_time(we);
+        let in_s = iv.start.max(win_start);
+        let in_e = iv.end.min(win_end);
+        if in_s < in_e {
+            inw.push(Interval { start: in_s, end: in_e });
+            if iv.start < in_s {
+                outw.push(Interval { start: iv.start, end: in_s });
+            }
+            if in_e < iv.end {
+                outw.push(Interval { start: in_e, end: iv.end });
+            }
+        } else {
+            outw.push(iv);
+        }
+    }
+    inw.sort_by_key(|iv| iv.start);
+    outw.sort_by_key(|iv| iv.start);
+    (inw, outw)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule_one(
     t: &Task,
@@ -259,6 +316,7 @@ fn schedule_one(
     locked_min: &HashMap<i64, i64>,
     scheduled_end: &mut HashMap<i64, NaiveDateTime>,
     ignore_deps: bool,
+    pref: Option<&SchedulePref>,
     blocks: &mut Vec<Block>,
     conflicts: &mut Vec<Conflict>,
 ) {
@@ -283,11 +341,24 @@ fn schedule_one(
     let est = t.estimated_minutes.max(0);
     let already = *locked_min.get(&t.id).unwrap_or(&0);
     let remaining = (est - already).max(0);
-    let min_chunk = t.min_chunk_minutes.max(1);
+    // A label's min-chunk pref overrides the task default (e.g. "deep work" → ≥90 min blocks).
+    let min_chunk = pref.and_then(|p| p.min_chunk).filter(|&m| m > 0).unwrap_or(t.min_chunk_minutes).max(1);
     // Never schedule a task past its deadline — cap placement at it.
     let deadline = t.deadline.as_deref().and_then(parse_dt);
 
-    let (placed, last_end, left) = place(free, earliest, remaining, min_chunk, deadline);
+    // A label's preferred time-of-day window is a SOFT preference: try in-window time first (earliest
+    // first), then fall back to any free slot. Done by ordering the free list window-first for `place`.
+    let (placed, last_end, left) = match pref.and_then(|p| p.window) {
+        Some((ws, we)) => {
+            let (inw, outw) = partition_by_window(std::mem::take(free), ws, we);
+            let mut combined = inw;
+            combined.extend(outw);
+            let r = place(&mut combined, earliest, remaining, min_chunk, deadline);
+            *free = coalesce(combined);
+            r
+        }
+        None => place(free, earliest, remaining, min_chunk, deadline),
+    };
     for p in &placed {
         blocks.push(Block {
             id: 0,
@@ -334,6 +405,19 @@ pub fn schedule(
     tasks: &[Task],
     fixed: &[Interval],
     locked: &[(i64, Interval)],
+) -> ScheduleResult {
+    schedule_with_prefs(now, s, tasks, fixed, locked, &HashMap::new())
+}
+
+/// As `schedule`, but each task may carry a label-derived `SchedulePref` (preferred window / min
+/// chunk) that biases — never blocks — placement. Keyed by task id.
+pub fn schedule_with_prefs(
+    now: NaiveDateTime,
+    s: &Settings,
+    tasks: &[Task],
+    fixed: &[Interval],
+    locked: &[(i64, Interval)],
+    prefs: &HashMap<i64, SchedulePref>,
 ) -> ScheduleResult {
     let active: Vec<&Task> = tasks.iter().filter(|t| t.status != "done").collect();
     let id_set: HashSet<i64> = active.iter().map(|t| t.id).collect();
@@ -382,7 +466,7 @@ pub fn schedule(
         ready.sort_by(|a, b| cmp_task(task_by_id[a], task_by_id[b]));
         let tid = ready.remove(0);
         let t = task_by_id[&tid];
-        schedule_one(t, &mut free, now, &locked_min, &mut scheduled_end, false, &mut blocks, &mut conflicts);
+        schedule_one(t, &mut free, now, &locked_min, &mut scheduled_end, false, prefs.get(&tid), &mut blocks, &mut conflicts);
         done.insert(tid);
         if let Some(deps) = dependents.get(&tid).cloned() {
             for dep in deps {
@@ -406,7 +490,7 @@ pub fn schedule(
         stuck.sort_by(|a, b| cmp_task(task_by_id[a], task_by_id[b]));
         for tid in stuck {
             let t = task_by_id[&tid];
-            schedule_one(t, &mut free, now, &locked_min, &mut scheduled_end, true, &mut blocks, &mut conflicts);
+            schedule_one(t, &mut free, now, &locked_min, &mut scheduled_end, true, prefs.get(&tid), &mut blocks, &mut conflicts);
         }
     }
 
@@ -452,6 +536,52 @@ mod tests {
             created_at: String::new(),
             depends_on: deps,
         }
+    }
+
+    fn t_at(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn label_window_pref_prefers_in_window_then_falls_back() {
+        let s = settings(3);
+        let now = dt(2026, 6, 15, 0, 0); // midnight → placement starts at work_start each day
+        let mut prefs = HashMap::new();
+        prefs.insert(1, SchedulePref { window: Some((t_at(14, 0), t_at(16, 0))), min_chunk: None, batch: false });
+
+        // A 2h task with a 14:00–16:00 window lands in the afternoon, not the 09:00 default.
+        let r = schedule_with_prefs(now, &s, &[task(1, "Deep work", 120, None, vec![])], &[], &[], &prefs);
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(parse_dt(&r.blocks[0].start).unwrap().time(), t_at(14, 0), "prefers its window");
+        assert!(r.conflicts.is_empty());
+
+        // A 4h task can't fit the 2h window → fills it, then falls back to other free time (soft pref):
+        // everything still scheduled, and some of it is inside the window.
+        let mut prefs2 = HashMap::new();
+        prefs2.insert(2, SchedulePref { window: Some((t_at(14, 0), t_at(16, 0))), min_chunk: None, batch: false });
+        let r2 = schedule_with_prefs(now, &s, &[task(2, "Big", 240, None, vec![])], &[], &[], &prefs2);
+        let placed: i64 = r2.blocks.iter().map(|b| (parse_dt(&b.end).unwrap() - parse_dt(&b.start).unwrap()).num_minutes()).sum();
+        assert_eq!(placed, 240, "soft preference never makes a task unschedulable");
+        assert!(!r2.conflicts.iter().any(|c| matches!(c, Conflict::Unschedulable { .. })));
+        assert!(
+            r2.blocks.iter().any(|b| {
+                let st = parse_dt(&b.start).unwrap().time();
+                st >= t_at(14, 0) && st < t_at(16, 0)
+            }),
+            "some of it lands in the preferred window"
+        );
+    }
+
+    #[test]
+    fn label_min_chunk_pref_overrides_task_default() {
+        let s = settings(3);
+        let now = dt(2026, 6, 15, 0, 0);
+        // 90-min task, label forces ≥90-min blocks → a single block, not chopped to the 30-min default.
+        let mut prefs = HashMap::new();
+        prefs.insert(1, SchedulePref { window: None, min_chunk: Some(90), batch: false });
+        let r = schedule_with_prefs(now, &s, &[task(1, "Focus", 90, None, vec![])], &[], &[], &prefs);
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!((parse_dt(&r.blocks[0].end).unwrap() - parse_dt(&r.blocks[0].start).unwrap()).num_minutes(), 90);
     }
 
     #[test]

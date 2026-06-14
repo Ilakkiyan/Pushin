@@ -208,6 +208,52 @@ pub struct Page {
     pub score: Option<f32>,
 }
 
+/// A label — Pushin's flat, cross-cutting taxonomy applied to any entity (task/event/habit/page/
+/// project), the layer above the rigid structural types. A label is "actionable" when it carries
+/// scheduling prefs (a preferred time-of-day window, min/max block, batching) the scheduler honors;
+/// all `pref_*` left empty = a purely organizational label. `count` is populated by `list_labels`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Label {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    pub archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pref_window_start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pref_window_end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pref_min_chunk: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pref_max_chunk: Option<i64>,
+    pub pref_batch: bool,
+    pub created_at: String,
+    /// How many entities carry this label (filled by `list_labels`; 0 elsewhere).
+    #[serde(default)]
+    pub count: i64,
+}
+
+/// Create/update payload for a label (no id / count / created_at).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelInput {
+    pub name: String,
+    pub color: String,
+    pub icon: Option<String>,
+    pub group_name: Option<String>,
+    pub pref_window_start: Option<String>,
+    pub pref_window_end: Option<String>,
+    pub pref_min_chunk: Option<i64>,
+    pub pref_max_chunk: Option<i64>,
+    #[serde(default)]
+    pub pref_batch: bool,
+}
+
 /// A reference from a page to another entity (a task or event) — the join that turns the calendar
 /// into an index into the vault. The frontend resolves `id` to a title from its loaded store.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,6 +12,8 @@ export default function CommandPalette() {
   const openPage = useStore((s) => s.openPage);
   const createPage = useStore((s) => s.createPage);
   const allPages = useStore((s) => s.pages);
+  const labels = useStore((s) => s.labels);
+  const openLabel = useStore((s) => s.openLabel);
   const askVault = useStore((s) => s.askVault);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -92,6 +94,17 @@ export default function CommandPalette() {
     { key: "v:settings", label: "Settings", icon: <SettingsIcon className="size-4" />, run: () => setView("settings") },
   ].filter((v) => !q || v.label.toLowerCase().includes(q));
 
+  const labelItems: Item[] = labels
+    .filter((l) => !q || l.name.toLowerCase().includes(q))
+    .slice(0, 6)
+    .map((l) => ({
+      key: `l:${l.id}`,
+      label: l.name,
+      icon: <span className="size-2.5 rounded-full inline-block" style={{ background: l.color }} />,
+      hint: "Label",
+      run: () => openLabel(l.id),
+    }));
+
   const pageItems: Item[] = pages.map((p) => ({
     key: `p:${p.id}`,
     label: p.title,
@@ -121,7 +134,7 @@ export default function CommandPalette() {
       ]
     : [];
 
-  const items = [...pageItems, ...views, ...actions];
+  const items = [...pageItems, ...labelItems, ...views, ...actions];
   const activate = (i: number) => {
     const it = items[i];
     if (!it) return;

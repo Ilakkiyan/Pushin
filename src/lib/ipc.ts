@@ -226,11 +226,45 @@ export interface Page {
   score?: number;
 }
 
-/** A reference from a page to a task or event. */
+/** A reference to an entity (used by page links and label taggings). */
 export interface EntityRef {
-  kind: "task" | "event";
+  kind: "task" | "event" | "habit" | "page" | "project";
   id: number;
 }
+
+/** A label — Pushin's cross-cutting taxonomy over any entity. `pref*` set = an "actionable" label
+ *  whose scheduling prefs the scheduler honors. `count` = how many entities carry it (list only). */
+export interface Label {
+  id: number;
+  name: string;
+  color: string;
+  icon?: string;
+  groupName?: string;
+  archived: boolean;
+  prefWindowStart?: string;
+  prefWindowEnd?: string;
+  prefMinChunk?: number;
+  prefMaxChunk?: number;
+  prefBatch: boolean;
+  createdAt: string;
+  count: number;
+}
+
+/** Create/update payload for a label. */
+export interface LabelInput {
+  name: string;
+  color: string;
+  icon?: string | null;
+  groupName?: string | null;
+  prefWindowStart?: string | null;
+  prefWindowEnd?: string | null;
+  prefMinChunk?: number | null;
+  prefMaxChunk?: number | null;
+  prefBatch: boolean;
+}
+
+/** Entity kinds a label can be applied to. */
+export type LabelKind = "task" | "event" | "habit" | "page" | "project";
 
 /** A Markdown file found by the vault importer (title + raw markdown). */
 export interface ImportDoc {
@@ -305,10 +339,8 @@ export const api = {
   deleteHabit: (id: number) => invoke<HabitStats[]>("delete_habit", { id }),
   scheduleHabit: (id: number, day: string | null) => invoke<ScheduleResult>("schedule_habit", { id, day }),
 
-  // Hermes (memory layer)
-  hermesListNotes: () => invoke<Note[]>("hermes_list_notes"),
-  hermesAddNote: (content: string) => invoke<Note[]>("hermes_add_note", { content }),
-  hermesDeleteNote: (id: number) => invoke<Note[]>("hermes_delete_note", { id }),
+  // Hermes (memory layer): save a durable fact + semantic recall over the vault.
+  hermesAddNote: (content: string) => invoke<void>("hermes_add_note", { content }),
   hermesRecall: (query: string, k?: number) => invoke<RecallResult>("hermes_recall", { query, k: k ?? null }),
 
   // Vault pages (Notion-style documents + Obsidian-style links/graph)
@@ -333,6 +365,18 @@ export const api = {
     invoke<void>("unlink_page_entity", { pageId, kind, entityId }),
   pageEntities: (pageId: number) => invoke<EntityRef[]>("page_entities", { pageId }),
   entityPages: (kind: string, entityId: number) => invoke<Page[]>("entity_pages", { kind, entityId }),
+
+  // Labels (cross-cutting taxonomy)
+  listLabels: () => invoke<Label[]>("list_labels"),
+  createLabel: (input: LabelInput) => invoke<Label[]>("create_label", { input }),
+  updateLabel: (id: number, input: LabelInput) => invoke<Label[]>("update_label", { id, input }),
+  deleteLabel: (id: number) => invoke<Label[]>("delete_label", { id }),
+  mergeLabels: (from: number, into: number) => invoke<Label[]>("merge_labels", { from, into }),
+  setEntityLabels: (kind: LabelKind, entityId: number, labelIds: number[]) =>
+    invoke<void>("set_entity_labels", { kind, entityId, labelIds }),
+  labelsFor: (kind: LabelKind, entityId: number) => invoke<Label[]>("labels_for", { kind, entityId }),
+  quickLabel: (name: string, color: string) => invoke<Label[]>("quick_label", { name, color }),
+  entitiesForLabel: (labelId: number) => invoke<EntityRef[]>("entities_for_label", { labelId }),
   readMarkdownDir: (path: string) => invoke<ImportDoc[]>("read_markdown_dir", { path }),
   captureNote: (text: string) => invoke<void>("capture_note", { text }),
   listInbox: () => invoke<Page[]>("list_inbox"),

@@ -31,6 +31,8 @@ vi.mock("./lib/ipc", () => {
       ensureInference: vi.fn().mockResolvedValue("ready"),
       ensureEmbeddings: vi.fn().mockResolvedValue("ready"),
       reschedule: vi.fn().mockResolvedValue({ conflicts: [] }),
+      listLabels: vi.fn().mockResolvedValue([]),
+      labelsFor: vi.fn().mockResolvedValue([]),
       listPages: vi.fn(async () => state.pages.filter((p) => !p.inbox).map(lite)),
       listInbox: vi.fn(async () => state.inbox.slice().reverse()),
       captureNote: vi.fn(async (text: string) => {

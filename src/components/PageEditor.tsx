@@ -7,6 +7,7 @@ import { useStore } from "../state/store";
 import { api, type Page, type EntityRef } from "../lib/ipc";
 import { blocksToPlainText, extractLinkTitles, pageToInitialContent } from "../lib/blocks";
 import { schema, type PartialPageBlock } from "../lib/editorSchema";
+import LabelPicker from "./LabelPicker";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -186,8 +187,11 @@ export default function PageEditor({ page }: { page: Page }) {
             scheduleSave();
           }}
           placeholder="Untitled"
-          className="w-full bg-transparent outline-none text-3xl font-bold tracking-tight placeholder:text-gray-700 mb-4"
+          className="w-full bg-transparent outline-none text-3xl font-bold tracking-tight placeholder:text-gray-700 mb-2"
         />
+        <div className="mb-4">
+          <LabelPicker kind="page" entityId={page.id} />
+        </div>
         <BlockNoteView editor={editor} theme="dark" onChange={scheduleSave} className="pushin-editor" slashMenu={false}>
           <SuggestionMenuController triggerCharacter="[" getItems={getLinkItems} />
           <SuggestionMenuController

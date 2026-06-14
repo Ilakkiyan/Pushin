@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { HabitStats } from "../lib/ipc";
 import { humanMinutes, mondayIndex, parseLocal } from "../lib/time";
+import LabelPicker from "../components/LabelPicker";
 
 const COLORS = ["#22c55e", "#0ea5e9", "#a855f7", "#f59e0b", "#ef4444", "#ec4899", "#14b8a6", "#6366f1"];
 const WEEKDAYS = [
@@ -237,6 +238,9 @@ function HabitCard({ habit }: { habit: HabitStats }) {
             </span>
             <span title="Completed (all time)">{habit.totalDone} total</span>
             <span title="Consistency over the last 30 days (scheduled days only)">{Math.round(habit.completionRate * 100)}% consistent</span>
+          </div>
+          <div className="mt-1">
+            <LabelPicker kind="habit" entityId={habit.id} compact />
           </div>
         </div>
 

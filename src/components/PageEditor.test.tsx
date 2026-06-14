@@ -26,6 +26,7 @@ vi.mock("../lib/ipc", () => ({
     pageBacklinks: vi.fn().mockResolvedValue([]),
     unlinkedMentions: vi.fn().mockResolvedValue([]),
     pageEntities: vi.fn().mockResolvedValue([]),
+    labelsFor: vi.fn().mockResolvedValue([]),
   },
 }));
 

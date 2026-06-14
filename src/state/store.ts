@@ -8,20 +8,21 @@ import {
   type Conflict,
   type EventType,
   type HabitStats,
+  type Label,
+  type LabelInput,
+  type LabelKind,
   type LlmStatus,
-  type Note,
   type Page,
   type VaultAnswer,
   type PlanOutcome,
   type Project,
-  type RecallResult,
   type ScheduleResult,
   type Settings,
   type SyncSummary,
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "booking" | "settings";
+type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "booking" | "settings";
 type CalMode = "week" | "month";
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
@@ -50,15 +51,16 @@ interface State {
   focusDateIso: string | null;
   habits: HabitStats[];
 
-  // Hermes (memory layer): the user's notes.
-  notes: Note[];
-
   // Vault: the page tree (lightweight rows) + which page is open in the editor.
   pages: Page[];
   currentPageId: number | null;
   // Inbox: unsorted quick captures + the quick-capture modal's open flag.
   inbox: Page[];
   captureOpen: boolean;
+
+  // Labels: the cross-cutting taxonomy + which label's filtered view is open.
+  labels: Label[];
+  currentLabelId: number | null;
 
   // Chat transcript, persisted for the session so it isn't lost on page/settings changes.
   chatMessages: ChatMsg[];
@@ -79,10 +81,8 @@ interface State {
   scheduleHabit: (id: number, day?: string | null) => Promise<void>;
   setHabitScheduled: (id: number, scheduled: boolean) => Promise<void>;
 
-  loadNotes: () => Promise<void>;
+  // Save a durable fact to the vault (the chat "Remember this?" chip).
   addNote: (content: string) => Promise<void>;
-  deleteNote: (id: number) => Promise<void>;
-  recallNotes: (query: string, k?: number) => Promise<RecallResult>;
 
   loadPages: () => Promise<void>;
   openPage: (id: number) => void;
@@ -97,6 +97,15 @@ interface State {
   captureNote: (text: string) => Promise<void>;
   keepInboxNote: (id: number) => Promise<void>;
   setCaptureOpen: (open: boolean) => void;
+
+  loadLabels: () => Promise<void>;
+  createLabel: (input: LabelInput) => Promise<void>;
+  updateLabel: (id: number, input: LabelInput) => Promise<void>;
+  deleteLabel: (id: number) => Promise<void>;
+  mergeLabels: (from: number, into: number) => Promise<void>;
+  quickLabel: (name: string, color: string) => Promise<Label[]>;
+  setEntityLabels: (kind: LabelKind, entityId: number, labelIds: number[]) => Promise<void>;
+  openLabel: (id: number) => void;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
@@ -173,11 +182,12 @@ export const useStore = create<State>((set, get) => {
     calMode: "week",
     focusDateIso: null,
     habits: [],
-    notes: [],
     pages: [],
     currentPageId: null,
     inbox: [],
     captureOpen: false,
+    labels: [],
+    currentLabelId: null,
     chatMessages: [],
 
     setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
@@ -191,6 +201,7 @@ export const useStore = create<State>((set, get) => {
       await refreshData();
       get().loadPages().catch(() => {});
       get().loadInbox().catch(() => {});
+      get().loadLabels().catch(() => {});
       await get().refreshLlm();
       // Auto-start the local inference server on open if it isn't already up, so the app is
       // "AI ready" without a manual click. ensure_inference is safe to call blindly: it no-ops
@@ -268,10 +279,9 @@ export const useStore = create<State>((set, get) => {
     },
 
     // Hermes note commands return the full list, so we just store the result. Recall is read-only.
-    loadNotes: async () => set({ notes: await api.hermesListNotes() }),
-    addNote: async (content) => set({ notes: await api.hermesAddNote(content) }),
-    deleteNote: async (id) => set({ notes: await api.hermesDeleteNote(id) }),
-    recallNotes: (query, k) => api.hermesRecall(query, k),
+    addNote: async (content) => {
+      await api.hermesAddNote(content);
+    },
 
     // Vault pages. The tree is lightweight (no bodies); the editor fetches a full page via getPage.
     loadPages: async () => set({ pages: await api.listPages() }),
@@ -317,6 +327,26 @@ export const useStore = create<State>((set, get) => {
       await get().loadPages();
     },
     setCaptureOpen: (open) => set({ captureOpen: open }),
+
+    // Labels. Mutating commands return the refreshed list, so we just store it.
+    loadLabels: async () => set({ labels: await api.listLabels() }),
+    createLabel: async (input) => set({ labels: await api.createLabel(input) }),
+    updateLabel: async (id, input) => set({ labels: await api.updateLabel(id, input) }),
+    deleteLabel: async (id) => {
+      const labels = await api.deleteLabel(id);
+      set((s) => ({ labels, currentLabelId: s.currentLabelId === id ? null : s.currentLabelId }));
+    },
+    mergeLabels: async (from, into) => set({ labels: await api.mergeLabels(from, into) }),
+    quickLabel: async (name, color) => {
+      const labels = await api.quickLabel(name, color);
+      set({ labels });
+      return labels;
+    },
+    setEntityLabels: async (kind, entityId, labelIds) => {
+      await api.setEntityLabels(kind, entityId, labelIds);
+      set({ labels: await api.listLabels() }); // refresh counts
+    },
+    openLabel: (id) => set({ currentLabelId: id, view: "label" }),
 
     saveSettings: async (s) => {
       await api.saveSettings(s);

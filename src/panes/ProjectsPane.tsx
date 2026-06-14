@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { CalEvent, Project, Task } from "../lib/ipc";
 import { humanMinutes, parseLocal } from "../lib/time";
+import LabelPicker from "../components/LabelPicker";
 
 const PRIORITY: Record<number, { label: string; cls: string }> = {
   1: { label: "Low", cls: "text-gray-400 bg-gray-400/10" },
@@ -206,6 +207,11 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
             </button>
           )}
         </div>
+        {isReal && project && (
+          <div className="mt-1.5">
+            <LabelPicker kind="project" entityId={project.id} compact />
+          </div>
+        )}
         {/* Progress bar */}
         <div className="mt-2 h-1.5 rounded-full bg-white/10 overflow-hidden">
           <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />

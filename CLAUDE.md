@@ -22,7 +22,8 @@ and was learned the hard way.
 
 ## Stack
 - **Shell:** Tauri 2 — Rust backend (`src-tauri/`), web frontend (`src/`).
-- **Frontend:** React 18 + TypeScript + Vite + Tailwind; state via **Zustand** (`src/state/store.ts`); SQLite is source of truth.
+- **Frontend:** React 19 + TypeScript + Vite + Tailwind v4; state via **Zustand** (`src/state/store.ts`);
+  SQLite is source of truth. Editor: `@blocknote/*`; graph: `react-force-graph-2d`. Tests: Vitest + Playwright.
 - **Inference:** llama.cpp **`llama-server`** run as a child process, OpenAI-compatible API at `http://127.0.0.1:8080`, using **`response_format: json_schema`** for constrained JSON.
 - **Models** (`model_manager::MODELS`): Qwen2.5 **3B** ("lite", default download, ~2GB), **7B** ("recommended", ~4.7GB), **14B** ("most powerful", ~9GB). 4-bit GGUF from bartowski on HuggingFace, auto-downloaded on first run. Default `Settings.model_id` stays the lite 3B (fast first run); the card flags 7B as recommended.
 - **DB:** SQLite via `rusqlite` (Rust) + `@tauri-apps/plugin-sql` (frontend). Lives at `~/Library/Application Support/com.pushin.app/pushin.db`.
@@ -31,7 +32,7 @@ and was learned the hard way.
 
 ## Architecture
 ```
-React UI (chat | full-day week calendar | task list | settings)
+React UI (sidebar shell | chat | week/month calendar | tasks | habits | vault editor | graph | ⌘K palette)
   │  Tauri invoke (commands.rs)
   ▼
 Rust core
@@ -42,7 +43,7 @@ Rust core
   ├─ calendar/google : OAuth(PKCE loopback) + token refresh + two-way sync
   ├─ booking       : availability via scheduler free-slots (booking-page seam)
   ├─ hermes        : memory layer ("second brain") — embeddings + cosine/keyword recall; backs the vault
-  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links
+  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links, labels, entity_labels
        │ spawns child process              │ OAuth + HTTPS
        ▼                                    ▼
   llama-server (GGUF, Metal)          Google Calendar API v3 (optional)
@@ -53,10 +54,11 @@ Rust core
 - `lib.rs` — Tauri setup, command registration, app-exit kills the llama-server child.
 - `commands.rs` — the IPC surface. **Never hold the DB `Mutex<Connection>` across an `.await`** (async commands must stay `Send`); use short scoped lock blocks.
 - `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, etc.
-- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0009_brain`). `0008` evolves
+- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0010_labels`). `0008` evolves
   `notes` into vault pages + adds `page_links`; `0009` adds `daily_date` (daily notes), `entity_links`
-  (page ↔ task/event), and an `inbox` flag (quick capture). Page CRUD, graph, daily/inbox, entity
-  links, and unlinked-mentions queries all live here.
+  (page ↔ task/event), and an `inbox` flag; `0010` adds `labels` + a polymorphic `entity_labels` join
+  (the cross-cutting taxonomy). Page CRUD, graph, daily/inbox, entity links, unlinked-mentions, label
+  CRUD/merge, and `resolve_task_prefs` (labels → scheduler prefs) all live here.
 - `model_manager.rs` — model + engine auto-download, `llama-server` spawn/health, `MODELS` list.
   Cross-platform: picks the **CPU** llama.cpp release asset per OS/arch (asset substrings are
   extension-less since llama.cpp churns extensions — Linux moved `.zip`→`.tar.gz`). macOS/Linux
@@ -67,7 +69,7 @@ Rust core
 - `parser.rs` — **the trickiest file.** NL→plan, day-word→date, dedupe, edit-merge. See Gotchas.
 - `scheduler.rs` — auto-scheduler + `parse_dt`/`fmt_dt` time helpers. Has unit tests.
 - `calendar/google.rs` — Google two-way sync (OAuth/API/sync engine).
-- `calendar/mod.rs`, `calendar/local.rs` — vestigial `CalendarProvider` trait + LocalProvider seam (only `sync_calendar` uses Local; real Google path is free functions).
+- `calendar/mod.rs` — just declares `google` (SQLite is the source of truth; the old `CalendarProvider`/LocalProvider indirection was removed).
 - `booking.rs` — booking-page availability (reuses scheduler free-slots).
 
 **Frontend (`src/`)**
@@ -274,15 +276,23 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 - `bin/llama-server` (+ dylibs) — auto-downloaded llama.cpp engine
 - `pushin.db` — SQLite (tasks, events, blocks, settings, Google tokens)
 
-## Current status
-- **Working:** on-device planning pipeline, auto-scheduler, full-day (00–24) week calendar with
-  drag-to-move/pin + re-plan, conversational create/update/remove of events, task list, settings,
-  first-run model+engine auto-download, two-way Google sync (compiles; not live-tested).
-- **Branding:** pushpin 📌 — top bar, favicon, and dock icon (`src-tauri/icons/`, generated via a Swift
-  emoji-render script → `tauri icon`).
-- **Git:** the repo was about to be initialized when `gh` was found **not installed** — `git init` +
-  GitHub push are still pending. (Install `gh` or add a remote manually, then commit & push. `.gitignore`
-  already excludes node_modules/dist/target/models/binaries.)
+## Current status (released **v0.2.2**; tagged on GitHub, `release.yml` builds installers)
+- **Working — calendar core:** on-device planning pipeline, auto-scheduler, full-day (00–24) week +
+  month calendar with drag-to-move/pin + re-plan, conversational create/update/remove of events, task
+  list, habits, booking mockup, settings, first-run model+engine auto-download, two-way Google sync
+  (compiles + leaf fns httpmock-tested; first live connect still unverified).
+- **Working — second brain (v0.2.x):** collapsible left **sidebar** shell + **Cmd-K palette**;
+  Notion-style **vault** (BlockNote block editor, nested pages), Obsidian-style **`[[wikilinks]]` +
+  backlinks + connection graph**, **daily notes**, task/event↔page **entity links**, on-device
+  **semantic recall**, **AI-over-vault** (auto-recall into the planner, chat→memory chips, ask-your-
+  vault RAG, semantic Cmd-K), **quick capture → Inbox**, **Markdown/Obsidian import**, editor templates.
+- **Working — shell polish:** custom **frameless `TitleBar`** (own min/max/close) that **auto-hides
+  when maximized/fullscreen**, revealing on a top-edge hover (F11 toggles fullscreen).
+- **Tested:** layered suite — Rust `cargo test --lib` (126) + httpmock integration, Vitest (64 across
+  16 files) + IPC/bridge contract tests, Playwright mocked-IPC E2E (CI), live `llm_eval` battery
+  (~90%, manual). CI: `.github/workflows/test.yml`. See **Test suite** above.
+- **Branding:** pushpin 📌 — sidebar brand, favicon, dock icon (`src-tauri/icons/`).
+- **Repo:** on GitHub (`Ilakkiyan/Pushin`), `main` is the default; releases are version tags (`v0.2.0`…).
 
 ## Known limitations / follow-ups
 - **Mobile:** the spawn-a-server approach won't work on iOS (no subprocess). Mobile needs **in-process
@@ -294,6 +304,20 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
   (CUDA/Vulkan/Metal) instead of the GPU-agnostic CPU asset. Live-verify on Linux/Windows.
 - **Public booking page** needs a hosted relay (the in-app booking is a local mockup).
 - No **drag-to-resize** on the calendar yet (only drag-to-move).
+- **Test gap:** the full Google `sync()` orchestrator end-to-end (the leaf fns are httpmock-tested);
+  needs a seeded account/token in DB+keychain. PageEditor real-editing is Playwright-only (jsdom can't
+  drive ProseMirror).
+- **Labeling system (core SHIPPED):** a flat+grouped, user-defined, **cross-cutting** label taxonomy
+  over tasks/events/habits/pages/projects (`0010_labels`: `labels` + polymorphic `entity_labels`,
+  mirroring `entity_links`). Built: label CRUD/merge, a shared **`LabelPicker`** attached to tasks/
+  habits/projects/pages, a sidebar **Labels** section + **`LabelPane`** (cross-cutting filtered view +
+  inline manager with scheduling prefs), Cmd-K label jumps, and **actionable scheduling** — labels'
+  time-of-day window + min-chunk bias the planner (`db::resolve_task_prefs` → `scheduler::schedule_with_prefs`;
+  a *soft* preference that always falls back). **Still TODO (Phases 3/5/6):** calendar color-by-label +
+  filter chips; AI auto-labeling (keyword post-pass → confirm chips); read-only "system labels" for the
+  structural kinds; a `#`-trigger inline label chip in the editor; batching in the scheduler. Events
+  have no editor surface yet, so they're label-able only via the AI/back-end, not the UI. See memory
+  `labeling-system-plan`.
 
 ## Working style with this user
 Wants fast iteration and **honest assessment** — when something flaky is the model's limitation vs. a

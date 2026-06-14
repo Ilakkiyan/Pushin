@@ -2,7 +2,9 @@
 //! The frontend never touches the DB directly — it goes through Tauri commands.
 
 use crate::model::*;
+use crate::scheduler::SchedulePref;
 use anyhow::Result;
+use chrono::NaiveTime;
 use rusqlite::{params, Connection, Row};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
@@ -14,6 +16,7 @@ const MIGRATION_0006: &str = include_str!("../migrations/0006_notes.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_habit_cadence.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_pages.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_brain.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0010_labels.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -60,6 +63,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 9 {
         conn.execute_batch(MIGRATION_0009)?;
         conn.pragma_update(None, "user_version", 9)?;
+    }
+    if version < 10 {
+        conn.execute_batch(MIGRATION_0010)?;
+        conn.pragma_update(None, "user_version", 10)?;
     }
     Ok(())
 }
@@ -633,20 +640,6 @@ fn row_to_note(r: &Row, indexed: bool) -> rusqlite::Result<Note> {
     })
 }
 
-/// All notes, newest first. Carries no embedding payload (the `indexed` flag tells the UI whether
-/// one exists); use `notes_for_recall` when the vectors are actually needed.
-pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, content, created_at, updated_at, embedding IS NOT NULL AS indexed
-         FROM notes ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let indexed: bool = r.get::<_, i64>("indexed")? != 0;
-        row_to_note(r, indexed)
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
 pub fn insert_note(conn: &Connection, content: &str, embedding: Option<&[u8]>, model: Option<&str>) -> Result<i64> {
     let now = now_iso();
     conn.execute(
@@ -995,6 +988,183 @@ pub fn entity_pages(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec
         row_to_page(r, indexed, false)
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+// ---------- Labels (cross-cutting taxonomy over any entity) ----------
+
+fn row_to_label(r: &Row, count: i64) -> rusqlite::Result<Label> {
+    Ok(Label {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        color: r.get("color")?,
+        icon: r.get("icon")?,
+        group_name: r.get("group_name")?,
+        archived: r.get::<_, i64>("archived")? != 0,
+        pref_window_start: r.get("pref_window_start")?,
+        pref_window_end: r.get("pref_window_end")?,
+        pref_min_chunk: r.get("pref_min_chunk")?,
+        pref_max_chunk: r.get("pref_max_chunk")?,
+        pref_batch: r.get::<_, i64>("pref_batch")? != 0,
+        created_at: r.get("created_at")?,
+        count,
+    })
+}
+
+/// All non-archived labels with their usage counts, ordered by group then name.
+pub fn list_labels(conn: &Connection) -> Result<Vec<Label>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.*, COUNT(el.label_id) AS cnt
+         FROM labels l LEFT JOIN entity_labels el ON el.label_id = l.id
+         WHERE l.archived = 0
+         GROUP BY l.id
+         ORDER BY l.group_name IS NULL, lower(l.group_name), lower(l.name)",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let count: i64 = r.get("cnt")?;
+        row_to_label(r, count)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Insert a label (errors if the name already exists — the UI validates first).
+pub fn create_label(conn: &Connection, input: &LabelInput) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO labels(name, color, icon, group_name, pref_window_start, pref_window_end,
+                            pref_min_chunk, pref_max_chunk, pref_batch, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            input.name.trim(), input.color, input.icon, input.group_name,
+            input.pref_window_start, input.pref_window_end, input.pref_min_chunk, input.pref_max_chunk,
+            input.pref_batch as i64, now_iso()
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Find a label by name (case-insensitive), creating a minimal one (name + color) if absent. Used by
+/// the inline/quick picker's "create on the fly".
+pub fn get_or_create_label(conn: &Connection, name: &str, color: &str) -> Result<i64> {
+    let name = name.trim();
+    let existing: rusqlite::Result<i64> =
+        conn.query_row("SELECT id FROM labels WHERE lower(name) = lower(?1)", params![name], |r| r.get(0));
+    match existing {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute(
+                "INSERT INTO labels(name, color, created_at) VALUES(?1, ?2, ?3)",
+                params![name, color, now_iso()],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Update a label's display + scheduling prefs.
+pub fn update_label(conn: &Connection, id: i64, input: &LabelInput) -> Result<()> {
+    conn.execute(
+        "UPDATE labels SET name = ?2, color = ?3, icon = ?4, group_name = ?5, pref_window_start = ?6,
+                          pref_window_end = ?7, pref_min_chunk = ?8, pref_max_chunk = ?9, pref_batch = ?10
+         WHERE id = ?1",
+        params![
+            id, input.name.trim(), input.color, input.icon, input.group_name,
+            input.pref_window_start, input.pref_window_end, input.pref_min_chunk, input.pref_max_chunk,
+            input.pref_batch as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a label (its `entity_labels` rows cascade away).
+pub fn delete_label(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM labels WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Merge `from` into `into`: re-point its taggings (skipping dupes), then delete `from`.
+pub fn merge_labels(conn: &Connection, from: i64, into: i64) -> Result<()> {
+    if from == into {
+        return Ok(());
+    }
+    conn.execute("UPDATE OR IGNORE entity_labels SET label_id = ?2 WHERE label_id = ?1", params![from, into])?;
+    conn.execute("DELETE FROM labels WHERE id = ?1", params![from])?; // cascades any leftover dupes
+    Ok(())
+}
+
+/// Replace the full set of labels on an entity (like `set_page_links`).
+pub fn set_entity_labels(conn: &Connection, kind: &str, entity_id: i64, label_ids: &[i64]) -> Result<()> {
+    conn.execute("DELETE FROM entity_labels WHERE entity_kind = ?1 AND entity_id = ?2", params![kind, entity_id])?;
+    for lid in label_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_labels(label_id, entity_kind, entity_id) VALUES(?1, ?2, ?3)",
+            params![lid, kind, entity_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// The labels on a given entity.
+pub fn labels_for(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec<Label>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.* FROM entity_labels el JOIN labels l ON l.id = el.label_id
+         WHERE el.entity_kind = ?1 AND el.entity_id = ?2 AND l.archived = 0
+         ORDER BY l.group_name IS NULL, lower(l.group_name), lower(l.name)",
+    )?;
+    let rows = stmt.query_map(params![kind, entity_id], |r| row_to_label(r, 0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Every entity tagged with a label (for the cross-cutting filtered view). Returns (kind, id) refs;
+/// the frontend resolves them to titles from its loaded store.
+pub fn entities_for_label(conn: &Connection, label_id: i64) -> Result<Vec<EntityRef>> {
+    let mut stmt = conn.prepare("SELECT entity_kind, entity_id FROM entity_labels WHERE label_id = ?1")?;
+    let rows = stmt.query_map(params![label_id], |r| Ok(EntityRef { kind: r.get(0)?, id: r.get(1)? }))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Resolve each task's labels into a merged `SchedulePref` the scheduler honors: window = the union
+/// (widest) of its labels' windows; min_chunk = the strictest (max); batch = any. Tasks with no
+/// actionable labels are omitted (no pref → no effect).
+pub fn resolve_task_prefs(conn: &Connection, task_ids: &[i64]) -> Result<std::collections::HashMap<i64, SchedulePref>> {
+    let hm = |s: Option<String>| -> Option<NaiveTime> { s.and_then(|v| NaiveTime::parse_from_str(&v, "%H:%M").ok()) };
+    let mut out = std::collections::HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT l.pref_window_start, l.pref_window_end, l.pref_min_chunk, l.pref_batch
+         FROM entity_labels el JOIN labels l ON l.id = el.label_id
+         WHERE el.entity_kind = 'task' AND el.entity_id = ?1 AND l.archived = 0",
+    )?;
+    for &tid in task_ids {
+        let (mut win_start, mut win_end): (Option<NaiveTime>, Option<NaiveTime>) = (None, None);
+        let mut min_chunk: Option<i64> = None;
+        let mut batch = false;
+        let rows = stmt.query_map(params![tid], |r| {
+            Ok((
+                hm(r.get(0)?),
+                hm(r.get(1)?),
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        for row in rows {
+            let (ws, we, mc, b) = row?;
+            if let (Some(ws), Some(we)) = (ws, we) {
+                win_start = Some(win_start.map_or(ws, |c| c.min(ws)));
+                win_end = Some(win_end.map_or(we, |c| c.max(we)));
+            }
+            if let Some(mc) = mc.filter(|&m| m > 0) {
+                min_chunk = Some(min_chunk.map_or(mc, |c| c.max(mc)));
+            }
+            batch = batch || b;
+        }
+        let window = match (win_start, win_end) {
+            (Some(s), Some(e)) if e > s => Some((s, e)),
+            _ => None,
+        };
+        if window.is_some() || min_chunk.is_some() || batch {
+            out.insert(tid, SchedulePref { window, min_chunk, batch });
+        }
+    }
+    Ok(out)
 }
 
 /// The whole vault graph: every non-archived page as a node, every resolved wikilink as an edge.
@@ -1348,5 +1518,111 @@ mod tests {
         let listed = list_pages(&conn).unwrap().into_iter().find(|p| p.id == id).unwrap();
         assert_eq!(listed.content, "");
         assert!(listed.content_json.is_none());
+    }
+
+    // ---- Labels ----
+
+    fn label(name: &str) -> LabelInput {
+        LabelInput {
+            name: name.into(),
+            color: "#0ea5e9".into(),
+            icon: None,
+            group_name: None,
+            pref_window_start: None,
+            pref_window_end: None,
+            pref_min_chunk: None,
+            pref_max_chunk: None,
+            pref_batch: false,
+        }
+    }
+
+    #[test]
+    fn label_get_or_create_is_case_insensitive_and_idempotent() {
+        let conn = mem();
+        let a = get_or_create_label(&conn, "Health", "#10b981").unwrap();
+        let b = get_or_create_label(&conn, "  health  ", "#000").unwrap();
+        assert_eq!(a, b, "same name (case/space-insensitive) → same label");
+        assert_eq!(list_labels(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn entity_labels_replace_set_and_query_both_ways() {
+        let conn = mem();
+        let work = create_label(&conn, &label("Work")).unwrap();
+        let deep = create_label(&conn, &label("Deep")).unwrap();
+        let admin = create_label(&conn, &label("Admin")).unwrap();
+
+        set_entity_labels(&conn, "task", 5, &[work, deep]).unwrap();
+        assert_eq!(labels_for(&conn, "task", 5).unwrap().iter().map(|l| l.id).collect::<std::collections::BTreeSet<_>>(), [deep, work].into());
+
+        // Replace (not append): now only Admin.
+        set_entity_labels(&conn, "task", 5, &[admin]).unwrap();
+        let ids: Vec<i64> = labels_for(&conn, "task", 5).unwrap().iter().map(|l| l.id).collect();
+        assert_eq!(ids, vec![admin]);
+
+        // Cross-cutting: Work tags a task AND a page; entities_for_label sees both kinds.
+        set_entity_labels(&conn, "task", 9, &[work]).unwrap();
+        set_entity_labels(&conn, "page", 2, &[work]).unwrap();
+        let mut refs: Vec<(String, i64)> = entities_for_label(&conn, work).unwrap().into_iter().map(|e| (e.kind, e.id)).collect();
+        refs.sort();
+        assert_eq!(refs, vec![("page".into(), 2), ("task".into(), 9)]);
+
+        // list_labels carries usage counts.
+        let counts: std::collections::HashMap<i64, i64> = list_labels(&conn).unwrap().into_iter().map(|l| (l.id, l.count)).collect();
+        assert_eq!(counts[&work], 2);
+        assert_eq!(counts[&admin], 1);
+    }
+
+    #[test]
+    fn deleting_a_label_cascades_its_taggings() {
+        let conn = mem();
+        let l = create_label(&conn, &label("Temp")).unwrap();
+        set_entity_labels(&conn, "event", 3, &[l]).unwrap();
+        delete_label(&conn, l).unwrap();
+        assert!(labels_for(&conn, "event", 3).unwrap().is_empty());
+        assert!(entities_for_label(&conn, l).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_task_prefs_merges_label_scheduling() {
+        let conn = mem();
+        let mut deep = label("Deep work");
+        deep.pref_window_start = Some("09:00".into());
+        deep.pref_window_end = Some("12:00".into());
+        deep.pref_min_chunk = Some(60);
+        let deep_id = create_label(&conn, &deep).unwrap();
+
+        let mut focus = label("Focus");
+        focus.pref_window_start = Some("06:00".into()); // union → widest window 06:00–13:00
+        focus.pref_window_end = Some("13:00".into());
+        focus.pref_min_chunk = Some(90); // strictest → 90
+        let focus_id = create_label(&conn, &focus).unwrap();
+
+        set_entity_labels(&conn, "task", 1, &[deep_id, focus_id]).unwrap();
+        set_entity_labels(&conn, "task", 2, &[create_label(&conn, &label("Plain")).unwrap()]).unwrap();
+
+        let prefs = resolve_task_prefs(&conn, &[1, 2, 3]).unwrap();
+        let p = prefs.get(&1).expect("task 1 has actionable labels");
+        let (ws, we) = p.window.unwrap();
+        assert_eq!((ws, we), (NaiveTime::from_hms_opt(6, 0, 0).unwrap(), NaiveTime::from_hms_opt(13, 0, 0).unwrap()));
+        assert_eq!(p.min_chunk, Some(90), "strictest min-chunk wins");
+        assert!(!prefs.contains_key(&2), "a non-actionable label yields no pref");
+        assert!(!prefs.contains_key(&3), "an untagged task yields no pref");
+    }
+
+    #[test]
+    fn merge_repoints_taggings_dedupes_and_removes_source() {
+        let conn = mem();
+        let from = create_label(&conn, &label("Errand")).unwrap();
+        let into = create_label(&conn, &label("Errands")).unwrap();
+        // task 1 has both (a dup after merge); task 2 has only `from`.
+        set_entity_labels(&conn, "task", 1, &[from, into]).unwrap();
+        set_entity_labels(&conn, "task", 2, &[from]).unwrap();
+
+        merge_labels(&conn, from, into).unwrap();
+        // `from` is gone; both tasks now carry `into` exactly once.
+        assert!(list_labels(&conn).unwrap().iter().all(|l| l.id != from));
+        assert_eq!(labels_for(&conn, "task", 1).unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), vec![into]);
+        assert_eq!(labels_for(&conn, "task", 2).unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), vec![into]);
     }
 }
