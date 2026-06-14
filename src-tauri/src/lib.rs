@@ -39,6 +39,14 @@ pub fn run() {
                 server: Mutex::new(None),
                 embed_server: Mutex::new(None),
             });
+
+            // On macOS, native traffic-light controls are the reliable way out of fullscreen/
+            // maximized states. A frameless custom titlebar can leave the window trapped.
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_decorations(true)?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -90,6 +98,7 @@ pub fn run() {
             commands::merge_labels,
             commands::set_entity_labels,
             commands::labels_for,
+            commands::labels_for_entities,
             commands::quick_label,
             commands::entities_for_label,
             commands::extract_memories,

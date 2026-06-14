@@ -38,6 +38,7 @@ export async function installMockBridge(page: Page) {
       list_event_types: () => [],
       list_labels: () => [],
       labels_for: () => [],
+      labels_for_entities: () => ({}),
       // ---- vault ----
       list_pages: () => state.pages.filter((p: any) => !p.archived && !p.inbox).map(lite),
       get_page: ({ id }: any) => state.pages.find((p: any) => p.id === id) ?? null,
@@ -91,7 +92,7 @@ export async function installMockBridge(page: Page) {
       hermes_add_note: () => null,
       vault_ask: () => ({ answer: "(mock answer)", citations: [] }),
       extract_memories: () => [],
-      plan_tasks: () => ({ createdTaskIds: [], projectNames: [], createdEventTitles: [], updatedEventTitles: [], removedEventTitles: [], createdHabitNames: [], clarifications: [] }),
+      plan_tasks: () => ({ createdTaskIds: [], createdEventIds: [], projectNames: [], createdEventTitles: [], updatedEventTitles: [], removedEventTitles: [], createdHabitNames: [], clarifications: [] }),
     };
 
     (window as any).__TAURI_INTERNALS__ = {

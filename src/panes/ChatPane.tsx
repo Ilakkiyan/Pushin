@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Send, Sparkles, Brain, X } from "lucide-react";
+import { Send, Sparkles, Brain, X, Tag } from "lucide-react";
 import { useStore } from "../state/store";
 import { api } from "../lib/ipc";
+import { suggestAutoLabels, type AutoLabelSuggestion } from "../lib/autoLabels";
 import InferenceSetup from "../components/InferenceSetup";
+
+type PendingAutoLabelSuggestion = Omit<AutoLabelSuggestion, "entityId" | "key"> & {
+  key: string;
+  entityIds: number[];
+};
 
 export default function ChatPane() {
   const llm = useStore((s) => s.llm);
@@ -10,12 +16,16 @@ export default function ChatPane() {
   const plan = useStore((s) => s.plan);
   const addNote = useStore((s) => s.addNote);
   const loadPages = useStore((s) => s.loadPages);
+  const quickLabel = useStore((s) => s.quickLabel);
+  const setEntityLabels = useStore((s) => s.setEntityLabels);
   // Transcript lives in the store so it persists across page/settings changes (cleared on app close).
   const messages = useStore((s) => s.chatMessages);
   const setMessages = useStore((s) => s.setChatMessages);
   const [input, setInput] = useState("");
   // Durable facts the AI noticed in the last message — offered for the user to confirm into memory.
   const [memSuggestions, setMemSuggestions] = useState<string[]>([]);
+  // Deterministic label guesses for just-created tasks/events — confirmed before storing.
+  const [labelSuggestions, setLabelSuggestions] = useState<PendingAutoLabelSuggestion[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const saveMemory = async (fact: string) => {
@@ -24,9 +34,21 @@ export default function ChatPane() {
     await loadPages();
   };
 
+  const applyLabelSuggestion = async (suggestion: PendingAutoLabelSuggestion) => {
+    setLabelSuggestions((s) => s.filter((x) => x.key !== suggestion.key));
+    const labels = await quickLabel(suggestion.labelName, suggestion.color);
+    const label = labels.find((l) => l.name.toLowerCase() === suggestion.labelName.toLowerCase());
+    if (!label) return;
+    for (const entityId of suggestion.entityIds) {
+      const current = await api.labelsFor(suggestion.kind, entityId).catch(() => []);
+      const next = [...new Set([...current.map((l) => l.id), label.id])];
+      await setEntityLabels(suggestion.kind, entityId, next);
+    }
+  };
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, busy]);
+  }, [messages, busy, memSuggestions, labelSuggestions]);
 
   const send = async (text: string) => {
     const trimmed = text.trim();
@@ -34,6 +56,8 @@ export default function ChatPane() {
     // Conversation context (prior turns) so follow-ups like "this friday at 7pm" work.
     const history = messages.map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.text }));
     setInput("");
+    setLabelSuggestions([]);
+    setMemSuggestions([]);
     setMessages((m) => [...m, { role: "user", text: trimmed }]);
     try {
       const o = await plan(trimmed, history);
@@ -66,6 +90,22 @@ export default function ChatPane() {
         parts.push("📌 Recalled from your notes:\n" + o.recalledNotes.map((r) => "• " + r).join("\n"));
       }
       setMessages((m) => [...m, { role: "ai", text: parts.join("\n\n") }]);
+      const latest = useStore.getState();
+      const targets = [
+        ...o.createdTaskIds
+          .map((id) => {
+            const task = latest.tasks.find((t) => t.id === id);
+            return task ? { kind: "task" as const, id, title: task.title, text: task.notes } : null;
+          })
+          .filter((x): x is NonNullable<typeof x> => !!x),
+        ...(o.createdEventIds ?? [])
+          .map((id) => {
+            const event = latest.events.find((e) => e.id === id);
+            return event ? { kind: "event" as const, id, title: event.title } : null;
+          })
+          .filter((x): x is NonNullable<typeof x> => !!x),
+      ];
+      setLabelSuggestions(groupLabelSuggestions(suggestAutoLabels(targets, trimmed)));
       // Best-effort: notice durable facts worth remembering and offer to save them (confirmed, not silent).
       api
         .extractMemories(trimmed)
@@ -128,6 +168,31 @@ export default function ChatPane() {
         </div>
       )}
 
+      {labelSuggestions.length > 0 && (
+        <div className="px-3 pt-2 shrink-0 space-y-1.5">
+          <div className="text-[11px] text-sky-300/80 flex items-center gap-1">
+            <Tag className="size-3" /> Apply labels?
+          </div>
+          {labelSuggestions.map((suggestion) => (
+            <div key={suggestion.key} className="flex items-center gap-2 rounded-lg border border-sky-400/20 bg-sky-500/[0.06] px-2.5 py-1.5">
+              <span className="size-2 rounded-full shrink-0" style={{ background: suggestion.color }} />
+              <span className="text-xs text-gray-200 flex-1 min-w-0">
+                <span className="text-gray-400">{suggestion.kind === "task" ? "Task" : "Event"}</span>{" "}
+                <span className="text-gray-100">{suggestion.entityTitle}</span>{" "}
+                <span className="text-gray-500">as</span>{" "}
+                <span style={{ color: suggestion.color }}>{suggestion.labelName}</span>
+              </span>
+              <button onClick={() => applyLabelSuggestion(suggestion)} className="text-[11px] px-2 py-0.5 rounded bg-sky-500/80 hover:bg-sky-500 text-white shrink-0">
+                Apply
+              </button>
+              <button onClick={() => setLabelSuggestions((s) => s.filter((x) => x.key !== suggestion.key))} className="text-gray-500 hover:text-gray-300 shrink-0" title="Dismiss">
+                <X className="size-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -160,4 +225,22 @@ export default function ChatPane() {
       </form>
     </div>
   );
+}
+
+function groupLabelSuggestions(suggestions: AutoLabelSuggestion[]): PendingAutoLabelSuggestion[] {
+  const byKey = new Map<string, PendingAutoLabelSuggestion>();
+  for (const suggestion of suggestions) {
+    const groupKey =
+      suggestion.kind === "event"
+        ? `${suggestion.kind}:${suggestion.entityTitle.toLowerCase()}:${suggestion.labelName.toLowerCase()}`
+        : suggestion.key;
+    const existing = byKey.get(groupKey);
+    if (existing) {
+      existing.entityIds.push(suggestion.entityId);
+    } else {
+      const { entityId: _entityId, key: _key, ...rest } = suggestion;
+      byKey.set(groupKey, { ...rest, key: groupKey, entityIds: [suggestion.entityId] });
+    }
+  }
+  return [...byKey.values()];
 }

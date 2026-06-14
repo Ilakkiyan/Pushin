@@ -132,6 +132,7 @@ export interface AppData {
 
 export interface PlanOutcome {
   createdTaskIds: number[];
+  createdEventIds: number[];
   projectNames: string[];
   createdEventTitles: string[];
   updatedEventTitles: string[];
@@ -265,6 +266,7 @@ export interface LabelInput {
 
 /** Entity kinds a label can be applied to. */
 export type LabelKind = "task" | "event" | "habit" | "page" | "project";
+export type EntityLabelMap = Record<number, Label[]>;
 
 /** A Markdown file found by the vault importer (title + raw markdown). */
 export interface ImportDoc {
@@ -375,6 +377,8 @@ export const api = {
   setEntityLabels: (kind: LabelKind, entityId: number, labelIds: number[]) =>
     invoke<void>("set_entity_labels", { kind, entityId, labelIds }),
   labelsFor: (kind: LabelKind, entityId: number) => invoke<Label[]>("labels_for", { kind, entityId }),
+  labelsForEntities: (kind: LabelKind, ids: number[]) =>
+    invoke<EntityLabelMap>("labels_for_entities", { kind, ids }),
   quickLabel: (name: string, color: string) => invoke<Label[]>("quick_label", { name, color }),
   entitiesForLabel: (labelId: number) => invoke<EntityRef[]>("entities_for_label", { labelId }),
   readMarkdownDir: (path: string) => invoke<ImportDoc[]>("read_markdown_dir", { path }),

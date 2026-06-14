@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import type { Block, CalEvent } from "../lib/ipc";
+import { api, type Block, type CalEvent, type Label } from "../lib/ipc";
 import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
 import ViewToggle from "../components/ViewToggle";
+import CalendarLabelControls from "../components/CalendarLabelControls";
 
 /** An all-day / multi-day event runs midnight→midnight (that's how trips are stored). */
 function isAllDay(e: CalEvent): boolean {
@@ -46,6 +47,8 @@ export default function CalendarPane() {
   const openDaily = useStore((s) => s.openDaily);
   const focusDateIso = useStore((s) => s.focusDateIso);
   const settings = useStore((s) => s.settings);
+  const colorByLabel = useStore((s) => s.calColorByLabel);
+  const labelFilterIds = useStore((s) => s.calLabelFilterIds);
 
   // The user's sleep window + recurring blocked time / routines, drawn as a shaded background so
   // free time reads as actual availability (not just empty space). Purely visual — the scheduler
@@ -61,6 +64,8 @@ export default function CalendarPane() {
   }, [settings]);
 
   const [anchor, setAnchor] = useState(() => startOfWeek(focusDateIso ? parseLocal(focusDateIso) : new Date()));
+  const [taskLabels, setTaskLabels] = useState<Record<number, Label[]>>({});
+  const [eventLabels, setEventLabels] = useState<Record<number, Label[]>>({});
 
   // Month view hands off a day to open to; jump to its week when it changes.
   useEffect(() => {
@@ -81,6 +86,25 @@ export default function CalendarPane() {
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addMinutes(anchor, i * 1440)), [anchor]);
   const taskById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
   const projectById = useMemo(() => new Map(projects.map((p) => [p.id, p])), [projects]);
+  const labelFilterSet = useMemo(() => new Set(labelFilterIds), [labelFilterIds]);
+  const taskIdsWithBlocks = useMemo(() => [...new Set(blocks.map((b) => b.taskId))], [blocks]);
+  const eventIds = useMemo(() => events.map((e) => e.id), [events]);
+
+  useEffect(() => {
+    if (taskIdsWithBlocks.length === 0) {
+      setTaskLabels({});
+      return;
+    }
+    api.labelsForEntities("task", taskIdsWithBlocks).then(setTaskLabels).catch(() => setTaskLabels({}));
+  }, [taskIdsWithBlocks]);
+
+  useEffect(() => {
+    if (eventIds.length === 0) {
+      setEventLabels({});
+      return;
+    }
+    api.labelsForEntities("event", eventIds).then(setEventLabels).catch(() => setEventLabels({}));
+  }, [eventIds]);
 
   // Multi-day / all-day events render as horizontal bars in a row above the time grid
   // (spanning the day columns they cover), clipped to the visible week.
@@ -90,14 +114,15 @@ export default function CalendarPane() {
       Math.round((new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() - new Date(ws.getFullYear(), ws.getMonth(), ws.getDate()).getTime()) / 86400000);
     return events
       .filter(isAllDay)
+      .filter((e) => matchesLabelFilter(eventLabels[e.id], labelFilterSet))
       .map((e) => {
         const startIdx = dayIdx(parseLocal(e.start));
         const lastIdx = dayIdx(addDays(parseLocal(e.end), -1)); // end is exclusive midnight
-        return { e, startIdx, lastIdx, col0: Math.max(0, startIdx), col1: Math.min(6, lastIdx) };
+        return { e, startIdx, lastIdx, col0: Math.max(0, startIdx), col1: Math.min(6, lastIdx), labels: eventLabels[e.id] ?? [] };
       })
       .filter((b) => b.lastIdx >= 0 && b.startIdx <= 6)
       .sort((a, b) => a.startIdx - b.startIdx || parseLocal(a.e.start).getTime() - parseLocal(b.e.start).getTime());
-  }, [events, days]);
+  }, [events, days, eventLabels, labelFilterSet]);
 
   // Drag lifecycle.
   useEffect(() => {
@@ -161,8 +186,9 @@ export default function CalendarPane() {
           {anchor.toLocaleDateString([], { month: "short", day: "numeric" })} –{" "}
           {days[6].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}
         </span>
+        <CalendarLabelControls />
         {/* Legend is nice-to-have; hide it when the pane is too narrow (sidebar + chat aside squeeze it). */}
-        <div className="ml-auto hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
+        <div className="hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
@@ -196,22 +222,12 @@ export default function CalendarPane() {
             all-day
           </div>
           {allDayBars.map((b, i) => (
-            <div
+            <AllDayEventBar
               key={b.e.id}
-              onClick={(e) => e.stopPropagation()}
-              className={clsx(
-                "text-[11px] px-2 py-0.5 truncate border self-center mx-0.5",
-                b.e.kind === "habit" ? "bg-emerald-500/20 border-emerald-400/40 text-emerald-100" : "bg-rose-500/20 border-rose-400/40 text-rose-100",
-                b.startIdx >= 0 ? "rounded-l-md" : "",
-                b.lastIdx <= 6 ? "rounded-r-md" : "",
-              )}
-              style={{ gridColumn: `${b.col0 + 2} / ${b.col1 + 3}`, gridRow: i + 1 }}
-              title={b.e.title}
-            >
-              {b.startIdx < 0 ? "‹ " : ""}
-              {b.e.title}
-              {b.lastIdx > 6 ? " ›" : ""}
-            </div>
+              bar={b}
+              row={i + 1}
+              color={colorByLabel ? primaryLabelColor(b.labels) : null}
+            />
           ))}
         </div>
       )}
@@ -230,8 +246,8 @@ export default function CalendarPane() {
 
           {/* Day columns */}
           {days.map((day) => {
-            const dayEvents = events.filter((e) => !isAllDay(e) && sameDay(parseLocal(e.start), day));
-            const dayBlocks = blocks.filter((b) => sameDay(parseLocal(b.start), day));
+            const dayEvents = events.filter((e) => !isAllDay(e) && sameDay(parseLocal(e.start), day) && matchesLabelFilter(eventLabels[e.id], labelFilterSet));
+            const dayBlocks = blocks.filter((b) => sameDay(parseLocal(b.start), day) && matchesLabelFilter(taskLabels[b.taskId], labelFilterSet));
             return (
               <div
                 key={day.toISOString()}
@@ -263,7 +279,14 @@ export default function CalendarPane() {
 
                 {/* Fixed events */}
                 {dayEvents.map((ev) => (
-                  <EventCard key={`e${ev.id}`} ev={ev} top={top(parseLocal(ev.start))} height={height(minutesBetweenEv(ev))} onDelete={() => deleteEvent(ev.id)} />
+                  <EventCard
+                    key={`e${ev.id}`}
+                    ev={ev}
+                    top={top(parseLocal(ev.start))}
+                    height={height(minutesBetweenEv(ev))}
+                    color={colorByLabel ? primaryLabelColor(eventLabels[ev.id]) : null}
+                    onDelete={() => deleteEvent(ev.id)}
+                  />
                 ))}
 
                 {/* Task blocks */}
@@ -273,6 +296,7 @@ export default function CalendarPane() {
                   const dur = minutesBetweenBlock(b);
                   const isDragging = drag?.blockId === b.id;
                   const dy = isDragging ? (drag!.deltaMin / 60) * PX_PER_HOUR : 0;
+                  const color = (colorByLabel ? primaryLabelColor(taskLabels[b.taskId]) : null) ?? project?.color ?? "#6366f1";
                   return (
                     <div
                       key={`b${b.id}`}
@@ -292,8 +316,8 @@ export default function CalendarPane() {
                       style={{
                         top: top(parseLocal(b.start)) + dy,
                         height: height(dur),
-                        background: (project?.color ?? "#6366f1") + "33",
-                        borderColor: (project?.color ?? "#6366f1") + "aa",
+                        background: color + "33",
+                        borderColor: color + "aa",
                       }}
                       title={t?.title}
                     >
@@ -312,6 +336,38 @@ export default function CalendarPane() {
       </div>
 
       {modal && <AddEventModal start={modal.start} onClose={() => setModal(null)} onSave={(title, end) => { addEvent(title, toLocalIso(modal.start), toLocalIso(end), "fixed"); setModal(null); }} />}
+    </div>
+  );
+}
+
+function primaryLabelColor(labels: Label[] | undefined): string | null {
+  return labels?.[0]?.color ?? null;
+}
+
+function matchesLabelFilter(labels: Label[] | undefined, active: Set<number>): boolean {
+  return active.size === 0 || (labels ?? []).some((label) => active.has(label.id));
+}
+
+function AllDayEventBar({ bar, row, color }: { bar: { e: CalEvent; startIdx: number; lastIdx: number; col0: number; col1: number }; row: number; color: string | null }) {
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      className={clsx(
+        "text-[11px] px-2 py-0.5 truncate border self-center mx-0.5",
+        !color && (bar.e.kind === "habit" ? "bg-emerald-500/20 border-emerald-400/40 text-emerald-100" : "bg-rose-500/20 border-rose-400/40 text-rose-100"),
+        bar.startIdx >= 0 ? "rounded-l-md" : "",
+        bar.lastIdx <= 6 ? "rounded-r-md" : "",
+      )}
+      style={{
+        gridColumn: `${bar.col0 + 2} / ${bar.col1 + 3}`,
+        gridRow: row,
+        ...(color ? { background: color + "33", borderColor: color + "aa", color: "#f9fafb" } : {}),
+      }}
+      title={bar.e.title}
+    >
+      {bar.startIdx < 0 ? "‹ " : ""}
+      {bar.e.title}
+      {bar.lastIdx > 6 ? " ›" : ""}
     </div>
   );
 }
@@ -380,16 +436,16 @@ function minutesBetweenBlock(b: Block) {
   return Math.round((parseLocal(b.end).getTime() - parseLocal(b.start).getTime()) / 60000);
 }
 
-function EventCard({ ev, top, height, onDelete }: { ev: CalEvent; top: number; height: number; onDelete: () => void }) {
+function EventCard({ ev, top, height, color, onDelete }: { ev: CalEvent; top: number; height: number; color: string | null; onDelete: () => void }) {
   const isHabit = ev.kind === "habit";
   return (
     <div
       onClick={(e) => e.stopPropagation()}
       className={clsx(
         "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
-        isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100",
+        !color && (isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100"),
       )}
-      style={{ top, height }}
+      style={{ top, height, ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
       title={ev.title}
     >
       <div className="flex items-center gap-1">

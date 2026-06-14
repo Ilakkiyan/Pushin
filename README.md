@@ -10,6 +10,8 @@ Then keep everything else — notes, ideas, knowledge — in a **Notion‑style 
 
 No cloud. No account. Nothing leaves your machine.
 
+**Docs:** [ilakkiyan.github.io/Pushin](https://ilakkiyan.github.io/Pushin/)
+
 </div>
 
 ---

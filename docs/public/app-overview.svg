@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" role="img" aria-labelledby="title desc">
+  <title id="title">Pushin app overview</title>
+  <desc id="desc">A docs-safe illustration of Pushin showing sidebar navigation, a calendar grid, and an AI planning panel with generic demo data.</desc>
+  <rect width="960" height="600" rx="28" fill="#090b10"/>
+  <rect x="1" y="1" width="958" height="598" rx="27" fill="none" stroke="#2a3040"/>
+  <rect x="0" y="0" width="150" height="600" rx="28" fill="#11141c"/>
+  <rect x="150" y="0" width="560" height="600" fill="#0b0f16"/>
+  <rect x="710" y="0" width="250" height="600" rx="28" fill="#0d1118"/>
+  <circle cx="28" cy="30" r="14" fill="#8b5cf6"/>
+  <text x="49" y="36" fill="#f7f7fb" font-family="Inter, ui-sans-serif, system-ui" font-size="18" font-weight="700">Pushin</text>
+  <text x="24" y="86" fill="#647087" font-family="Inter, ui-sans-serif, system-ui" font-size="11" font-weight="700" letter-spacing="1.6">WORKSPACE</text>
+  <rect x="14" y="102" width="122" height="28" rx="7" fill="#2a2f3a"/>
+  <text x="30" y="121" fill="#ffffff" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Calendar</text>
+  <text x="30" y="158" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Projects</text>
+  <text x="30" y="194" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Habits</text>
+  <text x="24" y="260" fill="#647087" font-family="Inter, ui-sans-serif, system-ui" font-size="11" font-weight="700" letter-spacing="1.6">VAULT</text>
+  <text x="30" y="296" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Notes</text>
+  <text x="30" y="332" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Inbox</text>
+  <rect x="14" y="548" width="122" height="28" rx="7" fill="#03392f" stroke="#10b981"/>
+  <circle cx="28" cy="562" r="4" fill="#10b981"/>
+  <text x="42" y="567" fill="#7ee7c4" font-family="Inter, ui-sans-serif, system-ui" font-size="12">AI ready</text>
+  <rect x="166" y="18" width="84" height="30" rx="8" fill="#242936"/>
+  <text x="188" y="38" fill="#fff" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Week</text>
+  <text x="270" y="38" fill="#98a2b3" font-family="Inter, ui-sans-serif, system-ui" font-size="13">Month</text>
+  <text x="336" y="38" fill="#e5e7eb" font-family="Inter, ui-sans-serif, system-ui" font-size="14">June 8 - June 14, 2026</text>
+  <line x1="166" y1="78" x2="690" y2="78" stroke="#1f2530"/>
+  <g font-family="Inter, ui-sans-serif, system-ui" font-size="12" fill="#98a2b3">
+    <text x="206" y="105">Mon</text><text x="282" y="105">Tue</text><text x="358" y="105">Wed</text><text x="434" y="105">Thu</text><text x="510" y="105">Fri</text><text x="586" y="105">Sat</text><text x="662" y="105">Sun</text>
+  </g>
+  <g stroke="#1a202b">
+    <line x1="180" y1="130" x2="690" y2="130"/><line x1="180" y1="190" x2="690" y2="190"/><line x1="180" y1="250" x2="690" y2="250"/><line x1="180" y1="310" x2="690" y2="310"/><line x1="180" y1="370" x2="690" y2="370"/><line x1="180" y1="430" x2="690" y2="430"/><line x1="180" y1="490" x2="690" y2="490"/>
+    <line x1="242" y1="116" x2="242" y2="540"/><line x1="318" y1="116" x2="318" y2="540"/><line x1="394" y1="116" x2="394" y2="540"/><line x1="470" y1="116" x2="470" y2="540"/><line x1="546" y1="116" x2="546" y2="540"/><line x1="622" y1="116" x2="622" y2="540"/>
+  </g>
+  <rect x="258" y="196" width="126" height="48" rx="8" fill="#6366f133" stroke="#818cf8"/>
+  <text x="270" y="218" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui" font-size="12" font-weight="600">Draft launch notes</text>
+  <text x="270" y="236" fill="#c7d2fe" font-family="Inter, ui-sans-serif, system-ui" font-size="11">10:00 AM</text>
+  <rect x="486" y="258" width="126" height="48" rx="8" fill="#10b98130" stroke="#34d399"/>
+  <text x="498" y="280" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui" font-size="12" font-weight="600">Gym</text>
+  <text x="498" y="298" fill="#bbf7d0" font-family="Inter, ui-sans-serif, system-ui" font-size="11">Health</text>
+  <rect x="724" y="18" width="220" height="168" rx="14" fill="#121722" stroke="#242b3a"/>
+  <text x="744" y="48" fill="#f5d0fe" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="700">Plan with AI</text>
+  <text x="744" y="82" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="12">"Study 3 hours by Friday</text>
+  <text x="744" y="100" fill="#a5adbd" font-family="Inter, ui-sans-serif, system-ui" font-size="12">and add gym tomorrow."</text>
+  <rect x="744" y="122" width="78" height="26" rx="13" fill="#0f3f33" stroke="#10b981"/>
+  <text x="760" y="140" fill="#a7f3d0" font-family="Inter, ui-sans-serif, system-ui" font-size="11">Health</text>
+  <rect x="724" y="210" width="220" height="136" rx="14" fill="#121722" stroke="#242b3a"/>
+  <text x="744" y="240" fill="#e5e7eb" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="700">Tasks</text>
+  <circle cx="748" cy="272" r="6" fill="#6366f1"/>
+  <text x="766" y="277" fill="#d1d5db" font-family="Inter, ui-sans-serif, system-ui" font-size="12">Study exam</text>
+  <circle cx="748" cy="308" r="6" fill="#10b981"/>
+  <text x="766" y="313" fill="#d1d5db" font-family="Inter, ui-sans-serif, system-ui" font-size="12">Gym workout</text>
+</svg>

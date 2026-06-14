@@ -5,7 +5,7 @@ use crate::model::*;
 use crate::scheduler::SchedulePref;
 use anyhow::Result;
 use chrono::NaiveTime;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, Row};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_google.sql");
@@ -1114,6 +1114,37 @@ pub fn labels_for(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec<L
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Labels for many entities of one kind, keyed by entity id. Used by dense calendar views so they
+/// can color/filter without doing one IPC round-trip per event/block.
+pub fn labels_for_entities(conn: &Connection, kind: &str, ids: &[i64]) -> Result<std::collections::BTreeMap<i64, Vec<Label>>> {
+    let mut out: std::collections::BTreeMap<i64, Vec<Label>> = ids.iter().copied().map(|id| (id, Vec::new())).collect();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+
+    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT el.entity_id AS tagged_entity_id, l.*
+         FROM entity_labels el JOIN labels l ON l.id = el.label_id
+         WHERE el.entity_kind = ? AND el.entity_id IN ({placeholders}) AND l.archived = 0
+         ORDER BY el.entity_id, l.group_name IS NULL, lower(l.group_name), lower(l.name)"
+    );
+    let mut values = Vec::with_capacity(ids.len() + 1);
+    values.push(rusqlite::types::Value::Text(kind.to_string()));
+    values.extend(ids.iter().map(|id| rusqlite::types::Value::Integer(*id)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(values), |r| {
+        let entity_id: i64 = r.get("tagged_entity_id")?;
+        Ok((entity_id, row_to_label(r, 0)?))
+    })?;
+    for row in rows {
+        let (entity_id, label) = row?;
+        out.entry(entity_id).or_default().push(label);
+    }
+    Ok(out)
+}
+
 /// Every entity tagged with a label (for the cross-cutting filtered view). Returns (kind, id) refs;
 /// the frontend resolves them to titles from its loaded store.
 pub fn entities_for_label(conn: &Connection, label_id: i64) -> Result<Vec<EntityRef>> {
@@ -1571,6 +1602,24 @@ mod tests {
         let counts: std::collections::HashMap<i64, i64> = list_labels(&conn).unwrap().into_iter().map(|l| (l.id, l.count)).collect();
         assert_eq!(counts[&work], 2);
         assert_eq!(counts[&admin], 1);
+    }
+
+    #[test]
+    fn labels_for_entities_returns_a_batched_map_with_empty_entries() {
+        let conn = mem();
+        let work = create_label(&conn, &label("Work")).unwrap();
+        let deep = create_label(&conn, &label("Deep")).unwrap();
+        let page_only = create_label(&conn, &label("Page")).unwrap();
+
+        set_entity_labels(&conn, "task", 1, &[work, deep]).unwrap();
+        set_entity_labels(&conn, "task", 3, &[work]).unwrap();
+        set_entity_labels(&conn, "page", 1, &[page_only]).unwrap();
+
+        let by_task = labels_for_entities(&conn, "task", &[1, 2, 3]).unwrap();
+        assert_eq!(by_task[&1].iter().map(|l| l.id).collect::<Vec<_>>(), vec![deep, work]);
+        assert!(by_task[&2].is_empty(), "requested but untagged entities get an empty list");
+        assert_eq!(by_task[&3].iter().map(|l| l.id).collect::<Vec<_>>(), vec![work]);
+        assert!(labels_for_entities(&conn, "task", &[]).unwrap().is_empty());
     }
 
     #[test]

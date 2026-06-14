@@ -4,6 +4,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const appWindow = getCurrentWindow();
 
+export function usesNativeTitleBar(): boolean {
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
+  const platform = nav.userAgentData?.platform || navigator.platform || navigator.userAgent;
+  return /Mac/i.test(platform);
+}
+
 /** A slim, frameless custom title bar (the window is `decorations: false`) with our own
  *  minimize/maximize/close + a drag region.
  *
@@ -12,10 +18,12 @@ const appWindow = getCurrentWindow();
  *  are always one hover away (never trapped). When the window is a normal floating size the bar is
  *  shown inline (you need it there to drag the window). F11 toggles fullscreen; Esc exits it. */
 export default function TitleBar() {
+  const nativeTitleBar = usesNativeTitleBar();
   const [maximized, setMaximized] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
 
   useEffect(() => {
+    if (nativeTitleBar) return;
     let unlisten: (() => void) | undefined;
     const sync = async () => {
       setMaximized(await appWindow.isMaximized());
@@ -40,7 +48,9 @@ export default function TitleBar() {
       unlisten?.();
       window.removeEventListener("keydown", onKey);
     };
-  }, []);
+  }, [nativeTitleBar]);
+
+  if (nativeTitleBar) return null;
 
   const btn = "h-full px-3.5 grid place-items-center text-gray-400 hover:bg-white/10 hover:text-white transition";
 

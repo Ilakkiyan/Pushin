@@ -1052,6 +1052,13 @@ pub fn labels_for(state: State<AppState>, kind: String, entity_id: i64) -> Resul
     db::labels_for(&conn, &kind, entity_id).map_err(err)
 }
 
+/// Labels for many entities of one kind in a single call, keyed by entity id.
+#[tauri::command]
+pub fn labels_for_entities(state: State<AppState>, kind: String, ids: Vec<i64>) -> Result<std::collections::BTreeMap<i64, Vec<Label>>, String> {
+    let conn = state.db.lock().unwrap();
+    db::labels_for_entities(&conn, &kind, &ids).map_err(err)
+}
+
 /// Quick "create on the fly" from the picker — find-or-create by name; returns the refreshed list.
 #[tauri::command]
 pub fn quick_label(state: State<AppState>, name: String, color: String) -> Result<Vec<Label>, String> {

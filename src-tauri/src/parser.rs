@@ -147,6 +147,7 @@ pub struct ParsedPlan {
 #[serde(rename_all = "camelCase")]
 pub struct PlanOutcome {
     pub created_task_ids: Vec<i64>,
+    pub created_event_ids: Vec<i64>,
     pub project_names: Vec<String>,
     pub created_event_titles: Vec<String>,
     pub updated_event_titles: Vec<String>,
@@ -2715,6 +2716,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
     // instead of making a duplicate. This converges to one event per title and makes
     // edits work however the model routes them.
     let mut current = crate::db::list_events(conn)?;
+    let mut created_event_ids = Vec::new();
     let mut created_event_titles = Vec::new();
     for ev in &plan.events {
         // Guardrail: never persist a blank or placeholder-titled event ("<NAME>", "", "event"),
@@ -2744,6 +2746,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             for (start, end) in days {
                 let (s, e) = (fmt_dt(start), fmt_dt(end));
                 let id = crate::db::insert_event(conn, &ev.title, &s, &e, "fixed")?;
+                created_event_ids.push(id);
                 current.push(Event {
                     id,
                     title: ev.title.clone(),
@@ -2765,6 +2768,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             Some((start, end)) => {
                 let (s, e) = (fmt_dt(start), fmt_dt(end));
                 let id = crate::db::insert_event(conn, &ev.title, &s, &e, "fixed")?;
+                created_event_ids.push(id);
                 created_event_titles.push(ev.title.clone());
                 current.push(Event {
                     id,
@@ -2795,6 +2799,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
 
     Ok(PlanOutcome {
         created_task_ids,
+        created_event_ids,
         project_names,
         created_event_titles,
         updated_event_titles,
@@ -2823,6 +2828,20 @@ mod tests {
 
     fn d() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
+    }
+
+    #[test]
+    fn store_plan_reports_created_event_ids() {
+        let conn = crate::db::test_conn();
+        let mut event = ev("today", Some("10:00"), Some("10:30"));
+        event.title = "Team standup".into();
+        let plan = ParsedPlan { events: vec![event], ..Default::default() };
+
+        let outcome = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let events = crate::db::list_events(&conn).unwrap();
+
+        assert_eq!(outcome.created_event_titles, vec!["Team standup"]);
+        assert_eq!(outcome.created_event_ids, vec![events[0].id]);
     }
 
     #[test]
