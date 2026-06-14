@@ -122,6 +122,34 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
     db::save_settings(&conn, &settings).map_err(err)
 }
 
+/// Pick the saved notes worth injecting into the planner prompt: only when *semantic* recall ran
+/// (embed server up), only strong matches (cosine ≥ 0.35), at most 2, each truncated. Small models
+/// are prompt-sensitive (gotcha #1), so a weak/keyword/empty recall contributes nothing. Pure.
+fn gate_recalled_memory(result: &RecallResult) -> Vec<String> {
+    if result.mode != "semantic" {
+        return Vec::new();
+    }
+    result
+        .notes
+        .iter()
+        .filter(|n| n.score.unwrap_or(0.0) >= 0.35)
+        .take(2)
+        .map(|n| n.content.trim().chars().take(220).collect::<String>())
+        .collect()
+}
+
+/// Map a model's 1-based citation indices to page ids, dropping out-of-range ones, sorted + deduped.
+/// `note_ids` is the recalled notes in the order they were numbered in the prompt. Pure.
+fn map_citation_indices(sources: &[i64], note_ids: &[i64]) -> Vec<i64> {
+    let mut citations: Vec<i64> = sources
+        .iter()
+        .filter_map(|&n| note_ids.get((n - 1) as usize).copied())
+        .collect();
+    citations.sort_unstable();
+    citations.dedup();
+    citations
+}
+
 // ---------- AI planning ----------
 
 #[tauri::command]
@@ -134,18 +162,11 @@ pub async fn plan_tasks(
         let conn = state.db.lock().unwrap();
         (db::get_settings(&conn).map_err(err)?, db::list_events(&conn).map_err(err)?)
     };
-    // Auto-recall relevant saved notes to inform planning. Best-effort and conservative: only inject
-    // when *semantic* recall ran (embed server up) and the match is strong, capped + truncated — small
-    // models are prompt-sensitive (gotcha #1), so a weak/empty recall changes the prompt by nothing.
+    // Auto-recall relevant saved notes to inform planning. Best-effort and conservative — see
+    // `gate_recalled_memory` (semantic-only, strong-match, capped + truncated).
     let recalled: Vec<String> = match recall_notes(&state, &text, 3).await {
-        Ok(r) if r.mode == "semantic" => r
-            .notes
-            .into_iter()
-            .filter(|n| n.score.unwrap_or(0.0) >= 0.35)
-            .take(2)
-            .map(|n| n.content.trim().chars().take(220).collect::<String>())
-            .collect(),
-        _ => Vec::new(),
+        Ok(r) => gate_recalled_memory(&r),
+        Err(_) => Vec::new(),
     };
     // Network call — no DB lock held here.
     let parsed = parser::plan(&state.http, &settings, &current_events, &history.unwrap_or_default(), &text, &recalled)
@@ -1033,18 +1054,8 @@ numbers of the notes you actually used.\n\nNotes:\n{context}"
         .await
         .map_err(err)?;
     let answer = raw["answer"].as_str().unwrap_or("").trim().to_string();
-    // Map 1-based note indices → page ids (dedup, ignore out-of-range).
-    let mut citations: Vec<i64> = raw["sources"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_i64())
-                .filter_map(|n| ids.get((n - 1) as usize).copied())
-                .collect()
-        })
-        .unwrap_or_default();
-    citations.sort_unstable();
-    citations.dedup();
+    let sources: Vec<i64> = raw["sources"].as_array().map(|a| a.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
+    let citations = map_citation_indices(&sources, &ids);
     Ok(VaultAnswer { answer, citations })
 }
 
@@ -1081,4 +1092,55 @@ pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Re
         }
     }
     Err("Memory engine is taking a while to start — give it a moment.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(id: i64, content: &str, score: Option<f32>) -> Note {
+        Note {
+            id,
+            content: content.into(),
+            created_at: "2026-01-01T00:00:00".into(),
+            updated_at: "2026-01-01T00:00:00".into(),
+            indexed: score.is_some(),
+            score,
+        }
+    }
+
+    #[test]
+    fn gate_memory_only_injects_strong_semantic_matches_capped() {
+        // Keyword mode → nothing, even with high scores.
+        let kw = RecallResult { mode: "keyword".into(), notes: vec![note(1, "a", Some(0.9))] };
+        assert!(gate_recalled_memory(&kw).is_empty());
+
+        // Semantic: drop sub-threshold, cap at 2, keep order.
+        let sem = RecallResult {
+            mode: "semantic".into(),
+            notes: vec![
+                note(1, "strong one", Some(0.80)),
+                note(2, "weak", Some(0.20)),
+                note(3, "strong two", Some(0.50)),
+                note(4, "strong three", Some(0.45)),
+            ],
+        };
+        let got = gate_recalled_memory(&sem);
+        assert_eq!(got, vec!["strong one".to_string(), "strong two".to_string()]);
+    }
+
+    #[test]
+    fn gate_memory_truncates_long_notes() {
+        let long = "x".repeat(500);
+        let sem = RecallResult { mode: "semantic".into(), notes: vec![note(1, &long, Some(0.9))] };
+        assert_eq!(gate_recalled_memory(&sem)[0].chars().count(), 220);
+    }
+
+    #[test]
+    fn citation_indices_map_dedup_and_drop_out_of_range() {
+        let ids = vec![10, 20, 30];
+        // 1-based: 1→10, 3→30; duplicate 1 collapses; 0 and 9 are out of range.
+        assert_eq!(map_citation_indices(&[1, 3, 1, 0, 9], &ids), vec![10, 30]);
+        assert!(map_citation_indices(&[], &ids).is_empty());
+    }
 }

@@ -31,6 +31,29 @@ const SCOPE: &str = "https://www.googleapis.com/auth/calendar openid email";
 const API: &str = "https://www.googleapis.com/calendar/v3";
 const PUSHIN_KEY: &str = "pushinKind"; // extendedProperties.private marker on our block events
 
+/// The Calendar API base + token endpoint, overridable in tests so httpmock can stand in for Google.
+/// Zero overhead in release (the `#[cfg(test)]` block is compiled out — it's just the const).
+#[cfg(test)]
+mod test_override {
+    use std::sync::Mutex;
+    pub static API: Mutex<Option<String>> = Mutex::new(None);
+    pub static TOKEN: Mutex<Option<String>> = Mutex::new(None);
+}
+fn api_base() -> String {
+    #[cfg(test)]
+    if let Some(b) = test_override::API.lock().unwrap().clone() {
+        return b;
+    }
+    API.to_string()
+}
+fn token_url() -> String {
+    #[cfg(test)]
+    if let Some(b) = test_override::TOKEN.lock().unwrap().clone() {
+        return b;
+    }
+    TOKEN_URL.to_string()
+}
+
 // ---------------- OAuth (PKCE loopback) ----------------
 
 fn b64url(bytes: &[u8]) -> String {
@@ -176,7 +199,7 @@ async fn await_code(listener: TcpListener) -> Result<String> {
 
 async fn refresh_access(http: &reqwest::Client, client_id: &str, client_secret: &str, refresh_token: &str) -> Result<(String, String)> {
     let resp: Value = http
-        .post(TOKEN_URL)
+        .post(token_url())
         .form(&[
             ("client_id", client_id),
             ("client_secret", client_secret),
@@ -203,6 +226,7 @@ fn token_expired(expiry_iso: &Option<String>) -> bool {
 
 // ---------------- Calendar API ----------------
 
+#[derive(Debug)]
 struct GEvent {
     id: String,
     summary: String,
@@ -252,6 +276,7 @@ async fn list_events(
     time_max: &str,
     sync_token: Option<&str>,
 ) -> Result<(Vec<GEvent>, Option<String>)> {
+    let base = api_base();
     let mut all = Vec::new();
     let mut page: Option<String> = None;
     let mut next_sync: Option<String> = None;
@@ -271,7 +296,7 @@ async fn list_events(
         if let Some(p) = &page {
             q.push(("pageToken".into(), p.clone()));
         }
-        let url = reqwest::Url::parse_with_params(&format!("{API}/calendars/{cal_id}/events"), &q)?;
+        let url = reqwest::Url::parse_with_params(&format!("{base}/calendars/{cal_id}/events"), &q)?;
         let resp = http.get(url).bearer_auth(access).send().await?;
         if resp.status().as_u16() == 410 {
             bail!("SYNC_TOKEN_EXPIRED");
@@ -303,7 +328,7 @@ async fn list_events(
 
 async fn insert_event(http: &reqwest::Client, access: &str, cal_id: &str, title: &str, start: &str, end: &str, kind: Option<&str>) -> Result<(String, Option<String>)> {
     let v: Value = http
-        .post(format!("{API}/calendars/{cal_id}/events"))
+        .post(format!("{}/calendars/{cal_id}/events", api_base()))
         .bearer_auth(access)
         .json(&event_body(title, start, end, kind))
         .send()
@@ -316,7 +341,7 @@ async fn insert_event(http: &reqwest::Client, access: &str, cal_id: &str, title:
 
 async fn patch_event(http: &reqwest::Client, access: &str, cal_id: &str, ext_id: &str, title: &str, start: &str, end: &str) -> Result<Option<String>> {
     let resp = http
-        .patch(format!("{API}/calendars/{cal_id}/events/{ext_id}"))
+        .patch(format!("{}/calendars/{cal_id}/events/{ext_id}", api_base()))
         .bearer_auth(access)
         .json(&event_body(title, start, end, None))
         .send()
@@ -330,7 +355,7 @@ async fn patch_event(http: &reqwest::Client, access: &str, cal_id: &str, ext_id:
 }
 
 async fn delete_event(http: &reqwest::Client, access: &str, cal_id: &str, ext_id: &str) -> Result<()> {
-    let resp = http.delete(format!("{API}/calendars/{cal_id}/events/{ext_id}")).bearer_auth(access).send().await?;
+    let resp = http.delete(format!("{}/calendars/{cal_id}/events/{ext_id}", api_base())).bearer_auth(access).send().await?;
     let code = resp.status().as_u16();
     if !resp.status().is_success() && code != 404 && code != 410 {
         bail!("Google delete failed ({code})");
@@ -459,4 +484,94 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
     }
 
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_s256_matches_rfc7636_vector() {
+        // RFC 7636 Appendix B: verifier → S256 challenge = base64url(sha256(verifier)), no padding.
+        let v = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(pkce_challenge(v), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn pkce_verifier_is_url_safe_long_and_random() {
+        let v = pkce_verifier();
+        assert!(v.len() >= 43, "RFC 7636 requires 43..128 chars");
+        assert!(v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'), "url-safe, unpadded");
+        assert_ne!(pkce_verifier(), pkce_verifier(), "fresh randomness each call");
+    }
+
+    // One serial test owns the global API/TOKEN override and drives the Calendar leaf functions
+    // against a mocked Google API — covering token refresh, incremental pull + 410 fallback, and the
+    // push verbs. (The full `sync()` orchestrator additionally needs a seeded account/token in the DB
+    // + keychain; that end-to-end test is a documented follow-up.)
+    #[tokio::test]
+    async fn calendar_api_against_mocked_google() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        *test_override::API.lock().unwrap() = Some(server.base_url());
+        *test_override::TOKEN.lock().unwrap() = Some(format!("{}/token", server.base_url()));
+        let http = reqwest::Client::new();
+
+        // --- token refresh ---
+        server.mock(|w, t| {
+            w.method(POST).path("/token");
+            t.status(200).json_body(serde_json::json!({ "access_token": "acc", "expires_in": 3600 }));
+        });
+        let (acc, _expiry) = refresh_access(&http, "id", "sec", "refresh").await.unwrap();
+        assert_eq!(acc, "acc");
+
+        // --- incremental pull: parses items + nextSyncToken ---
+        server.mock(|w, t| {
+            w.method(GET).path("/calendars/primary/events").query_param_exists("timeMin");
+            t.status(200).json_body(serde_json::json!({
+                "items": [ { "id": "e1", "summary": "Lunch", "status": "confirmed",
+                             "start": { "dateTime": "2026-06-14T12:00:00Z" }, "end": { "dateTime": "2026-06-14T13:00:00Z" } } ],
+                "nextSyncToken": "tok123"
+            }));
+        });
+        let (evs, next) = list_events(&http, "acc", "primary", "2026-06-01T00:00:00Z", "2026-07-01T00:00:00Z", None).await.unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].summary, "Lunch");
+        assert_eq!(next.as_deref(), Some("tok123"));
+
+        // --- 410 on a stale sync token → SYNC_TOKEN_EXPIRED (drives the full-window refetch) ---
+        let stale = server.mock(|w, t| {
+            w.method(GET).path("/calendars/primary/events").query_param("syncToken", "stale");
+            t.status(410);
+        });
+        let err = list_events(&http, "acc", "primary", "x", "y", Some("stale")).await.unwrap_err();
+        assert!(err.to_string().contains("SYNC_TOKEN_EXPIRED"));
+        stale.assert();
+
+        // --- push: insert returns (id, etag) ---
+        server.mock(|w, t| {
+            w.method(POST).path("/calendars/primary/events");
+            t.status(200).json_body(serde_json::json!({ "id": "new1", "etag": "\"abc\"" }));
+        });
+        let (id, etag) = insert_event(&http, "acc", "primary", "Block", "2026-06-14T09:00:00", "2026-06-14T10:00:00", Some("block")).await.unwrap();
+        assert_eq!(id, "new1");
+        assert_eq!(etag.as_deref(), Some("\"abc\""));
+
+        // --- patch tolerates a vanished event (404 → None) ---
+        server.mock(|w, t| {
+            w.method(httpmock::Method::PATCH).path("/calendars/primary/events/gone");
+            t.status(404);
+        });
+        assert!(patch_event(&http, "acc", "primary", "gone", "T", "s", "e").await.unwrap().is_none());
+
+        // --- delete tolerates 404/410 ---
+        server.mock(|w, t| {
+            w.method(DELETE).path("/calendars/primary/events/x");
+            t.status(404);
+        });
+        assert!(delete_event(&http, "acc", "primary", "x").await.is_ok());
+
+        *test_override::API.lock().unwrap() = None;
+        *test_override::TOKEN.lock().unwrap() = None;
+    }
 }

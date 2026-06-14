@@ -110,3 +110,79 @@ fn parse_json_lenient(s: &str) -> Result<Value> {
     }
     Err(anyhow!("the AI returned a malformed plan — try rephrasing, or use the larger model. (got: {})", truncate(s, 160)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+
+    #[test]
+    fn parse_json_lenient_handles_clean_fenced_and_wrapped() {
+        assert_eq!(parse_json_lenient("{\"a\":1}").unwrap()["a"], 1);
+        assert_eq!(parse_json_lenient("```json\n{\"a\":2}\n```").unwrap()["a"], 2);
+        assert_eq!(parse_json_lenient("sure, here: {\"a\":3} hope that helps").unwrap()["a"], 3);
+        assert!(parse_json_lenient("not json at all").is_err());
+    }
+
+    #[test]
+    fn truncate_caps_by_chars_with_ellipsis() {
+        assert_eq!(truncate("  hi  ", 10), "hi");
+        let t = truncate(&"x".repeat(50), 10);
+        assert!(t.ends_with('…') && t.chars().count() == 11);
+    }
+
+    fn completion(content: &str) -> serde_json::Value {
+        json!({ "choices": [ { "message": { "content": content } } ] })
+    }
+
+    #[tokio::test]
+    async fn chat_json_returns_parsed_content() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(completion("{\"ok\":true}"));
+        });
+        let v = chat_json(&reqwest::Client::new(), &server.base_url(), "m", json!([]), json!({})).await.unwrap();
+        assert_eq!(v["ok"], true);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn chat_json_retries_once_on_bad_json_then_succeeds() {
+        let server = MockServer::start_async().await;
+        // Both attempts hit the same path; first returns garbage, second returns valid JSON.
+        let _bad = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").json_body_partial(r#"{"temperature":0.0}"#);
+            then.status(200).json_body(completion("totally not json"));
+        });
+        let good = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").json_body_partial(r#"{"temperature":0.4}"#);
+            then.status(200).json_body(completion("{\"recovered\":1}"));
+        });
+        let v = chat_json(&reqwest::Client::new(), &server.base_url(), "m", json!([]), json!({})).await.unwrap();
+        assert_eq!(v["recovered"], 1);
+        good.assert();
+    }
+
+    #[tokio::test]
+    async fn chat_json_surfaces_http_errors() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(500).body("boom");
+        });
+        assert!(chat_json(&reqwest::Client::new(), &server.base_url(), "m", json!([]), json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn health_true_on_200_false_when_unreachable() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(GET).path("/health");
+            then.status(200).body("ok");
+        });
+        assert!(health(&reqwest::Client::new(), &server.base_url()).await);
+        // A port with nothing listening → unreachable → false.
+        assert!(!health(&reqwest::Client::new(), "http://127.0.0.1:1").await);
+    }
+}

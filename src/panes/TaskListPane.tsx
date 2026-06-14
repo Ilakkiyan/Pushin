@@ -24,6 +24,7 @@ function TaskRow({ task }: { task: Task }) {
   return (
     <div className="group flex items-center gap-2 px-3 py-2 hover:bg-white/[0.03] rounded-lg">
       <button
+        aria-label={done ? "Mark not done" : "Mark done"}
         onClick={() => setTaskStatus(task.id, done ? "todo" : "done")}
         className={clsx(
           "size-4 shrink-0 rounded border grid place-items-center",
@@ -53,6 +54,7 @@ function TaskRow({ task }: { task: Task }) {
         <NotebookPen className="size-3.5" />
       </button>
       <button
+        aria-label="Delete task"
         onClick={() => deleteTask(task.id)}
         className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-rose-400 shrink-0"
       >

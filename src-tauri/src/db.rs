@@ -1042,15 +1042,21 @@ pub fn page_graph(conn: &Connection) -> Result<PageGraph> {
     Ok(PageGraph { nodes, edges })
 }
 
+/// A fresh in-memory, fully-migrated connection for tests across the crate (booking, commands, …).
+#[cfg(test)]
+pub(crate) fn test_conn() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    migrate(&conn).unwrap();
+    conn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mem() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        migrate(&conn).unwrap();
-        conn
+        super::test_conn()
     }
 
     #[test]

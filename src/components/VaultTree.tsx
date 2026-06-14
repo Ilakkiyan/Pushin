@@ -6,6 +6,18 @@ import { parseLocal } from "../lib/time";
 import { importMarkdownFolder } from "../lib/import";
 import type { Page } from "../lib/ipc";
 
+/** True if `ancestorId` sits somewhere above `nodeId` in the tree — the drag-reparent cycle guard
+ *  (you can't drop a page into its own subtree). Pure + exported for unit testing. */
+export function isAncestor(pages: Page[], ancestorId: number, nodeId: number): boolean {
+  let cur = pages.find((p) => p.id === nodeId);
+  while (cur?.parentId != null) {
+    if (cur.parentId === ancestorId) return true;
+    const parentId: number = cur.parentId;
+    cur = pages.find((p) => p.id === parentId);
+  }
+  return false;
+}
+
 // Build a parentId → children map once per render so the tree is O(n).
 function childrenOf(pages: Page[]): Map<number | null, Page[]> {
   const map = new Map<number | null, Page[]>();
@@ -31,23 +43,12 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
   const kids = byParent.get(page.id) ?? [];
   const active = currentPageId === page.id;
 
-  // True if `ancestorId` is somewhere above `nodeId` in the tree — used to reject a drop that would
-  // move a page into its own subtree (which would create a cycle / orphan the branch).
-  const isAncestor = (ancestorId: number, nodeId: number): boolean => {
-    let cur = pages.find((p) => p.id === nodeId);
-    while (cur?.parentId != null) {
-      if (cur.parentId === ancestorId) return true;
-      cur = pages.find((p) => p.id === cur!.parentId);
-    }
-    return false;
-  };
-
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDropHover(false);
     const src = Number(e.dataTransfer.getData("text/page"));
-    if (src && src !== page.id && !isAncestor(src, page.id)) {
+    if (src && src !== page.id && !isAncestor(pages, src, page.id)) {
       movePage(src, page.id, 0);
       setExpanded(true);
     }

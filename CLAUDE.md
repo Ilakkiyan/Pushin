@@ -236,6 +236,28 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 
 ---
 
+## Test suite (layered; `.github/workflows/test.yml` runs it on push/PR)
+- **Rust unit + integration** (`cargo test --lib`, 126 tests): pure logic across `scheduler`/`parser`/
+  `habits`/`db`/`hermes`/`booking`/`model_manager`/`commands`, plus **httpmock** integration for
+  `llm::chat_json` (retry/error), `hermes::embed_text`, and `google.rs` (PKCE + the Calendar leaf
+  fns — token refresh, incremental pull + **410 fallback**, push verbs — via a `#[cfg(test)]`
+  `api_base()`/`token_url()` override seam). `secrets.rs` uses a `#[cfg(test)]` in-memory store seam
+  (`test_store`) for roundtrip tests. In-memory DB via `db::test_conn()`. `httpmock`+`tempfile` dev-deps.
+  **Deferred:** the full `sync()` orchestrator end-to-end (needs a seeded account/token in DB+keychain).
+- **Frontend unit + component** (`npm test` → Vitest + Testing-Library + jsdom, 64 tests):
+  `vitest.config.ts` + `vitest.setup.ts` (mocks `@tauri-apps/api/window` + `plugin-dialog`). Covers
+  pure utils (`time`/`blocks`/`import`), the Zustand store (mocked ipc), an **IPC contract test**
+  (`ipcContract.test.ts` — parses `lib.rs` `generate_handler![]` vs `ipc.ts` `invoke<>` names so a
+  renamed/removed command fails CI), and components (`TitleBar`, `QuickCapture`, `Sidebar`,
+  `CommandPalette`, `InboxPane`). Test files are colocated `*.test.ts(x)` and **excluded from the
+  app `tsconfig`** so `npm run build` doesn't compile them.
+- **Mocked-IPC E2E** (`npm run test:e2e` → Playwright): drives the real React app on the Vite dev
+  server with a faked `window.__TAURI_INTERNALS__.invoke` (`tests/e2e/_mockBridge.ts`, an in-memory
+  fake backend) — boot/nav, vault create, quick-capture→Inbox, Cmd-K + ask-your-vault. **CI-only**:
+  Playwright has no browser build for this WSL sandbox's OS, so it runs on `ubuntu-latest`.
+- **Live model eval** (`tests/llm_eval.rs`, `--ignored`): the parser-quality battery; needs a running
+  `:8080`, stays out of CI (manual gate). Baseline ~90% of checks, judge per-category (gotcha #1).
+
 ## Build / run / test (macOS, IMPORTANT specifics)
 - **`rustc`/`cargo` are NOT on the default PATH.** Prefix with `export PATH="$HOME/.cargo/bin:$PATH"`.
 - **The Bash cwd resets to the project root between calls.** Use absolute paths or `--manifest-path`.

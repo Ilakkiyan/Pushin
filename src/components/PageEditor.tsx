@@ -32,6 +32,10 @@ export default function PageEditor({ page }: { page: Page }) {
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirty = useRef(false);
+  // Mirror the latest title into a ref so the debounced save (whose closure was captured a keystroke
+  // earlier) reads the current value rather than dropping the last character typed before a pause.
+  const titleRef = useRef(title);
+  titleRef.current = title;
 
   const refreshBacklinks = () => {
     api.pageBacklinks(page.id).then(setBacklinks).catch(() => {});
@@ -54,7 +58,7 @@ export default function PageEditor({ page }: { page: Page }) {
   const persist = async () => {
     const blocks = editor.document;
     const text = blocksToPlainText(blocks);
-    const finalTitle = title.trim() || text.split("\n")[0]?.slice(0, 80) || "Untitled";
+    const finalTitle = titleRef.current.trim() || text.split("\n")[0]?.slice(0, 80) || "Untitled";
     await savePage(page.id, finalTitle, page.icon ?? null, text, JSON.stringify(blocks), extractLinkTitles(blocks));
     dirty.current = false;
   };

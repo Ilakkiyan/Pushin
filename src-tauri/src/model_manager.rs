@@ -491,6 +491,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn port_from_url_parses_or_defaults() {
+        assert_eq!(port_from_url("http://127.0.0.1:8080"), 8080);
+        assert_eq!(port_from_url("http://127.0.0.1:11434/"), 11434);
+        assert_eq!(port_from_url("http://localhost"), 8080); // no port → default chat port
+        assert_eq!(port_from_url("garbage"), 8080);
+    }
+
+    #[test]
+    fn embed_base_url_uses_the_embed_port() {
+        assert_eq!(embed_base_url(), format!("http://127.0.0.1:{EMBED_PORT}"));
+        assert_eq!(port_from_url(&embed_base_url()), EMBED_PORT);
+    }
+
+    #[test]
+    fn model_info_known_and_unknown() {
+        // Every model in the catalog resolves; a bogus id does not.
+        assert!(!MODELS.is_empty());
+        for m in MODELS {
+            assert_eq!(model_info(m.id).map(|i| i.id), Some(m.id));
+        }
+        assert!(model_info("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn platform_has_an_engine_asset_candidate() {
+        // The CI build runs on a supported OS/arch, so there must be a candidate list for it.
+        assert!(platform_asset_candidates().is_some(), "this platform should have llama.cpp asset substrings");
+    }
+
+    #[test]
     fn sha256_gate_accepts_match_and_rejects_everything_else() {
         // sha256("hello world")
         let good = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";

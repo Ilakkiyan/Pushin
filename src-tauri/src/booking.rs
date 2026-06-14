@@ -58,3 +58,53 @@ pub fn available_slots(
     }
     Ok(slots)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::parse_dt;
+
+    fn et(dur: i64, buf: i64) -> EventType {
+        EventType { id: 1, name: "Call".into(), duration_minutes: dur, buffer_minutes: buf, color: "#000".into() }
+    }
+
+    #[test]
+    fn slots_have_the_event_duration_and_dont_overlap_each_other() {
+        let conn = db::test_conn();
+        let slots = available_slots(&conn, &Settings::default(), &et(30, 0), 7).unwrap();
+        assert!(!slots.is_empty(), "an empty calendar yields bookable slots");
+        for s in &slots {
+            let (start, end) = (parse_dt(&s.start).unwrap(), parse_dt(&s.end).unwrap());
+            assert_eq!((end - start).num_minutes(), 30, "each slot is exactly the event duration");
+        }
+        // Sorted and non-overlapping (each starts no earlier than the previous ends).
+        for w in slots.windows(2) {
+            assert!(parse_dt(&w[1].start).unwrap() >= parse_dt(&w[0].end).unwrap());
+        }
+    }
+
+    #[test]
+    fn slots_avoid_busy_events() {
+        let conn = db::test_conn();
+        // Block out a wide window tomorrow during typical working hours.
+        let tomorrow = (Local::now().naive_local().date() + chrono::Duration::days(1)).format("%Y-%m-%d");
+        let busy_start = format!("{tomorrow}T09:00:00");
+        let busy_end = format!("{tomorrow}T17:00:00");
+        db::insert_event(&conn, "All-day workshop", &busy_start, &busy_end, "fixed").unwrap();
+
+        let slots = available_slots(&conn, &Settings::default(), &et(30, 0), 3).unwrap();
+        let (bs, be) = (parse_dt(&busy_start).unwrap(), parse_dt(&busy_end).unwrap());
+        for s in &slots {
+            let (start, end) = (parse_dt(&s.start).unwrap(), parse_dt(&s.end).unwrap());
+            assert!(end <= bs || start >= be, "slot {start}–{end} must not overlap the busy window");
+        }
+    }
+
+    #[test]
+    fn longer_horizon_offers_at_least_as_many_slots() {
+        let conn = db::test_conn();
+        let few = available_slots(&conn, &Settings::default(), &et(60, 0), 2).unwrap();
+        let many = available_slots(&conn, &Settings::default(), &et(60, 0), 7).unwrap();
+        assert!(many.len() >= few.len());
+    }
+}

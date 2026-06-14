@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.2.1"
+version = "0.2.2"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"
@@ -55,6 +55,9 @@ tokio = { version = "1", features = ["time"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { version = "0.4" }
+# Integration tests mock the OpenAI-compatible inference/embeddings servers + the Google Calendar API.
+httpmock = "0.7"
+tempfile = "3"
 
 # Fine-tuning data generator (Stage 1–4 of finetune/PLAN.md). An *example*, not a bin, so it links
 # the lib and reuses dev-dependencies (full tokio + reqwest) without bloating the shipped app's deps.

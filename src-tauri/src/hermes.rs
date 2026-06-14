@@ -266,4 +266,29 @@ mod tests {
         let (_, ranked) = rank_notes(vec![], Some(&[1.0f32]), "q", 5);
         assert!(ranked.is_empty());
     }
+
+    // ---- embed_text against a mocked OpenAI-compatible embeddings server ----
+    use httpmock::prelude::*;
+
+    #[tokio::test]
+    async fn embed_text_parses_the_vector() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            then.status(200).json_body(json!({ "data": [ { "embedding": [0.1, 0.2, 0.3] } ] }));
+        });
+        let v = embed_text(&reqwest::Client::new(), &server.base_url(), "bge", "hello").await.unwrap();
+        assert_eq!(v.len(), 3);
+        assert!((v[1] - 0.2).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn embed_text_errors_when_no_embedding_field() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/embeddings");
+            then.status(200).json_body(json!({ "data": [] })); // model isn't embeddings-capable
+        });
+        assert!(embed_text(&reqwest::Client::new(), &server.base_url(), "chat", "x").await.is_err());
+    }
 }

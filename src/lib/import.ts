@@ -8,7 +8,7 @@ import { schema } from "./editorSchema";
 import { blocksToPlainText } from "./blocks";
 
 /** Distinct `[[target]]` titles in raw markdown, stripping Obsidian `|alias` and `#heading` parts. */
-function wikilinkTitles(md: string): string[] {
+export function wikilinkTitles(md: string): string[] {
   const out = new Set<string>();
   for (const m of md.matchAll(/\[\[([^\]\n]+)\]\]/g)) {
     const t = m[1].split("|")[0].split("#")[0].trim();
