@@ -182,6 +182,102 @@ pub struct Note {
     pub score: Option<f32>,
 }
 
+/// One attendee in a meeting brief: the person plus a quick relationship summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttendeeBrief {
+    pub person: Person,
+    pub total_meetings: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_met: Option<String>,
+}
+
+/// The Meeting Companion's pre-meeting brief: the event, who's attending (with history), and any
+/// notes linked to it. Assembled deterministically from bookings + people + entity links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingBrief {
+    pub event: Event,
+    pub attendees: Vec<AttendeeBrief>,
+    pub linked_pages: Vec<Page>,
+}
+
+/// A focus session on a task (time-tracking). `end` is None while running; `minutes` is the elapsed
+/// time (0 while running, derived on read).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusSession {
+    pub id: i64,
+    pub task_id: i64,
+    pub start: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    pub minutes: i64,
+}
+
+/// A person in the relationship layer (private CRM). Auto-created from booking invitees (and later
+/// event attendees / `[[mentions]]`); recalled as `EntityKind::Person`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Person {
+    pub id: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub notes: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The kind of entity an index/recall row refers to. The Context Engine treats tasks, events,
+/// pages (and later people/goals) uniformly; this discriminates the polymorphic `entity_index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityKind {
+    Task,
+    Event,
+    Page,
+    Person,
+    Goal,
+}
+
+impl EntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntityKind::Task => "task",
+            EntityKind::Event => "event",
+            EntityKind::Page => "page",
+            EntityKind::Person => "person",
+            EntityKind::Goal => "goal",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<EntityKind> {
+        match s {
+            "task" => Some(EntityKind::Task),
+            "event" => Some(EntityKind::Event),
+            "page" => Some(EntityKind::Page),
+            "person" => Some(EntityKind::Person),
+            "goal" => Some(EntityKind::Goal),
+            _ => None,
+        }
+    }
+}
+
+/// The common currency of cross-entity recall: one ranked candidate, independent of source table.
+/// `embedding` carries the raw LE-f32 bytes (None = not indexed); `score` is set by ranking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextItem {
+    pub kind: EntityKind,
+    pub id: i64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(skip)]
+    pub embedding: Option<Vec<u8>>,
+}
+
 /// A vault page — a Notion-style document with an Obsidian-style place in the page tree. Backed by
 /// the same `notes` table as Hermes (so embeddings/recall keep working over `content`, the derived
 /// plaintext). `content_json` is the BlockNote block array (None on legacy notes → rendered as a

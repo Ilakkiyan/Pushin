@@ -6,13 +6,35 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_PORT: u16 = 47610;
+
+/// Hard cap on a request body. A booking JSON is a few hundred bytes; anything
+/// larger is abuse. Without this the body-read loop grows an unbounded `Vec`
+/// straight from an attacker-controlled `Content-Length` (memory-exhaustion DoS).
+const MAX_BODY: usize = 64 * 1024;
+/// Whole-request budget. The per-read timeout alone does not stop a slowloris
+/// that dribbles a byte just inside each timeout; this caps total time on a socket.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(8);
+/// Per-read socket timeout.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on connections handled at once. Each connection gets its own
+/// thread so one slow client can't stall the accept loop; this bounds the blast
+/// radius of many slow clients (thread-exhaustion DoS).
+const MAX_INFLIGHT: usize = 64;
+/// Global booking rate limit: at most this many `POST /book` in the window.
+/// Through a tunnel every request appears to come from 127.0.0.1, so per-IP
+/// limiting is meaningless — the limit must be global. Protects the calendar
+/// from flooding and the Google sync from amplification.
+const BOOK_LIMIT: usize = 8;
+const BOOK_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +87,30 @@ struct BookRequest {
     end: String,
 }
 
+/// Fixed-window counter for booking attempts. Global (see `BOOK_LIMIT`).
+#[derive(Default)]
+struct RateLimiter {
+    hits: VecDeque<Instant>,
+}
+
+impl RateLimiter {
+    /// Records an attempt and returns whether it is allowed under the window.
+    fn allow(&mut self, now: Instant, limit: usize, window: Duration) -> bool {
+        while let Some(front) = self.hits.front() {
+            if now.duration_since(*front) >= window {
+                self.hits.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.hits.len() >= limit {
+            return false;
+        }
+        self.hits.push_back(now);
+        true
+    }
+}
+
 pub fn stopped_status() -> BookingServerStatus {
     BookingServerStatus {
         running: false,
@@ -99,17 +145,31 @@ fn bind_listener(preferred: u16) -> Result<(TcpListener, u16)> {
 }
 
 fn run(listener: TcpListener, shutdown_rx: mpsc::Receiver<()>, db: Arc<Mutex<Connection>>, http: reqwest::Client) {
+    let limiter = Arc::new(Mutex::new(RateLimiter::default()));
+    let inflight = Arc::new(AtomicUsize::new(0));
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let response = match read_request(&mut stream) {
-                    Ok(req) => route(req, &db, &http),
-                    Err(_) => response_text(400, "Bad Request", "text/plain; charset=utf-8", "Bad request"),
-                };
-                let _ = write_response(&mut stream, response);
+                // Shed load rather than spawning unbounded threads under a flood.
+                if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+                    let _ = write_response(&mut stream, response_text(503, "Service Unavailable", "text/plain; charset=utf-8", "Busy"));
+                    continue;
+                }
+                inflight.fetch_add(1, Ordering::Relaxed);
+                let (db, http, limiter, inflight_c) = (Arc::clone(&db), http.clone(), Arc::clone(&limiter), Arc::clone(&inflight));
+                // One thread per connection: a slow client blocks only its own thread,
+                // never the accept loop or other bookings.
+                thread::spawn(move || {
+                    let response = match read_request(&mut stream) {
+                        Ok(req) => route(req, &db, &http, &limiter),
+                        Err(_) => response_text(400, "Bad Request", "text/plain; charset=utf-8", "Bad request"),
+                    };
+                    let _ = write_response(&mut stream, response);
+                    inflight_c.fetch_sub(1, Ordering::Relaxed);
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(35)),
             Err(_) => thread::sleep(Duration::from_millis(100)),
@@ -118,11 +178,15 @@ fn run(listener: TcpListener, shutdown_rx: mpsc::Receiver<()>, db: Arc<Mutex<Con
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request> {
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let mut header_end = None;
-    while header_end.is_none() && buf.len() < 64 * 1024 {
+    while header_end.is_none() && buf.len() < MAX_BODY {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("request header timeout"));
+        }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;
@@ -142,15 +206,25 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
+    // Reject an oversized declared body up front — never allocate toward it.
+    if content_length > MAX_BODY {
+        return Err(anyhow!("request body too large"));
+    }
 
     let body_start = header_end + 4;
     let mut body = buf.get(body_start..).unwrap_or_default().to_vec();
     while body.len() < content_length {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("request body timeout"));
+        }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;
         }
         body.extend_from_slice(&chunk[..n]);
+        if body.len() > MAX_BODY {
+            return Err(anyhow!("request body too large"));
+        }
     }
     body.truncate(content_length);
 
@@ -199,12 +273,17 @@ fn percent_decode(s: &str) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
-fn route(req: Request, db: &Arc<Mutex<Connection>>, http: &reqwest::Client) -> Response {
+fn route(req: Request, db: &Arc<Mutex<Connection>>, http: &reqwest::Client, limiter: &Arc<Mutex<RateLimiter>>) -> Response {
     let parts: Vec<&str> = req.path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (req.method.as_str(), parts.as_slice()) {
         ("GET", ["b", token, slug]) => public_page(db, token, slug),
         ("GET", ["api", "b", token, slug, "slots"]) => public_slots(db, token, slug, &req.query),
-        ("POST", ["api", "b", token, slug, "book"]) => public_book(db, http, token, slug, &req.body),
+        ("POST", ["api", "b", token, slug, "book"]) => {
+            if !limiter.lock().unwrap().allow(Instant::now(), BOOK_LIMIT, BOOK_WINDOW) {
+                return json_response(429, "Too Many Requests", json!({ "error": "Too many booking attempts. Please try again shortly." }));
+            }
+            public_book(db, http, token, slug, &req.body)
+        }
         ("GET", []) => response_text(200, "OK", "text/plain; charset=utf-8", "Pushin booking server"),
         _ => response_text(404, "Not Found", "text/plain; charset=utf-8", "Not found"),
     }
@@ -301,8 +380,20 @@ fn not_found_html() -> String {
     "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Booking unavailable</title><style>body{font-family:Inter,system-ui,sans-serif;background:#090b10;color:#f7f7fb;display:grid;min-height:100vh;place-items:center;margin:0}main{max-width:420px;padding:28px}p{color:#9ca3af}</style></head><body><main><h1>Booking unavailable</h1><p>This booking link is no longer active.</p></main></body></html>".into()
 }
 
+/// Make a JSON string safe to embed inside an inline `<script>`. `serde_json`
+/// does not escape `<`/`/`, so a value containing `</script>` would break out of
+/// the tag; U+2028/U+2029 also terminate JS string literals. Escaping these as
+/// `\uXXXX` keeps the JSON valid while preventing tag/line breakout.
+fn js_embed(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 fn booking_html(token: &str, slug: &str, et: &crate::model::EventType) -> String {
-    let public = serde_json::to_string(&booking::public_event_type(et)).unwrap_or_else(|_| "{}".into());
+    let public = js_embed(&serde_json::to_string(&booking::public_event_type(et)).unwrap_or_else(|_| "{}".into()));
     let title = escape_html(&et.name);
     let color = escape_html(&et.color);
     let token = escape_html(token);
@@ -502,5 +593,130 @@ mod tests {
         let (_, q) = split_target("/api/b/a/b/slots?horizonDays=14&name=Intro+Call");
         assert_eq!(q.get("horizonDays").map(String::as_str), Some("14"));
         assert_eq!(q.get("name").map(String::as_str), Some("Intro Call"));
+    }
+
+    // ---- Security tests (see SECURITY_TEST_PLAN.md) ----
+
+    fn et_with(conn: &Connection, dur: i64) -> crate::model::EventType {
+        let id = db::insert_event_type(conn, "Intro call", dur, 0, "#0ea5e9").unwrap();
+        db::get_event_type(conn, id).unwrap()
+    }
+
+    // 2.2 — off-grid / past / wrong-duration / reversed bookings are rejected.
+    #[test]
+    fn book_rejects_off_grid_times() {
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let settings = Settings::default();
+        let slot = booking::available_slots(&conn, &settings, &et, 2).unwrap().remove(0);
+        let db = Arc::new(Mutex::new(conn));
+        let http = reqwest::Client::new();
+
+        // Wrong duration (end is one hour after start, type is 30 min).
+        let bad_dur = serde_json::to_vec(&json!({"name":"A","email":"a@x.io","start":slot.start,"end":"2030-01-01T11:00:00"})).unwrap();
+        assert_ne!(public_book(&db, &http, &et.share_token, &et.slug, &bad_dur).status, 200);
+
+        // A start that is not a generated slot boundary.
+        let off_grid = serde_json::to_vec(&json!({"name":"A","email":"a@x.io","start":"2030-01-01T10:07:00","end":"2030-01-01T10:37:00"})).unwrap();
+        assert_eq!(public_book(&db, &http, &et.share_token, &et.slug, &off_grid).status, 409);
+
+        // Reversed interval.
+        let reversed = serde_json::to_vec(&json!({"name":"A","email":"a@x.io","start":slot.end,"end":slot.start})).unwrap();
+        assert_ne!(public_book(&db, &http, &et.share_token, &et.slug, &reversed).status, 200);
+    }
+
+    // 3.3 — token/slug are bound as SQL params; injection just fails the lookup.
+    #[test]
+    fn sql_injection_in_token_does_not_authenticate() {
+        let conn = db::test_conn();
+        let _ = et_with(&conn, 30);
+        let db = Arc::new(Mutex::new(conn));
+        let r = public_page(&db, "' OR '1'='1", "' OR '1'='1' --");
+        assert_eq!(r.status, 404);
+        let s = public_slots(&db, "x'; DROP TABLE event_types;--", "y", &HashMap::new());
+        assert_eq!(s.status, 404);
+        // The table still exists / app still works.
+        assert!(db::list_event_types(&db.lock().unwrap()).is_ok());
+    }
+
+    // 3.1 — event-type name cannot break out of the inline <script>.
+    #[test]
+    fn booking_html_escapes_script_breakout() {
+        let conn = db::test_conn();
+        let id = db::insert_event_type(&conn, "</script><img src=x onerror=alert(1)>", 30, 0, "#0ea5e9").unwrap();
+        let et = db::get_event_type(&conn, id).unwrap();
+        let html = booking_html(&et.share_token, &et.slug, &et);
+        let script_start = html.find("const eventType").unwrap();
+        // Nothing after the data assignment closes the tag prematurely.
+        assert!(!html[script_start..].contains("</script><img"), "raw breakout present");
+        assert!(html.contains("\\u003c/script\\u003e"), "expected escaped form in embedded JSON");
+    }
+
+    // 2.1 / 1.3 — the global booking limiter blocks a flood within the window.
+    #[test]
+    fn rate_limiter_blocks_flood() {
+        let mut rl = RateLimiter::default();
+        let now = Instant::now();
+        for _ in 0..BOOK_LIMIT {
+            assert!(rl.allow(now, BOOK_LIMIT, BOOK_WINDOW));
+        }
+        assert!(!rl.allow(now, BOOK_LIMIT, BOOK_WINDOW), "limit not enforced");
+        // After the window slides, attempts are allowed again.
+        assert!(rl.allow(now + BOOK_WINDOW, BOOK_LIMIT, BOOK_WINDOW));
+    }
+
+    // 2.4 — regenerating the token invalidates the old shareable link.
+    #[test]
+    fn regenerated_token_invalidates_old_link() {
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let old_token = et.share_token.clone();
+        let updated = db::regenerate_event_type_token(&conn, et.id).unwrap();
+        assert_ne!(updated.share_token, old_token);
+        let db = Arc::new(Mutex::new(conn));
+        assert_eq!(public_page(&db, &old_token, &et.slug).status, 404);
+        assert_eq!(public_page(&db, &updated.share_token, &et.slug).status, 200);
+    }
+
+    // 1.1 — an oversized declared Content-Length is rejected without allocating toward it.
+    #[test]
+    fn oversized_body_is_rejected() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream).map(|_| ()).err().map(|e| e.to_string())
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(b"POST /api/b/x/y/book HTTP/1.1\r\nContent-Length: 100000000\r\n\r\n{}")
+            .unwrap();
+        let err = handle.join().unwrap();
+        assert!(err.map(|e| e.contains("too large")).unwrap_or(false), "oversized body not rejected early");
+    }
+
+    // 1.2 — a slow client occupies only its own thread; a concurrent request still completes.
+    #[test]
+    fn slow_client_does_not_block_others() {
+        // Discover a free port (bind_listener echoes the requested port, so we
+        // can't pass 0 and read it back).
+        let free_port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let db = Arc::new(Mutex::new(db::test_conn()));
+        let handle = start(db, reqwest::Client::new(), Some(free_port)).unwrap();
+        let port = handle.status().port.unwrap();
+
+        // A slow client: send a partial header line and never finish.
+        let mut slow = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost: x").unwrap();
+
+        // A normal client should still get a prompt response.
+        let mut fast = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        fast.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        fast.write_all(b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut resp = Vec::new();
+        let _ = fast.read_to_end(&mut resp);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("Pushin booking server"), "fast client blocked by slow client: {text:?}");
+        handle.stop();
     }
 }

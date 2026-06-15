@@ -1,10 +1,16 @@
-import { useState } from "react";
-import { Check, Plus, Trash2, NotebookPen } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, Plus, Trash2, NotebookPen, Play, Square } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import type { Task } from "../lib/ipc";
+import { api, type FocusSession, type Task } from "../lib/ipc";
 import { humanMinutes, parseLocal } from "../lib/time";
 import LabelPicker from "../components/LabelPicker";
+
+/** mm:ss for an elapsed-seconds count. */
+function fmtElapsed(sec: number): string {
+  const m = Math.floor(sec / 60);
+  return `${m}:${String(sec % 60).padStart(2, "0")}`;
+}
 
 const PRIORITY: Record<number, { label: string; cls: string }> = {
   1: { label: "Low", cls: "text-gray-400 bg-gray-400/10" },
@@ -13,7 +19,7 @@ const PRIORITY: Record<number, { label: string; cls: string }> = {
   4: { label: "Urgent", cls: "text-rose-300 bg-rose-400/10" },
 };
 
-function TaskRow({ task }: { task: Task }) {
+function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: FocusSession | null; now: number; onStart: (id: number) => void; onStop: () => void }) {
   const projects = useStore((s) => s.projects);
   const setTaskStatus = useStore((s) => s.setTaskStatus);
   const deleteTask = useStore((s) => s.deleteTask);
@@ -21,6 +27,8 @@ function TaskRow({ task }: { task: Task }) {
   const project = projects.find((p) => p.id === task.projectId);
   const done = task.status === "done";
   const pr = PRIORITY[task.priority] ?? PRIORITY[2];
+  const focusing = active?.taskId === task.id;
+  const elapsed = focusing ? Math.max(0, Math.floor((now - parseLocal(active!.start).getTime()) / 1000)) : 0;
 
   return (
     <div className="group flex items-center gap-2 px-3 py-2 hover:bg-white/[0.03] rounded-lg">
@@ -50,6 +58,18 @@ function TaskRow({ task }: { task: Task }) {
       </div>
 
       <span className={clsx("text-[10px] px-1.5 py-0.5 rounded shrink-0", pr.cls)}>{pr.label}</span>
+      {focusing ? (
+        <button onClick={onStop} title="Stop focus" className="flex items-center gap-1 text-[11px] text-emerald-300 shrink-0 tabular-nums">
+          <Square className="size-3 fill-current" />
+          {fmtElapsed(elapsed)}
+        </button>
+      ) : (
+        !done && (
+          <button onClick={() => onStart(task.id)} title="Start a focus session" className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-emerald-300 shrink-0">
+            <Play className="size-3.5" />
+          </button>
+        )
+      )}
       <button
         onClick={() => openEntityNote("task", task.id, task.title)}
         title="Open notes for this task"
@@ -74,6 +94,37 @@ export default function TaskListPane() {
   const [adding, setAdding] = useState(false);
   const [title, setTitle] = useState("");
   const [minutes, setMinutes] = useState(60);
+  const [focus, setFocus] = useState<FocusSession | null>(null);
+  const [now, setNow] = useState(Date.now());
+
+  // Load any in-progress focus session on mount (e.g. after a navigation). Defensive against a
+  // missing api method (older test mocks) so the task list never crashes.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => api.activeFocus())
+      .then((s) => !cancelled && setFocus(s))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Tick the elapsed clock while a session is running.
+  useEffect(() => {
+    if (!focus) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [focus]);
+
+  const startFocus = async (taskId: number) => {
+    setNow(Date.now());
+    setFocus(await api.startFocus(taskId).catch(() => null));
+  };
+  const stopFocus = async () => {
+    if (focus) await api.stopFocus(focus.id).catch(() => {});
+    setFocus(null);
+  };
 
   const active = tasks.filter((t) => t.status !== "done");
   const done = tasks.filter((t) => t.status === "done");
@@ -127,13 +178,13 @@ export default function TaskListPane() {
           <p className="text-xs text-gray-500 px-4 py-6 text-center">No tasks yet. Plan something with the AI above.</p>
         )}
         {active.map((t) => (
-          <TaskRow key={t.id} task={t} />
+          <TaskRow key={t.id} task={t} active={focus} now={now} onStart={startFocus} onStop={stopFocus} />
         ))}
         {done.length > 0 && (
           <div className="mt-2 pt-2 border-t border-white/5">
             <div className="px-4 py-1 text-[11px] uppercase tracking-wide text-gray-600">Done</div>
             {done.map((t) => (
-              <TaskRow key={t.id} task={t} />
+              <TaskRow key={t.id} task={t} active={focus} now={now} onStart={startFocus} onStop={stopFocus} />
             ))}
           </div>
         )}

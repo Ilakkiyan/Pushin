@@ -26,7 +26,7 @@ describe("Sidebar", () => {
     for (const label of ["Calendar", "Projects", "Habits", "Booking", "Notes", "Inbox", "Graph", "Settings", "Today's note"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
-    expect(screen.getByText("AI ready")).toBeInTheDocument();
+    expect(screen.getByText(/AI ready/)).toBeInTheDocument();
   });
 
   it("shows the Inbox count badge", () => {

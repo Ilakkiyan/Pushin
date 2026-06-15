@@ -29,9 +29,9 @@ const openPalette = () => fireEvent.keyDown(window, { key: "k", metaKey: true })
 describe("CommandPalette", () => {
   it("opens on Cmd+K and semantic-searches pages", async () => {
     render(<CommandPalette />);
-    expect(screen.queryByPlaceholderText(/Search pages/)).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/Search/)).not.toBeInTheDocument();
     openPalette();
-    const input = screen.getByPlaceholderText(/Search pages/);
+    const input = screen.getByPlaceholderText(/Search/);
     await userEvent.type(input, "bud");
     // Debounced recall → maps note id 1 → the "Budget" page, with a "semantic" mode pill.
     await waitFor(() => expect(api.hermesRecall).toHaveBeenCalled());
@@ -42,7 +42,7 @@ describe("CommandPalette", () => {
   it("offers + runs ask-your-vault, showing the answer", async () => {
     render(<CommandPalette />);
     openPalette();
-    await userEvent.type(screen.getByPlaceholderText(/Search pages/), "what is the budget");
+    await userEvent.type(screen.getByPlaceholderText(/Search/), "what is the budget");
     const ask = await screen.findByText(/Ask your vault:/);
     await userEvent.click(ask);
     await waitFor(() => expect(api.vaultAsk).toHaveBeenCalledWith("what is the budget"));
@@ -52,7 +52,7 @@ describe("CommandPalette", () => {
   it("Enter opens the highlighted page and closes", async () => {
     render(<CommandPalette />);
     openPalette();
-    const input = screen.getByPlaceholderText(/Search pages/);
+    const input = screen.getByPlaceholderText(/Search/);
     await userEvent.type(input, "bud");
     await waitFor(() => expect(screen.getByText("Budget")).toBeInTheDocument());
     fireEvent.keyDown(input, { key: "Enter" });

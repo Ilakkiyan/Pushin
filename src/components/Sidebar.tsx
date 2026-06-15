@@ -7,6 +7,7 @@ import {
   Notebook,
   Network,
   CalendarHeart,
+  Users,
   Inbox,
   Loader2,
   PanelLeftClose,
@@ -95,6 +96,7 @@ export default function Sidebar() {
   const collapsed = useStore((s) => s.sidebarCollapsed);
   const setCollapsed = useStore((s) => s.setSidebarCollapsed);
   const llm = useStore((s) => s.llm);
+  const embedReady = useStore((s) => s.embedReady);
   const busy = useStore((s) => s.busy);
   const refreshLlm = useStore((s) => s.refreshLlm);
   const [connecting, setConnecting] = useState(false);
@@ -144,6 +146,7 @@ export default function Sidebar() {
         <NavItem active={view === "projects"} collapsed={collapsed} onClick={go("projects")} icon={<FolderKanban className="size-4" />} label="Projects" />
         <NavItem active={view === "habits"} collapsed={collapsed} onClick={go("habits")} icon={<Flame className="size-4" />} label="Habits" />
         <NavItem active={view === "booking"} collapsed={collapsed} onClick={go("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
+        <NavItem active={view === "people"} collapsed={collapsed} onClick={go("people")} icon={<Users className="size-4" />} label="People" />
 
         {!collapsed && <SectionLabel>Vault</SectionLabel>}
         <NavItem active={view === "vault"} collapsed={collapsed} onClick={go("vault")} icon={<Notebook className="size-4" />} label="Notes" />
@@ -178,7 +181,11 @@ export default function Sidebar() {
           ) : (
             <span className={clsx("size-1.5 rounded-full shrink-0", llm?.reachable ? "bg-emerald-400" : "bg-amber-400")} />
           )}
-          {!collapsed && <span className="truncate">{connecting ? "Connecting…" : llm?.reachable ? "AI ready" : "AI offline"}</span>}
+          {!collapsed && (
+            <span className="truncate">
+              {connecting ? "Connecting…" : llm?.reachable ? (embedReady ? "AI ready · Memory ✓" : "AI ready · Memory…") : "AI offline"}
+            </span>
+          )}
         </button>
         <NavItem active={view === "settings"} collapsed={collapsed} onClick={go("settings")} icon={<SettingsIcon className="size-4" />} label="Settings" />
       </div>

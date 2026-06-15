@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Tag, Plus, X, Check } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { api, type LabelKind } from "../lib/ipc";
+import { api, type Label, type LabelKind } from "../lib/ipc";
 
 const PALETTE = ["#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"];
 
@@ -16,6 +16,7 @@ export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKi
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [suggestions, setSuggestions] = useState<Label[]>([]);
   const ref = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -25,6 +26,16 @@ export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKi
       cancelled = true;
     };
   }, [kind, entityId]);
+
+  // Keyword auto-label suggestions (existing labels whose name appears in the entity's text).
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api.suggestLabels(kind, entityId).then((s) => !cancelled && setSuggestions(s)).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open, kind, entityId]);
 
   // Close on outside click.
   useEffect(() => {
@@ -83,6 +94,28 @@ export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKi
 
       {open && (
         <div className="absolute top-full left-0 mt-1 z-50 w-52 rounded-lg bg-[#0e1117] border border-white/10 shadow-xl p-1.5">
+          {(() => {
+            const fresh = suggestions.filter((s) => !selected.has(s.id));
+            return fresh.length > 0 ? (
+              <div className="mb-1.5">
+                <div className="px-1 pb-1 text-[10px] uppercase tracking-wide text-gray-500">Suggested</div>
+                <div className="flex flex-wrap gap-1 px-1">
+                  {fresh.map((l) => (
+                    <button
+                      key={l.id}
+                      onClick={() => toggle(l.id)}
+                      className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px]"
+                      style={{ background: `${l.color}22`, color: l.color }}
+                      title={`Add "${l.name}"`}
+                    >
+                      <Plus className="size-2.5" />
+                      {l.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null;
+          })()}
           <input
             autoFocus
             value={query}

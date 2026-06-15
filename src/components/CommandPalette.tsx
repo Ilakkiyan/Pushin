@@ -1,8 +1,21 @@
 import { useEffect, useRef, useState } from "react";
-import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, ArrowLeft, Loader2 } from "lucide-react";
+import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, Zap, ArrowLeft, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { api, type Page, type VaultAnswer } from "../lib/ipc";
+import { api, type Page, type PlanOutcome, type VaultAnswer } from "../lib/ipc";
+
+/** A one-line summary of what a natural-language command did, for the action-bar result. */
+function summarizeOutcome(o: PlanOutcome): string {
+  const parts: string[] = [];
+  if (o.createdEventTitles.length) parts.push(`added ${o.createdEventTitles.length} event${o.createdEventTitles.length === 1 ? "" : "s"} (${o.createdEventTitles.join(", ")})`);
+  if (o.createdTaskIds.length) parts.push(`added ${o.createdTaskIds.length} task${o.createdTaskIds.length === 1 ? "" : "s"}`);
+  if (o.updatedEventTitles.length) parts.push(`updated ${o.updatedEventTitles.join(", ")}`);
+  if (o.removedEventTitles.length) parts.push(`removed ${o.removedEventTitles.join(", ")}`);
+  if (o.createdHabitNames.length) parts.push(`added habit ${o.createdHabitNames.join(", ")}`);
+  if (parts.length === 0) return o.clarifications[0] ?? "Nothing to change.";
+  const s = parts.join(", ");
+  return s.charAt(0).toUpperCase() + s.slice(1) + ".";
+}
 
 type Item = { key: string; label: string; icon: React.ReactNode; hint?: string; keepOpen?: boolean; run: () => void };
 
@@ -15,6 +28,7 @@ export default function CommandPalette() {
   const labels = useStore((s) => s.labels);
   const openLabel = useStore((s) => s.openLabel);
   const askVault = useStore((s) => s.askVault);
+  const plan = useStore((s) => s.plan);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [pages, setPages] = useState<Page[]>([]);
@@ -22,6 +36,8 @@ export default function CommandPalette() {
   const [sel, setSel] = useState(0);
   const [answer, setAnswer] = useState<VaultAnswer | null>(null);
   const [asking, setAsking] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [planMsg, setPlanMsg] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Global hotkey to toggle the palette.
@@ -46,6 +62,8 @@ export default function CommandPalette() {
       setSel(0);
       setAnswer(null);
       setAsking(false);
+      setRunning(false);
+      setPlanMsg(null);
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
@@ -127,8 +145,23 @@ export default function CommandPalette() {
     }
   };
 
+  const runCommand = async () => {
+    const text = query.trim();
+    if (!text) return;
+    setRunning(true);
+    setPlanMsg(null);
+    try {
+      setPlanMsg(summarizeOutcome(await plan(text, [])));
+    } catch {
+      setPlanMsg("Couldn't run that — is the AI set up? Try rephrasing.");
+    } finally {
+      setRunning(false);
+    }
+  };
+
   const actions: Item[] = q
     ? [
+        { key: "run", label: `Run: "${query.trim()}"`, icon: <Zap className="size-4 text-indigo-400" />, hint: "AI", keepOpen: true, run: runCommand },
         { key: "ask", label: `Ask your vault: "${query.trim()}"`, icon: <Sparkles className="size-4 text-fuchsia-400" />, keepOpen: true, run: runAsk },
         { key: "new", label: `Create page "${query.trim()}"`, icon: <Plus className="size-4" />, run: () => createPage(null) },
       ]
@@ -171,7 +204,7 @@ export default function CommandPalette() {
                 activate(sel);
               }
             }}
-            placeholder="Search pages, jump to a view, or create…"
+            placeholder="Search, run a command, jump to a view, or ask…"
             className="flex-1 bg-transparent py-3 text-sm outline-none placeholder:text-gray-600"
           />
           {mode && pages.length > 0 && (
@@ -180,7 +213,20 @@ export default function CommandPalette() {
           <kbd className="text-[10px] text-gray-600 border border-white/10 rounded px-1.5 py-0.5">esc</kbd>
         </div>
         <div className="max-h-[50vh] overflow-y-auto py-1">
-          {asking || answer ? (
+          {running || planMsg ? (
+            <div className="p-4">
+              <button onClick={() => { setPlanMsg(null); setRunning(false); inputRef.current?.focus(); }} className="text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-3">
+                <ArrowLeft className="size-3" /> back to search
+              </button>
+              {running ? (
+                <div className="flex items-center gap-2 text-sm text-gray-400">
+                  <Loader2 className="size-4 animate-spin" /> Running…
+                </div>
+              ) : (
+                <p className="text-sm text-gray-200 leading-relaxed">{planMsg}</p>
+              )}
+            </div>
+          ) : asking || answer ? (
             <div className="p-4">
               <button onClick={() => { setAnswer(null); setAsking(false); inputRef.current?.focus(); }} className="text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-3">
                 <ArrowLeft className="size-3" /> back to search

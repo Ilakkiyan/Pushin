@@ -114,6 +114,48 @@ export interface Booking {
   createdAt: string;
 }
 
+/** A focus session on a task (time-tracking). `end` is undefined while running. */
+export interface FocusSession {
+  id: number;
+  taskId: number;
+  start: string;
+  end?: string;
+  minutes: number;
+}
+
+/** A person in the relationship layer (private CRM). Auto-created from booking invitees. */
+export interface Person {
+  id: number;
+  name: string;
+  email?: string;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One attendee in a meeting brief: the person + a quick relationship summary. */
+export interface AttendeeBrief {
+  person: Person;
+  totalMeetings: number;
+  lastMet?: string;
+}
+
+/** The Meeting Companion's deterministic pre-meeting brief. */
+export interface MeetingBrief {
+  event: CalEvent;
+  attendees: AttendeeBrief[];
+  linkedPages: Page[];
+}
+
+/** The morning Daily Briefing — today's agenda, assembled deterministically (no LLM). */
+export interface Briefing {
+  date: string;
+  weekday: string;
+  events: CalEvent[];
+  dueTasks: Task[];
+  focusMinutes: number;
+}
+
 export type Conflict =
   | { kind: "dependencyCycle"; taskIds: number[] }
   | { kind: "unschedulable"; taskId: number; title: string; remainingMinutes: number }
@@ -276,7 +318,7 @@ export interface LabelInput {
 }
 
 /** Entity kinds a label can be applied to. */
-export type LabelKind = "task" | "event" | "habit" | "page" | "project";
+export type LabelKind = "task" | "event" | "habit" | "page" | "project" | "person";
 export type EntityLabelMap = Record<number, Label[]>;
 
 /** A Markdown file found by the vault importer (title + raw markdown). */
@@ -378,6 +420,21 @@ export const api = {
   unlinkedMentions: (id: number) => invoke<Page[]>("unlinked_mentions", { id }),
   pageGraph: () => invoke<PageGraph>("page_graph"),
   vaultAsk: (question: string) => invoke<VaultAnswer>("vault_ask", { question }),
+  dailyBriefing: (date?: string) => invoke<Briefing>("daily_briefing", { date: date ?? null }),
+  meetingBrief: (eventId: number) => invoke<MeetingBrief>("meeting_brief", { eventId }),
+  extractActionItems: (notes: string) => invoke<string[]>("extract_action_items", { notes }),
+  // Focus / time-tracking
+  startFocus: (taskId: number) => invoke<FocusSession>("start_focus", { taskId }),
+  stopFocus: (id: number) => invoke<void>("stop_focus", { id }),
+  activeFocus: () => invoke<FocusSession | null>("active_focus"),
+  taskFocusMinutes: (taskId: number) => invoke<number>("task_focus_minutes", { taskId }),
+
+  // People (relationship layer)
+  listPeople: () => invoke<Person[]>("list_people"),
+  getPerson: (id: number) => invoke<Person>("get_person", { id }),
+  createPerson: (name: string, email: string | null, notes: string) => invoke<Person>("create_person", { name, email, notes }),
+  updatePerson: (id: number, name: string, email: string | null, notes: string) => invoke<Person>("update_person", { id, name, email, notes }),
+  deletePerson: (id: number) => invoke<void>("delete_person", { id }),
   dailyNote: (date: string) => invoke<Page>("daily_note", { date }),
   linkPageEntity: (pageId: number, kind: string, entityId: number) =>
     invoke<void>("link_page_entity", { pageId, kind, entityId }),
@@ -395,6 +452,7 @@ export const api = {
   setEntityLabels: (kind: LabelKind, entityId: number, labelIds: number[]) =>
     invoke<void>("set_entity_labels", { kind, entityId, labelIds }),
   labelsFor: (kind: LabelKind, entityId: number) => invoke<Label[]>("labels_for", { kind, entityId }),
+  suggestLabels: (kind: LabelKind, entityId: number) => invoke<Label[]>("suggest_labels", { kind, entityId }),
   labelsForEntities: (kind: LabelKind, ids: number[]) =>
     invoke<EntityLabelMap>("labels_for_entities", { kind, ids }),
   quickLabel: (name: string, color: string) => invoke<Label[]>("quick_label", { name, color }),

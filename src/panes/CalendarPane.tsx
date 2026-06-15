@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { api, type Block, type CalEvent, type Label } from "../lib/ipc";
+import { api, type Block, type CalEvent, type Label, type MeetingBrief } from "../lib/ipc";
 import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
 import ViewToggle from "../components/ViewToggle";
 import CalendarLabelControls from "../components/CalendarLabelControls";
+import LabelPicker from "../components/LabelPicker";
+import BriefingCard from "../components/BriefingCard";
 
 /** An all-day / multi-day event runs midnight→midnight (that's how trips are stored). */
 function isAllDay(e: CalEvent): boolean {
@@ -73,6 +75,10 @@ export default function CalendarPane() {
   }, [focusDateIso]);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [modal, setModal] = useState<{ start: Date } | null>(null);
+  // The event whose detail/label popover is open, plus a counter to refresh event labels (for
+  // color-by-label + filters) after the popover edits them.
+  const [detail, setDetail] = useState<CalEvent | null>(null);
+  const [labelRefresh, setLabelRefresh] = useState(0);
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -104,7 +110,7 @@ export default function CalendarPane() {
       return;
     }
     api.labelsForEntities("event", eventIds).then(setEventLabels).catch(() => setEventLabels({}));
-  }, [eventIds]);
+  }, [eventIds, labelRefresh]);
 
   // Multi-day / all-day events render as horizontal bars in a row above the time grid
   // (spanning the day columns they cover), clipped to the visible week.
@@ -197,6 +203,8 @@ export default function CalendarPane() {
         </div>
       </div>
 
+      <BriefingCard />
+
       {/* Day headers */}
       <div className="shrink-0 grid border-b border-white/10" style={{ gridTemplateColumns: "56px repeat(7, 1fr)" }}>
         <div />
@@ -286,6 +294,7 @@ export default function CalendarPane() {
                     height={height(minutesBetweenEv(ev))}
                     color={colorByLabel ? primaryLabelColor(eventLabels[ev.id]) : null}
                     onDelete={() => deleteEvent(ev.id)}
+                    onOpen={() => setDetail(ev)}
                   />
                 ))}
 
@@ -336,6 +345,13 @@ export default function CalendarPane() {
       </div>
 
       {modal && <AddEventModal start={modal.start} onClose={() => setModal(null)} onSave={(title, end) => { addEvent(title, toLocalIso(modal.start), toLocalIso(end), "fixed"); setModal(null); }} />}
+      {detail && (
+        <EventDetailModal
+          ev={detail}
+          onClose={() => { setDetail(null); setLabelRefresh((n) => n + 1); }}
+          onDelete={() => { deleteEvent(detail.id); setDetail(null); setLabelRefresh((n) => n + 1); }}
+        />
+      )}
     </div>
   );
 }
@@ -436,13 +452,17 @@ function minutesBetweenBlock(b: Block) {
   return Math.round((parseLocal(b.end).getTime() - parseLocal(b.start).getTime()) / 60000);
 }
 
-function EventCard({ ev, top, height, color, onDelete }: { ev: CalEvent; top: number; height: number; color: string | null; onDelete: () => void }) {
+function EventCard({ ev, top, height, color, onDelete, onOpen }: { ev: CalEvent; top: number; height: number; color: string | null; onDelete: () => void; onOpen: () => void }) {
   const isHabit = ev.kind === "habit";
   return (
     <div
-      onClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!isHabit) onOpen(); // open the detail/label popover for real events (habits → HabitsPane)
+      }}
       className={clsx(
         "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
+        !isHabit && "cursor-pointer",
         !color && (isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100"),
       )}
       style={{ top, height, ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
@@ -450,9 +470,126 @@ function EventCard({ ev, top, height, color, onDelete }: { ev: CalEvent; top: nu
     >
       <div className="flex items-center gap-1">
         <span className="truncate flex-1">{ev.title}</span>
-        <button onClick={onDelete} className="opacity-0 group-hover:opacity-100 hover:text-white">
+        <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="opacity-0 group-hover:opacity-100 hover:text-white">
           <X className="size-3" />
         </button>
+      </div>
+    </div>
+  );
+}
+
+/** Click an event → a small popover to (re)label it and delete it. Events have no inline editor, and
+ *  the calendar block itself is `overflow-hidden`, so labels live here rather than on the block. */
+function EventDetailModal({ ev, onClose, onDelete }: { ev: CalEvent; onClose: () => void; onDelete: () => void }) {
+  const createTask = useStore((s) => s.createTask);
+  const [brief, setBrief] = useState<MeetingBrief | null>(null);
+  const [notes, setNotes] = useState("");
+  const [items, setItems] = useState<string[]>([]);
+  const [extracting, setExtracting] = useState(false);
+
+  const extract = async () => {
+    setExtracting(true);
+    try {
+      setItems(await api.extractActionItems(notes));
+    } catch {
+      setItems([]);
+    } finally {
+      setExtracting(false);
+    }
+  };
+  const addItem = async (i: number) => {
+    await createTask(items[i], 30, null, 2);
+    setItems((prev) => prev.filter((_, j) => j !== i));
+  };
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => api.meetingBrief(ev.id))
+      .then((b) => !cancelled && setBrief(b))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [ev.id]);
+  const hasBrief = !!brief && (brief.attendees.length > 0 || brief.linkedPages.length > 0);
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50" onClick={onClose}>
+      <div className="w-80 rounded-xl border border-white/10 bg-[#12151c] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-2">
+          <h3 className="text-sm font-medium leading-snug">{ev.title}</h3>
+          <button onClick={onClose} className="text-gray-500 hover:text-white shrink-0"><X className="size-4" /></button>
+        </div>
+        <p className="text-xs text-gray-500">
+          {parseLocal(ev.start).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })} – {fmtTime(parseLocal(ev.end))}
+        </p>
+        {hasBrief && (
+          <div className="space-y-2 border-t border-white/10 pt-3">
+            {brief!.attendees.length > 0 && (
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Attendees</div>
+                {brief!.attendees.map((a) => (
+                  <div key={a.person.email ?? a.person.name} className="mb-1">
+                    <div className="text-sm text-gray-200">
+                      {a.person.name}
+                      <span className="text-xs text-gray-500"> · {a.totalMeetings} meeting{a.totalMeetings === 1 ? "" : "s"}</span>
+                    </div>
+                    {a.person.notes && <div className="text-xs text-gray-500 line-clamp-2">{a.person.notes}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {brief!.linkedPages.length > 0 && (
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Linked notes</div>
+                {brief!.linkedPages.map((p) => (
+                  <div key={p.id} className="truncate text-sm text-indigo-300">{p.title}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        <div>
+          <div className="text-xs text-gray-400 mb-1">Labels</div>
+          <LabelPicker kind="event" entityId={ev.id} />
+        </div>
+
+        <div className="space-y-1.5 border-t border-white/10 pt-3">
+          <div className="text-xs text-gray-400">Action items from notes</div>
+          <textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            rows={3}
+            placeholder="Paste meeting notes — Pushin suggests follow-up tasks you confirm."
+            className="w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-xs outline-none focus:border-indigo-500/50 resize-y"
+          />
+          <button
+            onClick={extract}
+            disabled={extracting || !notes.trim()}
+            className="text-xs px-2.5 py-1 rounded-md bg-white/5 border border-white/10 hover:bg-white/10 disabled:opacity-40"
+          >
+            {extracting ? "Extracting…" : "Extract action items"}
+          </button>
+          {items.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-1">
+              {items.map((it, i) => (
+                <button
+                  key={i}
+                  onClick={() => addItem(i)}
+                  title="Add as a task"
+                  className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] text-indigo-200 hover:bg-indigo-500/20"
+                >
+                  <Plus className="size-2.5" /> {it}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="flex justify-end pt-1">
+          <button onClick={onDelete} className="text-xs px-3 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+            Delete event
+          </button>
+        </div>
       </div>
     </div>
   );

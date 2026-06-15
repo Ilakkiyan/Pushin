@@ -396,6 +396,29 @@ fn schedule_one(
     }
 }
 
+/// Minimum completed-and-focus-tracked samples before we trust a learned estimation bias.
+const MIN_ESTIMATION_SAMPLES: usize = 4;
+
+/// A soft multiplier for task estimates, learned from how long completed tasks ACTUALLY took
+/// (focus-tracked) vs what they were estimated at. The median of `actual/estimate` over valid
+/// `(estimate, actual)` samples, clamped to a gentle range. Returns **1.0** (no change) until there's
+/// enough history — so the scheduler's behavior and its tests are untouched without data. Pure: this
+/// only rescales an input; the scheduler itself stays deterministic.
+pub fn estimation_factor(samples: &[(i64, i64)]) -> f64 {
+    let mut ratios: Vec<f64> = samples
+        .iter()
+        .filter(|(est, act)| *est > 0 && *act > 0)
+        .map(|(est, act)| *act as f64 / *est as f64)
+        .collect();
+    if ratios.len() < MIN_ESTIMATION_SAMPLES {
+        return 1.0;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = ratios.len() / 2;
+    let median = if ratios.len() % 2 == 0 { (ratios[mid - 1] + ratios[mid]) / 2.0 } else { ratios[mid] };
+    median.clamp(0.6, 1.8)
+}
+
 /// Schedule all non-done tasks. `fixed` = immovable events; `locked` = pinned blocks
 /// (task_id, interval) that are kept and counted toward their task's progress.
 /// Returns NEW blocks (locked ones are preserved by the caller).
@@ -501,6 +524,25 @@ pub fn schedule_with_prefs(
 mod tests {
     use super::*;
     use crate::model::Commitment;
+
+    #[test]
+    fn estimation_factor_needs_history_then_uses_clamped_median() {
+        // No / too little history → no change.
+        assert_eq!(estimation_factor(&[]), 1.0);
+        assert_eq!(estimation_factor(&[(60, 90), (60, 90), (60, 90)]), 1.0, "below MIN_ESTIMATION_SAMPLES");
+
+        // Four samples all 1.5× → factor 1.5.
+        assert!((estimation_factor(&[(60, 90), (40, 60), (100, 150), (20, 30)]) - 1.5).abs() < 1e-6);
+
+        // Median is robust to an outlier (one wild 10× doesn't dominate): ratios [1,1,1.5,10] → 1.25.
+        let f = estimation_factor(&[(60, 60), (60, 60), (60, 90), (60, 600)]);
+        assert!((f - 1.25).abs() < 1e-6, "expected clamped median 1.25, got {f}");
+
+        // Extreme consistent over-run is clamped to the gentle ceiling.
+        assert_eq!(estimation_factor(&[(10, 100), (10, 100), (10, 100), (10, 100)]), 1.8);
+        // Invalid samples (zero est/act) are ignored.
+        assert_eq!(estimation_factor(&[(0, 50), (60, 0), (60, 120)]), 1.0);
+    }
 
     fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, m, d)

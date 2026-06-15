@@ -8,7 +8,7 @@
 //! Everything here is local: embeddings are computed by the same OpenAI-compatible server Pushin
 //! already talks to (`{base}/v1/embeddings`), and vectors live in SQLite as little-endian f32.
 
-use crate::model::Note;
+use crate::model::{ContextItem, EntityKind, Note};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
@@ -116,34 +116,37 @@ pub fn keyword_score(content: &str, query: &str) -> f32 {
     hits as f32 / terms.len() as f32
 }
 
-/// Rank notes against a query: **semantic** cosine when a query vector is present and some notes are
-/// embedded, else a **keyword** fallback. Returns the mode that ran plus the top-`k` notes with their
-/// `score` set. Pure (no I/O) so it's shared by the recall command, the planner's auto-recall, and
-/// ask-your-vault. `notes` pairs each note with its raw embedding bytes (None = not indexed).
-pub fn rank_notes(notes: Vec<(Note, Option<Vec<u8>>)>, qvec: Option<&[f32]>, query: &str, k: usize) -> (&'static str, Vec<Note>) {
-    let has_vectors = notes.iter().any(|(_, e)| e.is_some());
-    let (mode, mut ranked): (&str, Vec<Note>) = match (qvec, has_vectors) {
+/// Rank any cross-entity candidates against a query: **semantic** cosine when a query vector is
+/// present and some items are embedded, else a **keyword** fallback over each item's `text`. Returns
+/// the mode that ran plus the top-`k` items with their `score` set. Pure (no I/O) — the shared core
+/// of the Context Engine, used by recall, the planner's auto-recall, ask-your-life, and Cmd-K.
+pub fn rank_items(items: Vec<ContextItem>, qvec: Option<&[f32]>, query: &str, k: usize) -> (&'static str, Vec<ContextItem>) {
+    let has_vectors = items.iter().any(|it| it.embedding.is_some());
+    let (mode, mut ranked): (&str, Vec<ContextItem>) = match (qvec, has_vectors) {
         (Some(qv), true) => {
-            let mut scored: Vec<Note> = notes
+            // Semantic: score only indexed items; unindexed ones drop out of semantic results.
+            let mut scored: Vec<ContextItem> = items
                 .into_iter()
-                .filter_map(|(mut n, emb)| {
-                    emb.map(|b| {
-                        n.score = Some(cosine(qv, &blob_to_vec(&b)));
-                        n
-                    })
+                .filter_map(|mut it| match &it.embedding {
+                    Some(b) => {
+                        let s = cosine(qv, &blob_to_vec(b));
+                        it.score = Some(s);
+                        Some(it)
+                    }
+                    None => None,
                 })
                 .collect();
             scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             ("semantic", scored)
         }
         _ => {
-            let mut scored: Vec<Note> = notes
+            let mut scored: Vec<ContextItem> = items
                 .into_iter()
-                .map(|(mut n, _)| {
-                    n.score = Some(keyword_score(&n.content, query));
-                    n
+                .map(|mut it| {
+                    it.score = Some(keyword_score(&it.text, query));
+                    it
                 })
-                .filter(|n| n.score.unwrap_or(0.0) > 0.0)
+                .filter(|it| it.score.unwrap_or(0.0) > 0.0)
                 .collect();
             scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
             ("keyword", scored)
@@ -151,6 +154,31 @@ pub fn rank_notes(notes: Vec<(Note, Option<Vec<u8>>)>, qvec: Option<&[f32]>, que
     };
     ranked.truncate(k);
     (mode, ranked)
+}
+
+/// Notes-specific adapter over [`rank_items`], preserving the original recall API. Pairs each note
+/// with its raw embedding bytes (None = not indexed) and returns the ranked notes with `score` set.
+pub fn rank_notes(notes: Vec<(Note, Option<Vec<u8>>)>, qvec: Option<&[f32]>, query: &str, k: usize) -> (&'static str, Vec<Note>) {
+    let mut by_id: std::collections::HashMap<i64, Note> = std::collections::HashMap::with_capacity(notes.len());
+    let items: Vec<ContextItem> = notes
+        .into_iter()
+        .map(|(n, emb)| {
+            let item = ContextItem { kind: EntityKind::Page, id: n.id, text: n.content.clone(), score: None, embedding: emb };
+            by_id.insert(n.id, n);
+            item
+        })
+        .collect();
+    let (mode, ranked) = rank_items(items, qvec, query, k);
+    let notes = ranked
+        .into_iter()
+        .filter_map(|it| {
+            by_id.remove(&it.id).map(|mut n| {
+                n.score = it.score;
+                n
+            })
+        })
+        .collect();
+    (mode, notes)
 }
 
 #[cfg(test)]
@@ -265,6 +293,28 @@ mod tests {
     fn rank_handles_empty() {
         let (_, ranked) = rank_notes(vec![], Some(&[1.0f32]), "q", 5);
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn rank_items_orders_across_kinds() {
+        let item = |kind, id, text: &str, emb: Option<&[f32]>| ContextItem {
+            kind,
+            id,
+            text: text.into(),
+            score: None,
+            embedding: emb.map(vec_to_blob),
+        };
+        let q = [1.0f32, 0.0];
+        let items = vec![
+            item(EntityKind::Event, 1, "far event", Some(&[0.0, 1.0])),
+            item(EntityKind::Task, 2, "near task", Some(&[0.95, 0.05])),
+            item(EntityKind::Page, 3, "mid page", Some(&[0.6, 0.6])),
+        ];
+        let (mode, ranked) = rank_items(items, Some(&q), "x", 2);
+        assert_eq!(mode, "semantic");
+        assert_eq!(ranked.len(), 2);
+        assert_eq!((ranked[0].kind, ranked[0].id), (EntityKind::Task, 2), "nearest, regardless of kind");
+        assert_eq!(ranked[1].kind, EntityKind::Page);
     }
 
     // ---- embed_text against a mocked OpenAI-compatible embeddings server ----

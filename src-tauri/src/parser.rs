@@ -2788,6 +2788,31 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         }
     }
 
+    // Task↔event de-dup: the small model often emits BOTH a task and a fixed event for a single
+    // "work on X from 12–2" intent (a "Do acc homework" task AND an "Acc homework" 12–2 event), which
+    // double-books — the task then gets auto-scheduled around the event. When a task created this turn
+    // fuzzy-matches such an event, the explicit calendar block is what the user meant, so drop the
+    // task. CRUCIALLY this only fires for events with an EXPLICIT user start time: a duration-only
+    // event ("study, about 3 hours") is not a scheduled block, so a same-named task must survive.
+    if !title_to_id.is_empty() {
+        let timed_titles: Vec<&str> = plan
+            .events
+            .iter()
+            .filter(|ev| ev.start_time.as_deref().and_then(parse_hm).is_some())
+            .map(|ev| ev.title.as_str())
+            .collect();
+        if !timed_titles.is_empty() {
+            let mut dropped: HashSet<i64> = HashSet::new();
+            for (task_title, &tid) in &title_to_id {
+                if timed_titles.iter().any(|et| event_matches(et, task_title)) {
+                    crate::db::delete_task(conn, tid)?;
+                    dropped.insert(tid);
+                }
+            }
+            created_task_ids.retain(|id| !dropped.contains(id));
+        }
+    }
+
     let clarifications = filter_clarifications(
         &plan.clarifications,
         &extra_clarifications,
@@ -2828,6 +2853,59 @@ mod tests {
 
     fn d() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
+    }
+
+    #[test]
+    fn store_plan_drops_task_that_duplicates_a_created_event() {
+        // "I'm going to work on ACC HW tomorrow from 12–2" — the model emits BOTH a task and a fixed
+        // event for one intent. The explicit calendar block wins; the duplicate task is dropped.
+        let conn = crate::db::test_conn();
+        let mut event = ev("tomorrow", Some("12:00"), Some("14:00"));
+        event.title = "Acc homework".into();
+        let task = ParsedTask { title: "Do acc homework".into(), ..Default::default() };
+        let project = ParsedProject { name: "<NAME>".into(), tasks: vec![task] };
+        let plan = ParsedPlan { events: vec![event], projects: vec![project], ..Default::default() };
+
+        let outcome = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(outcome.created_event_ids.len(), 1, "the explicit 12–2 block is kept");
+        assert!(outcome.created_task_ids.is_empty(), "the duplicate task is dropped");
+        assert!(crate::db::list_tasks(&conn).unwrap().is_empty(), "no duplicate task persisted");
+    }
+
+    #[test]
+    fn store_plan_keeps_a_task_unrelated_to_any_event() {
+        // A task whose title doesn't match the event must survive (no over-eager de-dup).
+        let conn = crate::db::test_conn();
+        let mut event = ev("tomorrow", Some("12:00"), Some("14:00"));
+        event.title = "Dentist".into();
+        let task = ParsedTask { title: "Write essay".into(), ..Default::default() };
+        let plan = ParsedPlan {
+            events: vec![event],
+            projects: vec![ParsedProject { name: "<NAME>".into(), tasks: vec![task] }],
+            ..Default::default()
+        };
+        let outcome = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(outcome.created_task_ids.len(), 1, "unrelated task kept");
+        assert_eq!(outcome.created_event_ids.len(), 1);
+    }
+
+    #[test]
+    fn store_plan_keeps_task_when_matching_event_has_no_explicit_start() {
+        // "Study for chemistry, about 3 hours" — if the model also emits a duration-only event with
+        // the same title, that's NOT a scheduled block, so the task must survive (regression guard:
+        // the de-dup must not fire without an explicit start time).
+        let conn = crate::db::test_conn();
+        let mut event = ev("tomorrow", None, None); // no start_time → not a block
+        event.title = "Study chemistry".into();
+        event.duration_minutes = Some(180);
+        let task = ParsedTask { title: "Study chemistry".into(), ..Default::default() };
+        let plan = ParsedPlan {
+            events: vec![event],
+            projects: vec![ParsedProject { name: "<NAME>".into(), tasks: vec![task] }],
+            ..Default::default()
+        };
+        let outcome = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(outcome.created_task_ids.len(), 1, "duration-only event must not drop the task");
     }
 
     #[test]

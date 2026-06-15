@@ -13,6 +13,7 @@ import LabelPane from "./panes/LabelPane";
 import QuickCapture from "./components/QuickCapture";
 import ChatPane from "./panes/ChatPane";
 import TaskListPane from "./panes/TaskListPane";
+import PeoplePane from "./panes/PeoplePane";
 import BookingPane from "./panes/BookingPane";
 import SettingsPane from "./panes/SettingsPane";
 import OnboardingModal from "./components/OnboardingModal";
@@ -66,6 +67,7 @@ export default function App() {
           {view === "graph" && <GraphPane />}
           {view === "inbox" && <InboxPane />}
           {view === "label" && <LabelPane />}
+          {view === "people" && <PeoplePane />}
           {view === "booking" && <BookingPane />}
           {view === "settings" && <SettingsPane />}
           </main>

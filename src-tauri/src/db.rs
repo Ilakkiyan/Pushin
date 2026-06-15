@@ -5,7 +5,7 @@ use crate::model::*;
 use crate::scheduler::SchedulePref;
 use anyhow::Result;
 use chrono::NaiveTime;
-use rusqlite::{params, params_from_iter, Connection, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_google.sql");
@@ -18,6 +18,9 @@ const MIGRATION_0008: &str = include_str!("../migrations/0008_pages.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_brain.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_labels.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_booking_public.sql");
+const MIGRATION_0012: &str = include_str!("../migrations/0012_context_index.sql");
+const MIGRATION_0013: &str = include_str!("../migrations/0013_people.sql");
+const MIGRATION_0014: &str = include_str!("../migrations/0014_focus_sessions.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -72,6 +75,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 11 {
         conn.execute_batch(MIGRATION_0011)?;
         conn.pragma_update(None, "user_version", 11)?;
+    }
+    if version < 12 {
+        conn.execute_batch(MIGRATION_0012)?;
+        conn.pragma_update(None, "user_version", 12)?;
+    }
+    if version < 13 {
+        conn.execute_batch(MIGRATION_0013)?;
+        conn.pragma_update(None, "user_version", 13)?;
+    }
+    if version < 14 {
+        conn.execute_batch(MIGRATION_0014)?;
+        conn.pragma_update(None, "user_version", 14)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -773,6 +788,325 @@ pub fn notes_for_recall(conn: &Connection) -> Result<Vec<(Note, Option<Vec<u8>>)
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+// ---------- Context Engine: the cross-entity recall index (entity_index) ----------
+
+/// Insert or replace the recall-index row for one entity. `embedding` is None when the embed backend
+/// is unavailable — the row is still keyword-searchable. `text_hash` lets the reindexer skip
+/// unchanged rows; `embedding_model` lets it reindex when the model (and thus vector dims) changes.
+pub fn upsert_entity_index(
+    conn: &Connection,
+    kind: EntityKind,
+    entity_id: i64,
+    text: &str,
+    text_hash: &str,
+    embedding: Option<&[u8]>,
+    embedding_model: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO entity_index(entity_kind, entity_id, text, text_hash, embedding, embedding_model, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(entity_kind, entity_id) DO UPDATE SET
+           text = excluded.text,
+           text_hash = excluded.text_hash,
+           embedding = excluded.embedding,
+           embedding_model = excluded.embedding_model,
+           updated_at = excluded.updated_at",
+        params![kind.as_str(), entity_id, text, text_hash, embedding, embedding_model, now_iso()],
+    )?;
+    Ok(())
+}
+
+/// Drop an entity's index row (e.g. when the entity is deleted).
+pub fn delete_entity_index(conn: &Connection, kind: EntityKind, entity_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM entity_index WHERE entity_kind = ?1 AND entity_id = ?2",
+        params![kind.as_str(), entity_id],
+    )?;
+    Ok(())
+}
+
+/// Candidates for cross-entity recall, each carrying its raw embedding bytes (None = not indexed).
+/// Empty `kinds` returns every indexed entity; otherwise only the requested kinds.
+pub fn entity_index_for_recall(conn: &Connection, kinds: &[EntityKind]) -> Result<Vec<ContextItem>> {
+    let mut sql = "SELECT entity_kind, entity_id, text, embedding FROM entity_index".to_string();
+    if !kinds.is_empty() {
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" WHERE entity_kind IN ({placeholders})"));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let kind_strs: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+    let rows = stmt.query_map(params_from_iter(kind_strs.iter()), |r| {
+        Ok((
+            r.get::<_, String>("entity_kind")?,
+            r.get::<_, i64>("entity_id")?,
+            r.get::<_, String>("text")?,
+            r.get::<_, Option<Vec<u8>>>("embedding")?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind_s, id, text, embedding) = row?;
+        if let Some(kind) = EntityKind::from_str(&kind_s) {
+            out.push(ContextItem { kind, id, text, score: None, embedding });
+        }
+    }
+    Ok(out)
+}
+
+/// Map of `entity_id` → stored `text_hash` for a kind, so the reindexer can skip unchanged rows.
+pub fn entity_index_hashes(conn: &Connection, kind: EntityKind) -> Result<std::collections::HashMap<i64, String>> {
+    let mut stmt = conn.prepare("SELECT entity_id, text_hash FROM entity_index WHERE entity_kind = ?1")?;
+    let rows = stmt.query_map(params![kind.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Stored index state per entity of a kind (hash + whether it has a vector + which model produced it),
+/// for the reindex pipeline's skip/re-embed decision.
+pub fn entity_index_meta(conn: &Connection, kind: EntityKind) -> Result<std::collections::HashMap<i64, crate::context::IndexState>> {
+    let mut stmt = conn.prepare(
+        "SELECT entity_id, text_hash, embedding IS NOT NULL AS has_emb, embedding_model FROM entity_index WHERE entity_kind = ?1",
+    )?;
+    let rows = stmt.query_map(params![kind.as_str()], |r| {
+        Ok((
+            r.get::<_, i64>("entity_id")?,
+            crate::context::IndexState {
+                text_hash: r.get::<_, String>("text_hash")?,
+                has_embedding: r.get::<_, i64>("has_emb")? != 0,
+                model: r.get::<_, Option<String>>("embedding_model")?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Project every indexable entity (tasks, events, pages) to its embeddable `ContextItem` — the input
+/// to the reindex sweep. Blank-text entities are skipped. `embedding`/`score` are left unset here.
+pub fn entities_for_index(conn: &Connection) -> Result<Vec<ContextItem>> {
+    let mut out = Vec::new();
+    let mut push = |kind: EntityKind, id: i64, text: String| {
+        if !text.trim().is_empty() {
+            out.push(ContextItem { kind, id, text, score: None, embedding: None });
+        }
+    };
+    for t in list_tasks(conn)? {
+        push(EntityKind::Task, t.id, crate::context::task_text(&t));
+    }
+    for e in list_events(conn)? {
+        push(EntityKind::Event, e.id, crate::context::event_text(&e));
+    }
+    // Pages live in `notes`; `list_pages` strips bodies, so read title+content directly.
+    let pages: Vec<(i64, Option<String>, String)> = {
+        let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>("id")?, r.get::<_, Option<String>>("title")?, r.get::<_, String>("content")?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, title, content) in pages {
+        // Only index pages with real body content. A title-only page (e.g. a blank daily note) has
+        // nothing to recall on — embedding its bare title/date is pure noise.
+        if content.trim().is_empty() {
+            continue;
+        }
+        push(EntityKind::Page, id, crate::context::page_text(title.as_deref().unwrap_or(""), &content));
+    }
+    for p in list_people(conn)? {
+        push(EntityKind::Person, p.id, crate::context::person_text(&p.name, &p.notes));
+    }
+    Ok(out)
+}
+
+/// 1-hop neighbors of an entity in the unified graph: page↔task/event via `entity_links`, and
+/// page→page via `page_links` (both directions). Used by the Context Engine to expand recall hits
+/// with their structurally-related entities. Returns possibly-duplicate `(kind, id)` pairs.
+pub fn entity_neighbors(conn: &Connection, kind: EntityKind, id: i64) -> Result<Vec<(EntityKind, i64)>> {
+    let mut out = Vec::new();
+    match kind {
+        EntityKind::Page => {
+            let mut linked = conn.prepare("SELECT entity_kind, entity_id FROM entity_links WHERE page_id = ?1")?;
+            for row in linked.query_map(params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+                let (k, eid) = row?;
+                if let Some(k) = EntityKind::from_str(&k) {
+                    out.push((k, eid));
+                }
+            }
+            let mut outgoing = conn.prepare("SELECT target_id FROM page_links WHERE source_id = ?1 AND target_id IS NOT NULL")?;
+            for row in outgoing.query_map(params![id], |r| r.get::<_, i64>(0))? {
+                out.push((EntityKind::Page, row?));
+            }
+            let mut incoming = conn.prepare("SELECT source_id FROM page_links WHERE target_id = ?1")?;
+            for row in incoming.query_map(params![id], |r| r.get::<_, i64>(0))? {
+                out.push((EntityKind::Page, row?));
+            }
+        }
+        EntityKind::Task | EntityKind::Event => {
+            let mut pages = conn.prepare("SELECT page_id FROM entity_links WHERE entity_kind = ?1 AND entity_id = ?2")?;
+            for row in pages.query_map(params![kind.as_str(), id], |r| r.get::<_, i64>(0))? {
+                out.push((EntityKind::Page, row?));
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// The most recently created tasks and events as `ContextItem`s — a low-priority recency tail for
+/// assembled context (helps when recall is thin). Text mirrors the index projections.
+pub fn recent_entities(conn: &Connection, limit: usize) -> Result<Vec<ContextItem>> {
+    let mut out = Vec::new();
+    let mut tasks = conn.prepare("SELECT id, title, notes FROM tasks ORDER BY created_at DESC, id DESC LIMIT ?1")?;
+    for row in tasks.query_map(params![limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (id, title, notes) = row?;
+        let text = if notes.trim().is_empty() { title.trim().to_string() } else { format!("{}\n{}", title.trim(), notes.trim()) };
+        if !text.is_empty() {
+            out.push(ContextItem { kind: EntityKind::Task, id, text, score: None, embedding: None });
+        }
+    }
+    let mut events = conn.prepare("SELECT id, title FROM events ORDER BY created_at DESC, id DESC LIMIT ?1")?;
+    for row in events.query_map(params![limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, title) = row?;
+        let title = title.trim().to_string();
+        if !title.is_empty() {
+            out.push(ContextItem { kind: EntityKind::Event, id, text: title, score: None, embedding: None });
+        }
+    }
+    Ok(out)
+}
+
+// ---------- People (the relationship layer / private CRM) ----------
+
+fn row_to_person(r: &Row) -> rusqlite::Result<Person> {
+    Ok(Person {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        email: r.get("email")?,
+        notes: r.get("notes")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+pub fn insert_person(conn: &Connection, name: &str, email: Option<&str>, notes: &str) -> Result<i64> {
+    let now = now_iso();
+    let email = email.map(str::trim).filter(|e| !e.is_empty());
+    conn.execute(
+        "INSERT INTO people(name, email, notes, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?4)",
+        params![name.trim(), email, notes, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Create or fetch a person by email (the dedupe key). When a row already exists for the email, its
+/// id is returned (and a previously-blank name is filled in) rather than inserting a duplicate. With
+/// no email we always insert (no reliable identity to dedupe on). Used to auto-create people from
+/// booking invitees.
+pub fn upsert_person_by_email(conn: &Connection, name: &str, email: Option<&str>) -> Result<i64> {
+    let email = email.map(str::trim).filter(|e| !e.is_empty());
+    if let Some(email) = email {
+        let existing: Option<(i64, String)> = conn
+            .query_row("SELECT id, name FROM people WHERE email = ?1", params![email], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((id, existing_name)) = existing {
+            if existing_name.trim().is_empty() && !name.trim().is_empty() {
+                conn.execute("UPDATE people SET name = ?1, updated_at = ?2 WHERE id = ?3", params![name.trim(), now_iso(), id])?;
+            }
+            return Ok(id);
+        }
+    }
+    insert_person(conn, name, email, "")
+}
+
+pub fn list_people(conn: &Connection) -> Result<Vec<Person>> {
+    let mut stmt = conn.prepare("SELECT id, name, email, notes, created_at, updated_at FROM people ORDER BY name COLLATE NOCASE")?;
+    let rows = stmt.query_map([], row_to_person)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn get_person(conn: &Connection, id: i64) -> Result<Person> {
+    Ok(conn.query_row("SELECT id, name, email, notes, created_at, updated_at FROM people WHERE id = ?1", params![id], row_to_person)?)
+}
+
+pub fn update_person(conn: &Connection, id: i64, name: &str, email: Option<&str>, notes: &str) -> Result<Person> {
+    let email = email.map(str::trim).filter(|e| !e.is_empty());
+    conn.execute(
+        "UPDATE people SET name = ?1, email = ?2, notes = ?3, updated_at = ?4 WHERE id = ?5",
+        params![name.trim(), email, notes, now_iso(), id],
+    )?;
+    get_person(conn, id)
+}
+
+pub fn delete_person(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM people WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+// ---------- Focus sessions (time-tracking) ----------
+
+/// Elapsed minutes of a session; 0 while running (no `end`).
+fn session_minutes(start: &str, end: Option<&str>) -> i64 {
+    match (crate::scheduler::parse_dt(start), end.and_then(crate::scheduler::parse_dt)) {
+        (Some(s), Some(e)) => (e - s).num_minutes().max(0),
+        _ => 0,
+    }
+}
+
+fn row_to_focus(r: &Row) -> rusqlite::Result<FocusSession> {
+    let start: String = r.get("start")?;
+    let end: Option<String> = r.get("end")?;
+    let minutes = session_minutes(&start, end.as_deref());
+    Ok(FocusSession { id: r.get("id")?, task_id: r.get("task_id")?, start, end, minutes })
+}
+
+/// Start a focus session on a task. Enforces a single active session: any still-running session is
+/// stopped first (so the timer never double-counts).
+pub fn start_focus(conn: &Connection, task_id: i64) -> Result<FocusSession> {
+    let now = now_iso();
+    conn.execute("UPDATE focus_sessions SET end = ?1 WHERE end IS NULL", params![now])?;
+    conn.execute("INSERT INTO focus_sessions(task_id, start, end, created_at) VALUES(?1, ?2, NULL, ?2)", params![task_id, now])?;
+    let id = conn.last_insert_rowid();
+    Ok(conn.query_row("SELECT id, task_id, start, end FROM focus_sessions WHERE id = ?1", params![id], row_to_focus)?)
+}
+
+/// Stop a running focus session (no-op if already stopped).
+pub fn stop_focus(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE focus_sessions SET end = ?1 WHERE id = ?2 AND end IS NULL", params![now_iso(), id])?;
+    Ok(())
+}
+
+/// The currently-running focus session, if any.
+pub fn active_focus(conn: &Connection) -> Result<Option<FocusSession>> {
+    Ok(conn
+        .query_row("SELECT id, task_id, start, end FROM focus_sessions WHERE end IS NULL ORDER BY id DESC LIMIT 1", [], row_to_focus)
+        .optional()?)
+}
+
+/// Total tracked minutes (completed sessions) for a task.
+pub fn focus_minutes_for_task(conn: &Connection, task_id: i64) -> Result<i64> {
+    let mut stmt = conn.prepare("SELECT start, end FROM focus_sessions WHERE task_id = ?1 AND end IS NOT NULL")?;
+    let rows = stmt.query_map(params![task_id], |r| {
+        let start: String = r.get(0)?;
+        let end: Option<String> = r.get(1)?;
+        Ok(session_minutes(&start, end.as_deref()))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?.into_iter().sum())
+}
+
+/// `(estimated_minutes, actual focus minutes)` for completed, focus-tracked tasks — the learning
+/// samples for the adaptive estimate (`scheduler::estimation_factor`).
+pub fn estimation_samples(conn: &Connection) -> Result<Vec<(i64, i64)>> {
+    let mut out = Vec::new();
+    for t in list_tasks(conn)? {
+        if t.status != "done" || t.estimated_minutes <= 0 {
+            continue;
+        }
+        let actual = focus_minutes_for_task(conn, t.id)?;
+        if actual > 0 {
+            out.push((t.estimated_minutes, actual));
+        }
+    }
+    Ok(out)
+}
+
 // ---------- Pages (vault: the notes table viewed as Notion-style documents) ----------
 
 /// A display title for a page: its explicit `title`, else the first non-empty line of the body
@@ -1252,6 +1586,54 @@ pub fn labels_for_entities(conn: &Connection, kind: &str, ids: &[i64]) -> Result
     Ok(out)
 }
 
+/// The free text of any labelable entity, for keyword auto-labeling. `kind` is the label-kind string
+/// ("task"/"event"/"page"/"person"/"habit"/"project"). None when the kind is unknown or no such row.
+pub fn entity_text(conn: &Connection, kind: &str, id: i64) -> Result<Option<String>> {
+    let text: Option<String> = match kind {
+        "task" => conn.query_row("SELECT title || ' ' || notes FROM tasks WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        "event" => conn.query_row("SELECT title FROM events WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        "page" => conn.query_row("SELECT COALESCE(title, '') || ' ' || content FROM notes WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        "person" => conn.query_row("SELECT name || ' ' || notes FROM people WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        "habit" => conn.query_row("SELECT name FROM habits WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        "project" => conn.query_row("SELECT name FROM projects WHERE id = ?1", params![id], |r| r.get(0)).optional()?,
+        _ => None,
+    };
+    Ok(text)
+}
+
+/// True if `needle` occurs in `hay` on word boundaries (both lowercase) — so "work" matches "more
+/// work" but not "homework". Avoids false-positive auto-labels from substrings.
+fn word_bounded_contains(hay: &str, needle: &str) -> bool {
+    let (hb, nb) = (hay.as_bytes(), needle.as_bytes());
+    let mut start = 0;
+    while let Some(pos) = hay[start..].find(needle) {
+        let i = start + pos;
+        let before_ok = i == 0 || !hb[i - 1].is_ascii_alphanumeric();
+        let after = i + nb.len();
+        let after_ok = after >= hb.len() || !hb[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + 1;
+    }
+    false
+}
+
+/// Keyword auto-labeling: existing labels whose name (≥3 chars) appears as a whole word/phrase,
+/// case-insensitively, in `text` and isn't already applied. The deterministic core surfaced as
+/// confirm-chips in the picker. Pure.
+pub fn suggest_labels_from(labels: &[Label], text: &str, applied: &[i64]) -> Vec<Label> {
+    let hay = text.to_lowercase();
+    labels
+        .iter()
+        .filter(|l| {
+            let name = l.name.trim().to_lowercase();
+            name.len() >= 3 && !applied.contains(&l.id) && word_bounded_contains(&hay, &name)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Every entity tagged with a label (for the cross-cutting filtered view). Returns (kind, id) refs;
 /// the frontend resolves them to titles from its loaded store.
 pub fn entities_for_label(conn: &Connection, label_id: i64) -> Result<Vec<EntityRef>> {
@@ -1365,6 +1747,157 @@ mod tests {
 
     fn mem() -> Connection {
         super::test_conn()
+    }
+
+    #[test]
+    fn entity_index_upsert_and_recall_roundtrip() {
+        let conn = mem();
+        let emb = crate::hermes::vec_to_blob(&[0.1, 0.2, 0.3]);
+        upsert_entity_index(&conn, EntityKind::Task, 7, "write the report", "h1", Some(&emb), Some("bge")).unwrap();
+        upsert_entity_index(&conn, EntityKind::Event, 9, "team sync", "h2", None, None).unwrap();
+
+        // Empty kinds → everything; filtered kinds → only that kind.
+        assert_eq!(entity_index_for_recall(&conn, &[]).unwrap().len(), 2);
+        let tasks = entity_index_for_recall(&conn, &[EntityKind::Task]).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 7);
+        assert_eq!(tasks[0].text, "write the report");
+        assert_eq!(tasks[0].embedding.as_deref(), Some(emb.as_slice()));
+        // The unindexed event still surfaces, just without a vector.
+        assert!(entity_index_for_recall(&conn, &[EntityKind::Event]).unwrap()[0].embedding.is_none());
+
+        // Upsert replaces in place (no duplicate PK), and hashes are retrievable.
+        upsert_entity_index(&conn, EntityKind::Task, 7, "write the Q3 report", "h1b", Some(&emb), Some("bge")).unwrap();
+        assert_eq!(entity_index_for_recall(&conn, &[EntityKind::Task]).unwrap().len(), 1);
+        assert_eq!(entity_index_hashes(&conn, EntityKind::Task).unwrap().get(&7).map(String::as_str), Some("h1b"));
+
+        delete_entity_index(&conn, EntityKind::Task, 7).unwrap();
+        assert!(entity_index_for_recall(&conn, &[EntityKind::Task]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn estimation_samples_are_completed_focus_tracked_tasks() {
+        let conn = mem();
+        let done = insert_task(&conn, None, "Wrote it", "", 60, None, 2, 30, 120, &[]).unwrap();
+        let other = insert_task(&conn, None, "Not done", "", 60, None, 2, 30, 120, &[]).unwrap();
+        // 90 minutes of real focus on the done task (1.5× its 60-min estimate).
+        conn.execute(
+            "INSERT INTO focus_sessions(task_id, start, end, created_at) VALUES(?1, ?2, ?3, ?2)",
+            params![done, "2026-06-15T10:00:00", "2026-06-15T11:30:00"],
+        )
+        .unwrap();
+        // A focus session on a NOT-done task should not become a sample.
+        conn.execute(
+            "INSERT INTO focus_sessions(task_id, start, end, created_at) VALUES(?1, ?2, ?3, ?2)",
+            params![other, "2026-06-15T10:00:00", "2026-06-15T10:30:00"],
+        )
+        .unwrap();
+        set_task_status(&conn, done, "done").unwrap();
+
+        let samples = estimation_samples(&conn).unwrap();
+        assert_eq!(samples, vec![(60, 90)], "only the completed, focus-tracked task is a sample");
+    }
+
+    #[test]
+    fn focus_sessions_track_one_active_at_a_time() {
+        let conn = mem();
+        let t1 = insert_task(&conn, None, "Write", "", 60, None, 2, 30, 120, &[]).unwrap();
+        let t2 = insert_task(&conn, None, "Read", "", 60, None, 2, 30, 120, &[]).unwrap();
+
+        let s1 = start_focus(&conn, t1).unwrap();
+        assert_eq!(active_focus(&conn).unwrap().unwrap().id, s1.id, "session is active");
+        assert!(s1.end.is_none());
+
+        // Starting a second session stops the first (single active).
+        let s2 = start_focus(&conn, t2).unwrap();
+        assert_eq!(active_focus(&conn).unwrap().unwrap().id, s2.id);
+        assert!(active_focus(&conn).unwrap().unwrap().task_id == t2);
+
+        stop_focus(&conn, s2.id).unwrap();
+        assert!(active_focus(&conn).unwrap().is_none(), "nothing active after stop");
+
+        // The first task accrued some (>=0) tracked minutes; deleting the task cascades its sessions.
+        let _ = focus_minutes_for_task(&conn, t1).unwrap();
+        delete_task(&conn, t1).unwrap();
+        assert_eq!(focus_minutes_for_task(&conn, t1).unwrap(), 0);
+    }
+
+    #[test]
+    fn suggest_labels_matches_names_in_entity_text() {
+        let conn = mem();
+        let school = get_or_create_label(&conn, "School", "#0ea5e9").unwrap();
+        get_or_create_label(&conn, "Work", "#10b981").unwrap();
+        let tid = insert_task(&conn, None, "Do school homework", "", 60, None, 2, 30, 120, &[]).unwrap();
+
+        let text = entity_text(&conn, "task", tid).unwrap().unwrap();
+        let labels = list_labels(&conn).unwrap();
+        let suggestions = suggest_labels_from(&labels, &text, &[]);
+        assert!(suggestions.iter().any(|l| l.name == "School"), "School appears in the task text");
+        assert!(!suggestions.iter().any(|l| l.name == "Work"), "Work does not appear");
+
+        // Already-applied labels are excluded from suggestions.
+        assert!(suggest_labels_from(&labels, &text, &[school]).iter().all(|l| l.name != "School"));
+        // Unknown kinds / missing rows yield no text.
+        assert!(entity_text(&conn, "bogus", tid).unwrap().is_none());
+    }
+
+    #[test]
+    fn people_upsert_dedupes_by_email_and_indexes() {
+        let conn = mem();
+        let a = upsert_person_by_email(&conn, "Ava Stone", Some("ava@example.com")).unwrap();
+        // Same email → same person (no duplicate), and a blank name backfills.
+        let b = upsert_person_by_email(&conn, "", Some("ava@example.com")).unwrap();
+        assert_eq!(a, b, "same email dedupes to one person");
+        assert_eq!(list_people(&conn).unwrap().len(), 1);
+        assert_eq!(get_person(&conn, a).unwrap().name, "Ava Stone");
+        // No email → always a new row.
+        upsert_person_by_email(&conn, "Anon", None).unwrap();
+        assert_eq!(list_people(&conn).unwrap().len(), 2);
+
+        // People flow into the cross-entity index.
+        update_person(&conn, a, "Ava Stone", Some("ava@example.com"), "met at the conference").unwrap();
+        let items = entities_for_index(&conn).unwrap();
+        let person = items.iter().find(|it| it.kind == EntityKind::Person && it.id == a).unwrap();
+        assert_eq!(person.text, "Ava Stone\nmet at the conference");
+
+        delete_person(&conn, a).unwrap();
+        assert_eq!(list_people(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn entity_neighbors_walks_links_both_ways() {
+        let conn = mem();
+        let task = insert_task(&conn, None, "Prep deck", "", 60, None, 2, 30, 120, &[]).unwrap();
+        let hub = insert_page(&conn, "Project hub", None, "see [[Sub page]]", None, None, None).unwrap();
+        let sub = insert_page(&conn, "Sub page", None, "details", None, None, None).unwrap();
+        link_entity(&conn, hub, "task", task).unwrap();
+        set_page_links(&conn, hub, &["Sub page".to_string()]).unwrap();
+
+        // From the page: its linked task, its outgoing page link.
+        let from_page = entity_neighbors(&conn, EntityKind::Page, hub).unwrap();
+        assert!(from_page.contains(&(EntityKind::Task, task)));
+        assert!(from_page.contains(&(EntityKind::Page, sub)));
+        // From the task: the page that references it.
+        assert_eq!(entity_neighbors(&conn, EntityKind::Task, task).unwrap(), vec![(EntityKind::Page, hub)]);
+        // From the sub page: the backlink from the hub.
+        assert!(entity_neighbors(&conn, EntityKind::Page, sub).unwrap().contains(&(EntityKind::Page, hub)));
+    }
+
+    #[test]
+    fn entities_for_index_projects_all_kinds_and_skips_blanks() {
+        let conn = mem();
+        let tid = insert_task(&conn, None, "Write report", "for Q3", 60, None, 2, 30, 120, &[]).unwrap();
+        let eid = insert_event(&conn, "Team sync", "2026-06-15T10:00:00", "2026-06-15T10:30:00", "fixed").unwrap();
+        let pid = insert_page(&conn, "Trip plan", None, "pack bags", None, None, None).unwrap();
+        // A whitespace-only event title should be skipped (nothing to embed).
+        insert_event(&conn, "   ", "2026-06-15T12:00:00", "2026-06-15T12:30:00", "fixed").unwrap();
+
+        let items = entities_for_index(&conn).unwrap();
+        let find = |k: EntityKind, id: i64| items.iter().find(|it| it.kind == k && it.id == id);
+        assert_eq!(find(EntityKind::Task, tid).unwrap().text, "Write report\nfor Q3");
+        assert_eq!(find(EntityKind::Event, eid).unwrap().text, "Team sync");
+        assert_eq!(find(EntityKind::Page, pid).unwrap().text, "Trip plan\npack bags");
+        assert_eq!(items.iter().filter(|it| it.kind == EntityKind::Event).count(), 1, "blank-title event skipped");
     }
 
     #[test]

@@ -22,7 +22,7 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "booking" | "settings";
+type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "people" | "booking" | "settings";
 type CalMode = "week" | "month";
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
@@ -44,6 +44,8 @@ interface State {
   bookings: Booking[];
   conflicts: Conflict[];
   llm: LlmStatus | null;
+  /** Whether the on-device embedding (memory) engine is up — drives the "Memory" status badge. */
+  embedReady: boolean;
 
   // Calendar view mode (week vs month), independent of which page you're on.
   calMode: CalMode;
@@ -185,6 +187,7 @@ export const useStore = create<State>((set, get) => {
     bookings: [],
     conflicts: [],
     llm: null,
+    embedReady: false,
     calMode: "week",
     calColorByLabel: false,
     calLabelFilterIds: [],
@@ -236,7 +239,12 @@ export const useStore = create<State>((set, get) => {
       // if it's not ready, recall just uses keyword search. Skipped until a chat model exists so we
       // don't download anything before the user has opted into the AI.
       if (get().llm?.reachable) {
-        api.ensureEmbeddings().catch(() => {});
+        // ensure_embeddings cheap-early-returns when the engine is already healthy, so its result
+        // doubles as a status signal for the "Memory" badge. Resolves once the engine is up (~30s
+        // on first spawn), flipping the badge to ready.
+        api.ensureEmbeddings()
+          .then((m) => set({ embedReady: /ready/i.test(m) }))
+          .catch(() => set({ embedReady: false }));
       }
     },
 

@@ -1,13 +1,16 @@
 mod booking;
 mod booking_server;
+mod briefing;
 mod calendar;
 mod commands;
+mod context;
 // Public so the LLM-evaluation harness (`tests/llm_eval.rs`) can drive the real parsing
 // pipeline against a live llama-server. No external consumers otherwise.
 pub mod db;
 mod habits;
 mod hermes;
 mod llm;
+mod meeting;
 pub mod model;
 mod model_manager;
 pub mod parser;
@@ -113,6 +116,19 @@ pub fn run() {
             commands::extract_memories,
             commands::unlinked_mentions,
             commands::vault_ask,
+            commands::list_people,
+            commands::get_person,
+            commands::create_person,
+            commands::update_person,
+            commands::delete_person,
+            commands::daily_briefing,
+            commands::meeting_brief,
+            commands::extract_action_items,
+            commands::start_focus,
+            commands::stop_focus,
+            commands::active_focus,
+            commands::task_focus_minutes,
+            commands::suggest_labels,
             commands::read_markdown_dir,
             commands::capture_note,
             commands::list_inbox,

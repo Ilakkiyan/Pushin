@@ -7,7 +7,19 @@ use rusqlite::Connection;
 
 /// Recompute the schedule from the current DB state and persist the new blocks.
 pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<ScheduleResult> {
-    let tasks = db::list_tasks(conn)?;
+    let mut tasks = db::list_tasks(conn)?;
+    // Adaptive estimate: bias not-done task durations by what completed tasks ACTUALLY took
+    // (focus-tracked). A soft input — `estimation_factor` is 1.0 (no change) until there's history,
+    // so the scheduler stays deterministic and its tests are unaffected. Stored estimates are not
+    // mutated; only this scheduling pass is rescaled.
+    let factor = scheduler::estimation_factor(&db::estimation_samples(conn).unwrap_or_default());
+    if (factor - 1.0).abs() > 1e-6 {
+        for t in &mut tasks {
+            if t.status != "done" && t.status != "in_progress" {
+                t.estimated_minutes = ((t.estimated_minutes as f64 * factor).round() as i64).max(15);
+            }
+        }
+    }
     let events = db::list_events(conn)?;
     let blocks = db::list_blocks(conn)?;
 

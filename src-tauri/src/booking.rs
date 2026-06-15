@@ -124,7 +124,11 @@ pub fn confirm_booking(
     }
 
     let title = format!("{}: {}", event_type.name, name);
-    db::insert_booking(conn, event_type.id, &title, &name, &email, &wanted.start, &wanted.end)
+    let booking_id = db::insert_booking(conn, event_type.id, &title, &name, &email, &wanted.start, &wanted.end)?;
+    // Relationship layer: a booking creates (or links to) a person, deduped by email. Best-effort —
+    // never fail a confirmed booking over a person-record hiccup.
+    let _ = db::upsert_person_by_email(conn, &name, Some(&email));
+    Ok(booking_id)
 }
 
 #[cfg(test)]
@@ -209,6 +213,19 @@ mod tests {
         confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
         assert_eq!(db::list_bookings(&conn).unwrap().len(), 1);
         assert!(db::list_events(&conn).unwrap().iter().any(|e| e.title.contains("Ava")));
+    }
+
+    #[test]
+    fn confirm_booking_creates_a_person_from_the_invitee() {
+        let mut conn = db::test_conn();
+        let settings = Settings::default();
+        let event_type = inserted_et(&conn, 30, 0);
+        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
+        let people = db::list_people(&conn).unwrap();
+        assert_eq!(people.len(), 1, "the invitee becomes a person");
+        assert_eq!(people[0].name, "Ava");
+        assert_eq!(people[0].email.as_deref(), Some("ava@example.com"));
     }
 
     #[test]

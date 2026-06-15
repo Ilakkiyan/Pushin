@@ -13,7 +13,7 @@ use crate::{db, habits, hermes, llm};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
@@ -81,19 +81,25 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
     db::save_settings(&conn, &settings).map_err(err)
 }
 
-/// Pick the saved notes worth injecting into the planner prompt: only when *semantic* recall ran
-/// (embed server up), only strong matches (cosine ≥ 0.35), at most 2, each truncated. Small models
-/// are prompt-sensitive (gotcha #1), so a weak/keyword/empty recall contributes nothing. Pure.
-fn gate_recalled_memory(result: &RecallResult) -> Vec<String> {
-    if result.mode != "semantic" {
+/// The cosine floor for injecting a recalled note into the planner. bge-small's similarity for
+/// *unrelated* short text measures ~0.59 (two random notes scored 0.587 in testing), so the floor
+/// must clear that baseline with margin — better to recall nothing than feed the prompt-sensitive
+/// small model an irrelevant note (gotcha #1). Tune against a real corpus.
+const RECALL_FLOOR: f32 = 0.65;
+
+/// Pick the recalled context worth injecting into the planner prompt: only when *semantic* recall
+/// ran (embed server up), only strong matches (cosine ≥ `RECALL_FLOOR`), at most 2, each truncated.
+/// Graph-neighbor and recency items (which carry no score) are excluded here by design. Pure.
+fn gate_recalled_context(bundle: &crate::context::ContextBundle) -> Vec<String> {
+    if bundle.mode != "semantic" {
         return Vec::new();
     }
-    result
-        .notes
+    bundle
+        .items
         .iter()
-        .filter(|n| n.score.unwrap_or(0.0) >= 0.35)
+        .filter(|it| it.score.unwrap_or(0.0) >= RECALL_FLOOR)
         .take(2)
-        .map(|n| n.content.trim().chars().take(220).collect::<String>())
+        .map(|it| it.text.trim().chars().take(220).collect::<String>())
         .collect()
 }
 
@@ -121,10 +127,11 @@ pub async fn plan_tasks(
         let conn = state.db.lock().unwrap();
         (db::get_settings(&conn).map_err(err)?, db::list_events(&conn).map_err(err)?)
     };
-    // Auto-recall relevant saved notes to inform planning. Best-effort and conservative — see
-    // `gate_recalled_memory` (semantic-only, strong-match, capped + truncated).
-    let recalled: Vec<String> = match recall_notes(&state, &text, 3).await {
-        Ok(r) => gate_recalled_memory(&r),
+    // Auto-recall relevant durable notes (pages) to inform planning. Pages only: the planner already
+    // sees current events, and recalling tasks/events just adds noise. Best-effort and conservative —
+    // see `gate_recalled_context` (semantic-only, strong-match, capped + truncated).
+    let recalled: Vec<String> = match recall_context(&state, &text, &[EntityKind::Page], 5).await {
+        Ok(b) => gate_recalled_context(&b),
         Err(_) => Vec::new(),
     };
     // Network call — no DB lock held here.
@@ -776,6 +783,48 @@ pub async fn hermes_recall(state: State<'_, AppState>, query: String, k: Option<
     recall_notes(&state, &query, k).await
 }
 
+/// Cross-entity recall — the Context Engine's read path. Embeds the query, ranks everything in
+/// `entity_index` (semantic when the embed server is up + entities indexed, else keyword), expands
+/// the top hits with 1-hop graph neighbors, appends a small recency tail, and trims to a budget.
+/// The DB lock is never held across the embed `.await` (gotcha #8).
+async fn recall_context(state: &State<'_, AppState>, query: &str, kinds: &[EntityKind], k: usize) -> Result<crate::context::ContextBundle, String> {
+    let model = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?.embed_model
+    };
+    let qvec = if model.trim().is_empty() {
+        None
+    } else {
+        let base = model_manager::embed_base_url();
+        hermes::embed_text(&state.http, &base, &model, query).await.ok()
+    };
+    // One lock: rank the index snapshot, then resolve neighbors + recency from the same connection.
+    let (mode, top, neighbors, recency) = {
+        let conn = state.db.lock().unwrap();
+        let all = db::entity_index_for_recall(&conn, kinds).map_err(err)?;
+        let text_map: HashMap<(EntityKind, i64), String> = all.iter().map(|it| ((it.kind, it.id), it.text.clone())).collect();
+        let (mode, top) = hermes::rank_items(all, qvec.as_deref(), query, k);
+        let mut neighbors = Vec::new();
+        let mut seen: HashSet<(EntityKind, i64)> = HashSet::new();
+        for hit in &top {
+            if let Ok(refs) = db::entity_neighbors(&conn, hit.kind, hit.id) {
+                for (nk, nid) in refs {
+                    if seen.insert((nk, nid)) {
+                        if let Some(text) = text_map.get(&(nk, nid)) {
+                            neighbors.push(ContextItem { kind: nk, id: nid, text: text.clone(), score: None, embedding: None });
+                        }
+                    }
+                }
+            }
+        }
+        let recency = db::recent_entities(&conn, 4).unwrap_or_default();
+        (mode.to_string(), top, neighbors, recency)
+    };
+    let budget = crate::context::Budget { max_items: 8, max_chars: 4000 };
+    let items = crate::context::merge_and_trim(vec![top, neighbors, recency], &budget);
+    Ok(crate::context::ContextBundle { mode, items })
+}
+
 // ---------- Vault pages (Notion-style documents over the Hermes notes store) ----------
 
 /// Embed `text` on-device, best-effort. Returns the (blob, model) to persist, or None when there's
@@ -792,6 +841,91 @@ async fn embed_best_effort(state: &State<'_, AppState>, text: &str) -> (Option<V
     let base = model_manager::embed_base_url();
     let blob = hermes::embed_text(&state.http, &base, &model, text).await.ok().map(|v| hermes::vec_to_blob(&v));
     (blob, model)
+}
+
+/// Bring the cross-entity recall index (`entity_index`) up to date: (re)embed tasks/events/pages
+/// whose projected text is new or changed, and prune rows for entities that no longer exist.
+/// Best-effort and idempotent — unchanged rows are skipped via their `text_hash`, and when the embed
+/// backend is down rows are still tracked (NULL vector, keyword-searchable) and retried next sweep.
+/// Spawnable: takes owned handles and never holds the DB lock across the embed `.await` (gotcha #8).
+/// Returns how many rows were embedded this pass.
+pub async fn reindex_all(db: Arc<Mutex<Connection>>, http: reqwest::Client) -> usize {
+    const BATCH: usize = 32;
+    use std::collections::HashMap;
+
+    // 1. Snapshot model + entities + existing index state under one short lock.
+    let (model, items, existing) = {
+        let conn = db.lock().unwrap();
+        let model = db::get_settings(&conn).map(|s| s.embed_model).unwrap_or_default();
+        let items = match db::entities_for_index(&conn) {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        let mut existing: HashMap<(EntityKind, i64), crate::context::IndexState> = HashMap::new();
+        for kind in [EntityKind::Task, EntityKind::Event, EntityKind::Page] {
+            if let Ok(map) = db::entity_index_meta(&conn, kind) {
+                for (id, st) in map {
+                    existing.insert((kind, id), st);
+                }
+            }
+        }
+        (model, items, existing)
+    };
+
+    // 2. Decide what needs (re)indexing and what to prune.
+    let present: HashSet<(EntityKind, i64)> = items.iter().map(|it| (it.kind, it.id)).collect();
+    let mut todo: Vec<(ContextItem, String)> = Vec::new();
+    for it in items {
+        let hash = crate::context::text_hash(&it.text);
+        if crate::context::needs_index_work(existing.get(&(it.kind, it.id)), &hash, &model) {
+            todo.push((it, hash));
+        }
+    }
+    let to_prune: Vec<(EntityKind, i64)> = existing.keys().filter(|k| !present.contains(k)).cloned().collect();
+    if todo.is_empty() && to_prune.is_empty() {
+        return 0;
+    }
+
+    // 3. Embed changed rows in batches, outside the lock. On failure keep NULL (keyword fallback).
+    let base = model_manager::embed_base_url();
+    let prepared: Vec<(ContextItem, String, Option<Vec<u8>>)> = if model.trim().is_empty() {
+        todo.into_iter().map(|(it, hash)| (it, hash, None)).collect()
+    } else {
+        let mut prepared = Vec::with_capacity(todo.len());
+        for chunk in todo.chunks(BATCH) {
+            let texts: Vec<&str> = chunk.iter().map(|(it, _)| it.text.as_str()).collect();
+            let vecs = hermes::embed_batch(&http, &base, &model, &texts).await.ok();
+            for (i, (it, hash)) in chunk.iter().enumerate() {
+                let blob = vecs.as_ref().and_then(|v| v.get(i)).map(|fv| hermes::vec_to_blob(fv));
+                prepared.push((it.clone(), hash.clone(), blob));
+            }
+        }
+        prepared
+    };
+
+    // 4. Write under a short lock.
+    let conn = db.lock().unwrap();
+    let mut embedded = 0usize;
+    for (it, hash, blob) in &prepared {
+        let model_used = blob.as_ref().map(|_| model.as_str());
+        if db::upsert_entity_index(&conn, it.kind, it.id, &it.text, hash, blob.as_deref(), model_used).is_ok() && blob.is_some() {
+            embedded += 1;
+        }
+    }
+    for (kind, id) in to_prune {
+        let _ = db::delete_entity_index(&conn, kind, id);
+    }
+    embedded
+}
+
+/// Kick off a background reindex sweep (fire-and-forget) so recall stays current without blocking
+/// the caller. Used after the embed engine comes up.
+fn spawn_reindex(state: &State<'_, AppState>) {
+    let db = Arc::clone(&state.db);
+    let http = state.http.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = reindex_all(db, http).await;
+    });
 }
 
 /// The vault page tree (lightweight rows — no bodies).
@@ -1094,17 +1228,18 @@ pub async fn vault_ask(state: State<'_, AppState>, question: String) -> Result<V
     if question.is_empty() {
         return Ok(VaultAnswer { answer: String::new(), citations: vec![] });
     }
-    let recalled = recall_notes(&state, &question, 5).await?;
-    if recalled.notes.is_empty() {
+    let recalled = recall_context(&state, &question, &[EntityKind::Task, EntityKind::Event, EntityKind::Page, EntityKind::Person], 6).await?;
+    if recalled.items.is_empty() {
         return Ok(VaultAnswer { answer: "I don't have any notes about that yet.".into(), citations: vec![] });
     }
-    // Number the notes [1..] so the model cites by index; map indices back to page ids after.
+    // Number the items [1..] so the model cites by index. Tasks/events inform the answer, but only
+    // pages are citable (clickable) — non-page slots map to 0 and are dropped from citations.
     let mut context = String::new();
-    for (i, n) in recalled.notes.iter().enumerate() {
-        let snippet: String = n.content.trim().chars().take(500).collect();
+    for (i, it) in recalled.items.iter().enumerate() {
+        let snippet: String = it.text.trim().chars().take(500).collect();
         context.push_str(&format!("[{}] {}\n", i + 1, snippet.replace('\n', " ")));
     }
-    let ids: Vec<i64> = recalled.notes.iter().map(|n| n.id).collect();
+    let ids: Vec<i64> = recalled.items.iter().map(|it| if it.kind == EntityKind::Page { it.id } else { 0 }).collect();
 
     let settings = {
         let conn = state.db.lock().unwrap();
@@ -1133,8 +1268,167 @@ numbers of the notes you actually used.\n\nNotes:\n{context}"
         .map_err(err)?;
     let answer = raw["answer"].as_str().unwrap_or("").trim().to_string();
     let sources: Vec<i64> = raw["sources"].as_array().map(|a| a.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
-    let citations = map_citation_indices(&sources, &ids);
+    let mut citations = map_citation_indices(&sources, &ids);
+    citations.retain(|&c| c > 0); // drop non-page (0) slots
     Ok(VaultAnswer { answer, citations })
+}
+
+/// Keyword auto-label suggestions for an entity: existing labels whose name appears in the entity's
+/// text and aren't already applied. Surfaced as confirm-chips in the label picker.
+#[tauri::command]
+pub fn suggest_labels(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Label>, String> {
+    let conn = state.db.lock().unwrap();
+    let Some(text) = db::entity_text(&conn, &kind, entity_id).map_err(err)? else {
+        return Ok(vec![]);
+    };
+    let labels = db::list_labels(&conn).map_err(err)?;
+    let applied: Vec<i64> = db::labels_for(&conn, &kind, entity_id).map_err(err)?.iter().map(|l| l.id).collect();
+    Ok(db::suggest_labels_from(&labels, &text, &applied))
+}
+
+// ---------- People (relationship layer / private CRM) ----------
+
+#[tauri::command]
+pub fn list_people(state: State<AppState>) -> Result<Vec<Person>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_people(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn get_person(state: State<AppState>, id: i64) -> Result<Person, String> {
+    let conn = state.db.lock().unwrap();
+    db::get_person(&conn, id).map_err(err)
+}
+
+#[tauri::command]
+pub fn create_person(state: State<AppState>, name: String, email: Option<String>, notes: Option<String>) -> Result<Person, String> {
+    let conn = state.db.lock().unwrap();
+    let id = db::insert_person(&conn, &name, email.as_deref(), &notes.unwrap_or_default()).map_err(err)?;
+    db::get_person(&conn, id).map_err(err)
+}
+
+#[tauri::command]
+pub fn update_person(state: State<AppState>, id: i64, name: String, email: Option<String>, notes: String) -> Result<Person, String> {
+    let conn = state.db.lock().unwrap();
+    db::update_person(&conn, id, &name, email.as_deref(), &notes).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_person(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_person(&conn, id).map_err(err)
+}
+
+// ---------- Focus / time-tracking ----------
+
+#[tauri::command]
+pub fn start_focus(state: State<AppState>, task_id: i64) -> Result<FocusSession, String> {
+    let conn = state.db.lock().unwrap();
+    db::start_focus(&conn, task_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn stop_focus(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::stop_focus(&conn, id).map_err(err)
+}
+
+#[tauri::command]
+pub fn active_focus(state: State<AppState>) -> Result<Option<FocusSession>, String> {
+    let conn = state.db.lock().unwrap();
+    db::active_focus(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn task_focus_minutes(state: State<AppState>, task_id: i64) -> Result<i64, String> {
+    let conn = state.db.lock().unwrap();
+    db::focus_minutes_for_task(&conn, task_id).map_err(err)
+}
+
+// ---------- Meeting Companion ----------
+
+/// Clean the model's action-item array: trim, drop blanks, dedupe (case-insensitive), cap at 10.
+/// Pure, so the fragile-input handling is unit-tested without a model.
+fn clean_action_items(raw: &serde_json::Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    raw["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && seen.insert(s.to_lowercase()))
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract concrete follow-up action items from meeting notes (LLM). Returns candidate task titles —
+/// nothing is created; the UI shows them as confirm-chips the user opts into. Strict schema + caps
+/// keep the small model bounded (gotcha #4). The DB lock is dropped before the network call.
+#[tauri::command]
+pub async fn extract_action_items(state: State<'_, AppState>, notes: String) -> Result<Vec<String>, String> {
+    let notes = notes.trim().to_string();
+    if notes.is_empty() {
+        return Ok(vec![]);
+    }
+    let settings = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?
+    };
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": { "type": "array", "maxItems": 10, "items": { "type": "string", "maxLength": 120 } }
+        },
+        "required": ["items"]
+    });
+    let system = "Extract the concrete follow-up action items (to-dos) from the meeting notes below. \
+Each item is a short, imperative task title. Only include real action items that appear in the notes — \
+do NOT invent any. If there are none, return an empty list.";
+    let messages = serde_json::json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": notes }
+    ]);
+    let raw = llm::chat_json(&state.http, &settings.llm_base_url, &settings.model_id, messages, schema)
+        .await
+        .map_err(err)?;
+    Ok(clean_action_items(&raw))
+}
+
+/// The deterministic pre-meeting brief for an event: attendees (booked invitees → people) with their
+/// relationship history, plus notes linked to the meeting.
+#[tauri::command]
+pub fn meeting_brief(state: State<AppState>, event_id: i64) -> Result<MeetingBrief, String> {
+    let conn = state.db.lock().unwrap();
+    let event = db::list_events(&conn)
+        .map_err(err)?
+        .into_iter()
+        .find(|e| e.id == event_id)
+        .ok_or_else(|| "Event not found".to_string())?;
+    let bookings = db::list_bookings(&conn).map_err(err)?;
+    let people = db::list_people(&conn).map_err(err)?;
+    let linked = db::entity_pages(&conn, "event", event_id).map_err(err)?;
+    Ok(crate::meeting::assemble(&event, &bookings, &people, linked))
+}
+
+// ---------- Planning rituals ----------
+
+/// The morning Daily Briefing: today's events, due/overdue tasks, and scheduled focus time.
+/// Deterministic — assembled from SQLite, no LLM. `date` defaults to today (`YYYY-MM-DD`).
+#[tauri::command]
+pub fn daily_briefing(state: State<AppState>, date: Option<String>) -> Result<crate::briefing::Briefing, String> {
+    let conn = state.db.lock().unwrap();
+    let today = date
+        .as_deref()
+        .and_then(|d| NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok())
+        .unwrap_or_else(|| Local::now().naive_local().date());
+    let events = db::list_events(&conn).map_err(err)?;
+    let tasks = db::list_tasks(&conn).map_err(err)?;
+    let blocks = db::list_blocks(&conn).map_err(err)?;
+    Ok(crate::briefing::assemble(today, &events, &tasks, &blocks))
 }
 
 /// Make Hermes' semantic recall work with zero setup: ensure the small embedding model is
@@ -1144,6 +1438,7 @@ numbers of the notes you actually used.\n\nNotes:\n{context}"
 pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let base = model_manager::embed_base_url();
     if llm::health(&state.http, &base).await {
+        spawn_reindex(&state);
         return Ok("Memory engine ready.".into());
     }
     // Reuse the same engine binary as the chat server; fetch the (tiny) embedding model if missing.
@@ -1166,6 +1461,7 @@ pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Re
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         if llm::health(&state.http, &base).await {
             let _ = app.emit("inference-status", "Memory engine ready.");
+            spawn_reindex(&state);
             return Ok("Memory engine ready.".into());
         }
     }
@@ -1176,42 +1472,49 @@ pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Re
 mod tests {
     use super::*;
 
-    fn note(id: i64, content: &str, score: Option<f32>) -> Note {
-        Note {
-            id,
-            content: content.into(),
-            created_at: "2026-01-01T00:00:00".into(),
-            updated_at: "2026-01-01T00:00:00".into(),
-            indexed: score.is_some(),
-            score,
-        }
+    fn citem(id: i64, text: &str, score: Option<f32>) -> ContextItem {
+        ContextItem { kind: EntityKind::Page, id, text: text.into(), score, embedding: None }
     }
 
     #[test]
-    fn gate_memory_only_injects_strong_semantic_matches_capped() {
-        // Keyword mode → nothing, even with high scores.
-        let kw = RecallResult { mode: "keyword".into(), notes: vec![note(1, "a", Some(0.9))] };
-        assert!(gate_recalled_memory(&kw).is_empty());
+    fn clean_action_items_trims_dedupes_and_caps() {
+        let raw = serde_json::json!({
+            "items": ["  Email Ava  ", "Email ava", "", "Book the room", "Book the room"]
+        });
+        assert_eq!(clean_action_items(&raw), vec!["Email Ava".to_string(), "Book the room".to_string()]);
+        // Missing/!array field → empty, not a panic.
+        assert!(clean_action_items(&serde_json::json!({})).is_empty());
+        // Cap at 10.
+        let many = serde_json::json!({ "items": (0..20).map(|i| format!("t{i}")).collect::<Vec<_>>() });
+        assert_eq!(clean_action_items(&many).len(), 10);
+    }
 
-        // Semantic: drop sub-threshold, cap at 2, keep order.
-        let sem = RecallResult {
+    #[test]
+    fn gate_context_only_injects_strong_semantic_matches_capped() {
+        // Keyword mode → nothing, even with high scores.
+        let kw = crate::context::ContextBundle { mode: "keyword".into(), items: vec![citem(1, "a", Some(0.9))] };
+        assert!(gate_recalled_context(&kw).is_empty());
+
+        // Semantic: drop sub-threshold (< RECALL_FLOOR), cap at 2, keep order, drop unscored neighbors.
+        let sem = crate::context::ContextBundle {
             mode: "semantic".into(),
-            notes: vec![
-                note(1, "strong one", Some(0.80)),
-                note(2, "weak", Some(0.20)),
-                note(3, "strong two", Some(0.50)),
-                note(4, "strong three", Some(0.45)),
+            items: vec![
+                citem(1, "strong one", Some(0.85)),
+                citem(2, "weak", Some(0.58)), // near bge-small's unrelated baseline → excluded
+                citem(3, "strong two", Some(0.70)),
+                citem(4, "strong three", Some(0.66)),
+                citem(5, "neighbor", None),
             ],
         };
-        let got = gate_recalled_memory(&sem);
+        let got = gate_recalled_context(&sem);
         assert_eq!(got, vec!["strong one".to_string(), "strong two".to_string()]);
     }
 
     #[test]
-    fn gate_memory_truncates_long_notes() {
+    fn gate_context_truncates_long_items() {
         let long = "x".repeat(500);
-        let sem = RecallResult { mode: "semantic".into(), notes: vec![note(1, &long, Some(0.9))] };
-        assert_eq!(gate_recalled_memory(&sem)[0].chars().count(), 220);
+        let sem = crate::context::ContextBundle { mode: "semantic".into(), items: vec![citem(1, &long, Some(0.9))] };
+        assert_eq!(gate_recalled_context(&sem)[0].chars().count(), 220);
     }
 
     #[test]

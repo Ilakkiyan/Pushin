@@ -45,6 +45,9 @@ vi.mock("./lib/ipc", () => {
       }),
       getPage: vi.fn(async (id: number) => state.pages.find((p) => p.id === id)),
       hermesRecall: vi.fn().mockResolvedValue({ mode: "keyword", notes: [] }),
+      dailyBriefing: vi.fn().mockResolvedValue({ date: "2026-06-15", weekday: "Monday", events: [], dueTasks: [], focusMinutes: 0 }),
+      suggestLabels: vi.fn().mockResolvedValue([]),
+      activeFocus: vi.fn().mockResolvedValue(null),
       searchPages: vi.fn().mockResolvedValue([]),
     },
   };

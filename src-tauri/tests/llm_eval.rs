@@ -284,6 +284,32 @@ fn one_task_not_event(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
         chk("is a task, not an event", o.created_task_ids.len() == 1 && o.created_event_titles.is_empty()),
     ]
 }
+fn dedup_lab_report(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // "work on the lab report from 1–3pm" → one timed BLOCK (event), not also a duplicate task.
+    let has_event = ev_exists(c, "lab");
+    let task_dups = db::list_tasks(c).unwrap_or_default().into_iter().filter(|t| t.title.to_lowercase().contains("lab")).count();
+    vec![
+        chk("lab report is a calendar block", has_event),
+        chk("no duplicate task for it", task_dups == 0),
+    ]
+}
+fn dedup_thesis(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    let has_event = ev_exists(c, "thesis");
+    let task_dups = db::list_tasks(c).unwrap_or_default().into_iter().filter(|t| t.title.to_lowercase().contains("thesis")).count();
+    vec![
+        chk("thesis is a calendar block", has_event),
+        chk("no duplicate task for it", task_dups == 0),
+    ]
+}
+fn dedup_does_not_overfire(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // A timed event AND an unrelated task in one message: the task must survive (de-dup only fires on
+    // title-matching, time-blocked work).
+    let tasks = db::list_tasks(c).unwrap_or_default();
+    vec![
+        chk("groceries task kept", tasks.iter().any(|t| t.title.to_lowercase().contains("groc"))),
+        chk("dentist is an event", ev_exists(c, "dent")),
+    ]
+}
 
 // ---------------- the battery ----------------
 
@@ -894,6 +920,32 @@ fn cases() -> Vec<Case> {
             prompt: "Ok my week: dentist Monday at 9am, finish the budget report (about 3 hours) by Wednesday, go for a run every morning, and cancel the old standup.",
             // "dent" stem: the model titles this "Dentist" or "Dental" run-to-run; both are correct.
             expect: E { min_events: Some(1), min_tasks: Some(1), min_habits: Some(1), min_removed: Some(1), title_has: &["dent"], habit_has: &["run"], ..Default::default() },
+        },
+
+        // ---- task/event de-dup: "work on X from <time>" is one block, not also a duplicate task ----
+        Case {
+            name: "work-on with explicit time → single block, no dup task",
+            category: "dedup",
+            history: &[],
+            seed: &[],
+            prompt: "I'm going to work on the lab report tomorrow from 1 to 3pm.",
+            expect: E { custom: Some(dedup_lab_report), ..Default::default() },
+        },
+        Case {
+            name: "block off time to work on something",
+            category: "dedup",
+            history: &[],
+            seed: &[],
+            prompt: "Block off 2 to 4pm on Friday to work on my thesis.",
+            expect: E { custom: Some(dedup_thesis), ..Default::default() },
+        },
+        Case {
+            name: "de-dup does not drop an unrelated task",
+            category: "dedup",
+            history: &[],
+            seed: &[],
+            prompt: "Dentist appointment Friday at 2pm, and I need to buy groceries.",
+            expect: E { custom: Some(dedup_does_not_overfire), ..Default::default() },
         },
     ]
 }
