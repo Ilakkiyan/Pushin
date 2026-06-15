@@ -39,9 +39,13 @@ export default defineConfig({
         text: "User Guide",
         items: [
           { text: "Planning with AI", link: "/user-guide/planning" },
+          { text: "Daily Briefing & Action Bar", link: "/user-guide/briefing" },
           { text: "Calendar", link: "/user-guide/calendar" },
           { text: "Tasks and Projects", link: "/user-guide/tasks-projects" },
+          { text: "Focus & Time-tracking", link: "/user-guide/focus" },
           { text: "Habits", link: "/user-guide/habits" },
+          { text: "People", link: "/user-guide/people" },
+          { text: "Meeting Companion", link: "/user-guide/meeting-companion" },
           { text: "Notes and Vault", link: "/user-guide/notes-vault" },
           { text: "Labels", link: "/user-guide/labels" },
           { text: "Quick Capture and Inbox", link: "/user-guide/inbox" },

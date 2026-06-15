@@ -61,13 +61,20 @@ The result is a calendar that fills itself in, works offline, and keeps your dat
 | 🧠 **Deterministic auto‑scheduler** | Dependency‑aware EDF + priority packing with conflict detection — the core IP, in Rust, with unit tests. |
 | 📓 **Notion‑style document vault** | A block editor (headings, lists, quotes, slash menu) with nested pages, organized in a sidebar tree. Notes are first‑class documents, not scratch text. |
 | 🕸️ **Obsidian‑style links & graph** | Type `[[` to link any page to another; each page shows its **backlinks**, and a force‑directed **connection graph** visualizes how your knowledge ties together. |
-| 🔮 **On‑device semantic memory (Hermes)** | Pages are embedded locally so recall and search find what you mean, not just keyword matches — with a keyword fallback that always works. |
+| 🔮 **On‑device semantic memory (Hermes)** | Notes, tasks, events, and people are embedded locally so recall and search find what you mean, not just keyword matches — with a keyword fallback that always works. |
 | 📆 **Daily notes** | One page per calendar day, opened straight from the week/month grid — the bridge between your time and your knowledge. |
 | 🪢 **Notes ↔ tasks & events** | Link any task or event to a page; the calendar becomes an index into your knowledge, and pages show their linked work. |
 | ✨ **AI that uses your notes** | The planner auto‑recalls relevant notes (e.g. "Sarah prefers afternoons"), offers to remember durable facts from chat, and can **answer questions over your vault** with citations — all on‑device. |
+| 🧩 **One shared context (Context Engine)** | Notes, tasks, events, and people are indexed into one cross‑entity recall layer, so the AI surfaces what's relevant no matter where it lives. |
+| 👥 **People (private CRM)** | Anyone who books time becomes a person record with their notes and meeting history — relationships, on‑device. |
+| ☀️ **Daily briefing** | A morning at‑a‑glance banner above the calendar: today's events, what's due, and how much focus time is already blocked. |
+| ⏱️ **Focus timer + adaptive scheduling** | Track real time on a task; the scheduler learns how long things actually take you and biases future estimates. |
+| 🤝 **Meeting companion** | Open a meeting to see who's attending and your history with them, then turn its notes into action‑item tasks you confirm. |
+| 🏷️ **Auto‑labeling** | Pushin suggests existing labels that match an item's text — one tap to apply, never automatic. |
+| 📅 **Public booking page** | A Calendly‑style page served from your real availability by a local server + a tunnel you run. |
 | 📥 **Quick capture + Inbox** | `Cmd/Ctrl+Shift+N` to jot anything into an Inbox; sort it later into a task, event, or note. One box, zero decisions. |
 | 📦 **Import your vault** | Bring in an Obsidian / Markdown folder — files become pages, `[[links]]` become connections. |
-| ⌘ **Command palette** | `Cmd/Ctrl‑K` for semantic search, jump to any page/view, or **ask your vault** a question. |
+| ⌘ **Command palette + action bar** | `Cmd/Ctrl‑K` for semantic search, jump to any page/view, **ask your vault**, or **run a natural‑language command** (create/move/cancel from anywhere). |
 | 📅 **Week view** | Full 24‑hour week grid with drag‑to‑move and pin‑to‑lock; re‑plans around your changes. |
 | 🗓️ **Month view** | Google‑Calendar‑style month grid with per‑day event chips; click a day to jump to its week. |
 | 🔥 **Habit tracker** | Build habits with streaks, a consistency heatmap, and one‑click "add to today's calendar" that slots a habit into a free gap. |

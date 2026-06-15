@@ -43,7 +43,10 @@ Rust core
   ├─ calendar/google : OAuth(PKCE loopback) + token refresh + two-way sync
   ├─ booking       : availability via scheduler free-slots (booking-page seam)
   ├─ hermes        : memory layer ("second brain") — embeddings + cosine/keyword recall; backs the vault
-  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links, labels, entity_labels
+  ├─ context       : Context Engine — cross-entity recall over `entity_index` (projections, reindex, assembler)
+  ├─ briefing      : deterministic Daily Briefing (today's events + due tasks + focus minutes)
+  ├─ meeting       : Meeting Companion — deterministic pre-meeting brief + (LLM) action-item extraction
+  └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links, labels, entity_labels, entity_index, people, focus_sessions
        │ spawns child process              │ OAuth + HTTPS
        ▼                                    ▼
   llama-server (GGUF, Metal)          Google Calendar API v3 (optional)
@@ -53,12 +56,16 @@ Rust core
 **Rust (`src-tauri/src/`)**
 - `lib.rs` — Tauri setup, command registration, app-exit kills the llama-server child.
 - `commands.rs` — the IPC surface. **Never hold the DB `Mutex<Connection>` across an `.await`** (async commands must stay `Send`); use short scoped lock blocks.
-- `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, etc.
-- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0010_labels`). `0008` evolves
-  `notes` into vault pages + adds `page_links`; `0009` adds `daily_date` (daily notes), `entity_links`
-  (page ↔ task/event), and an `inbox` flag; `0010` adds `labels` + a polymorphic `entity_labels` join
-  (the cross-cutting taxonomy). Page CRUD, graph, daily/inbox, entity links, unlinked-mentions, label
-  CRUD/merge, and `resolve_task_prefs` (labels → scheduler prefs) all live here.
+- `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, plus `Person`, `FocusSession`,
+  `EntityKind`/`ContextItem` (Context Engine), `Briefing`, `MeetingBrief`/`AttendeeBrief`, etc.
+- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0014_focus_sessions`). `0008`
+  evolves `notes` into vault pages + adds `page_links`; `0009` adds `daily_date`, `entity_links`
+  (page ↔ task/event), an `inbox` flag; `0010` adds `labels` + polymorphic `entity_labels`; `0011`
+  makes booking public (slug/share_token/enabled + booking `event_id`); `0012` adds **`entity_index`**
+  (Context Engine cross-entity recall); `0013` adds **`people`** (CRM); `0014` adds **`focus_sessions`**
+  (time-tracking). Page/graph/daily/inbox/entity-link/label CRUD, `resolve_task_prefs`, people CRUD,
+  focus sessions + `estimation_samples`, `entity_index` CRUD + `entities_for_index`/`entity_neighbors`,
+  and keyword `suggest_labels` all live here.
 - `model_manager.rs` — model + engine auto-download, `llama-server` spawn/health, `MODELS` list.
   Cross-platform: picks the **CPU** llama.cpp release asset per OS/arch (asset substrings are
   extension-less since llama.cpp churns extensions — Linux moved `.zip`→`.tar.gz`). macOS/Linux
@@ -67,10 +74,18 @@ Rust core
   (Linux) and `CREATE_NO_WINDOW` (Windows).
 - `llm.rs` — `chat_json(messages, schema)`; sampling tuned to stop runaway (see Gotchas).
 - `parser.rs` — **the trickiest file.** NL→plan, day-word→date, dedupe, edit-merge. See Gotchas.
-- `scheduler.rs` — auto-scheduler + `parse_dt`/`fmt_dt` time helpers. Has unit tests.
+- `scheduler.rs` — auto-scheduler + `parse_dt`/`fmt_dt` + **`estimation_factor`** (adaptive: learn real
+  durations from focus actuals; soft, fallback 1.0; applied in `schedule_service::reschedule_inner`). Has unit tests.
 - `calendar/google.rs` — Google two-way sync (OAuth/API/sync engine).
 - `calendar/mod.rs` — just declares `google` (SQLite is the source of truth; the old `CalendarProvider`/LocalProvider indirection was removed).
-- `booking.rs` — booking-page availability (reuses scheduler free-slots).
+- `booking.rs` — booking-page availability (reuses scheduler free-slots) + invitee→`people` upsert on confirm.
+- `booking_server.rs` — local `TcpListener` HTTP server for the public booking page (slots/book/cancel),
+  hardened (body cap, thread-per-connection + in-flight cap, global rate limit, XSS escaping — see `SECURITY_TEST_PLAN.md`).
+- `context.rs` — **Context Engine**: deterministic `*_text` projections, FNV-1a `text_hash`,
+  `needs_index_work`, `merge_and_trim`, `ContextBundle`. (Ranking is `hermes::rank_items`; `reindex_all`
+  + `recall_context` live in `commands.rs`.) See the Context Engine section.
+- `briefing.rs` — pure Daily Briefing assembler (today's events + due/overdue tasks + scheduled focus minutes).
+- `meeting.rs` — pure Meeting Companion brief: event → booked attendees (→ `people`) + history + linked notes.
 
 **Frontend (`src/`)**
 - `lib/ipc.ts` — typed wrappers over every Tauri command + shared types (incl. `Page`, `PageGraph`).
@@ -78,13 +93,15 @@ Rust core
 - `lib/editorSchema.tsx` — the BlockNote schema + the custom `pageLink` inline-content (the `[[wikilink]]` chip).
 - `state/store.ts` — Zustand store; `mutate()` runs a change → stores conflicts → refresh → `maybeSync()` (debounced Google sync). Also holds `pages`/`currentPageId` + page CRUD and `view`/`sidebarCollapsed`.
 - `panes/` — `ChatPane` (+ "Remember this?" memory chips), `CalendarPane` (24h grid, drag-to-move/pin,
-  day-header daily-note), `MonthPane`, `TaskListPane` (+ task "Notes" action), `ProjectsPane`,
-  `HabitsPane`, `SettingsPane`, `BookingPane`, **`VaultPane`** (page editor), **`GraphPane`**,
-  **`InboxPane`** (quick-capture triage).
-- `components/` — **`Sidebar`** (left nav, AI status, vault tree, Inbox badge, Today's note),
-  **`VaultTree`** (page tree, drag-to-reparent, import button), **`PageEditor`** (BlockNote + autosave +
-  `[[` picker + `/` templates + backlinks/linked-entities/unlinked-mentions), **`CommandPalette`**
-  (Cmd-K: semantic search + ask-your-vault), **`QuickCapture`** (Cmd/Ctrl+Shift+N), **`TitleBar`**
+  day-header daily-note, **`BriefingCard`** banner, **event-detail popover** = labels + Meeting Companion
+  brief + action-item confirm-chips), `MonthPane`, `TaskListPane` (task "Notes" action + **Focus timer**
+  Play/Stop), `ProjectsPane`, `HabitsPane`, `SettingsPane`, `BookingPane`, **`PeoplePane`** (CRM),
+  **`VaultPane`** (page editor), **`GraphPane`**, **`InboxPane`** (quick-capture triage), `LabelPane`.
+- `components/` — **`Sidebar`** (left nav, **AI + Memory** status, vault tree, Inbox badge, Today's note,
+  **People** nav), **`VaultTree`** (page tree, drag-to-reparent, import button), **`PageEditor`** (BlockNote
+  + autosave + `[[` picker + `/` templates + backlinks/linked-entities/unlinked-mentions), **`CommandPalette`**
+  (Cmd-K: semantic search + ask-your-vault + **"Run" NL action bar** → planner), **`LabelPicker`** (chips +
+  **auto-label suggestions**), **`BriefingCard`**, **`QuickCapture`** (Cmd/Ctrl+Shift+N), **`TitleBar`**
   (frameless window controls), `InferenceSetup`, `ConflictBanner`, `OnboardingModal`.
 - `lib/import.ts` — vault importer (folder picker → headless BlockNote markdown→blocks → pages).
   (The old top-tab `TopBar` and standalone `HermesPane` were removed when the sidebar + vault landed.)
@@ -156,7 +173,13 @@ Rust core
     - On WSL: the harness exe is a **Windows** binary, so it reaches the app's `:8080` even though
       `curl` from WSL can't. `cargo test --test llm_eval` fails to relink the locked `pushin.exe`
       while the app runs, **but the test exe is still built** — run it directly:
-      `./target/debug/deps/llm_eval-*.exe --ignored --nocapture`.
+      `./target/debug/deps/llm_eval-*.exe --ignored --nocapture`. Has a `dedup` category (see #12).
+
+12. **Task/event de-dup.** "I'll work on X from 12–2" makes the 3B emit BOTH a task and a fixed event
+    (double-booking). `store_plan` drops a task that fuzzy-matches an event created/updated the same
+    turn — but **only when that event has an explicit user start time** (a real block), so a
+    duration-only "study ~3h" task survives. Gated on `plan.events[].start_time`; unit-tested in
+    `parser`/`db` + the `dedup` llm_eval category.
 
 ## Google Calendar sync (`calendar/google.rs`)
 - **OAuth2 + PKCE via system browser + loopback `TcpListener`** (Desktop client → no redirect URI to
@@ -197,8 +220,8 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 - **Embeddings/recall (unchanged at the data layer):** little-endian f32 BLOBs in `embedding` (NULL
   until indexed); `hermes.rs` `cosine`/`keyword_score`/codec are pure + tested. `hermes_recall` still
   ranks the same rows (now pages). **The standalone Hermes capture/recall UI is gone**; keyword search
-  is in the Cmd-K palette. **Next step (not built): semantic recall in the palette + auto-recalling
-  relevant pages into the planner's context (don't destabilize the parser — do it deliberately).**
+  is in the Cmd-K palette. (Semantic Cmd-K + auto-recall into the planner are **now built** — and
+  generalized beyond pages to all entity kinds; see the **Context Engine** section.)
 - **Embeddings = all-in-one, zero setup:** Pushin runs a **second `llama-server` in `--embeddings`
   mode** on `EMBED_PORT` (8181), serving a tiny auto-downloaded model (`EMBED_MODEL` =
   bge-small-en-v1.5 Q8, ~37 MB, 384-dim). `ensure_embeddings` (idempotent, best-effort) downloads it
@@ -233,20 +256,39 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
   (`read_markdown_dir` walks a folder via `tauri-plugin-dialog`; `lib/import.ts` converts each file with
   a headless BlockNote editor, `[[links]]` → `set_page_links`), and **editor templates** (custom `/`
   slash items).
-- **Next steps (not built):** re-index pages created before the embed server was up; per-page icons;
-  global (OS-level) quick-capture hotkey; Notion-export importer; progressive-disclosure onboarding.
+- **Next steps (not built):** per-page icons; global (OS-level) quick-capture hotkey; Notion-export
+  importer; progressive-disclosure onboarding. (Re-indexing pre-embed-server pages is now handled by the
+  Context Engine reindex sweep.)
 
 ---
 
+## The Context Engine — cross-entity recall (`context.rs`, `db.rs` `entity_index`, migration 0012)
+The shared retrieval spine: every feature pulls relevant context through one path so the on-device LLM
+always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.md`; build log: `DEVLOG.md`.
+- **`entity_index`** (0012): one polymorphic row per entity (`entity_kind` ∈ task/event/page/person/goal)
+  with projected `text`, a stable FNV-1a `text_hash`, and an LE-f32 `embedding` (NULL until indexed).
+  Mirrors `entity_labels`/`entity_links`.
+- **Ranking generalized:** `hermes::rank_items` over `ContextItem` (semantic cosine, keyword fallback);
+  `rank_notes` is now a thin adapter.
+- **Reindex** (`commands::reindex_all`, best-effort, gotcha-#8 lock dance): projects all entities
+  (`db::entities_for_index`), embeds changed rows in batches (skip-unchanged via `text_hash`), prunes
+  deleted ones. Background sweep from `ensure_embeddings` (startup). *Deferred:* per-mutation single-row
+  hooks — new entities index on the next sweep.
+- **Assembler** (`commands::recall_context` + `context::merge_and_trim`): cross-kind semantic recall →
+  1-hop graph neighbors (`db::entity_neighbors`) → recency tail → token-budgeted `ContextBundle`.
+- **Wired:** planner auto-recall (pages-only, semantic-only, `RECALL_FLOOR` **0.65** — bge-small's
+  *unrelated* short-text baseline is ~0.59, so lower floors are noise) and `vault_ask` (spans tasks/
+  events/pages/people). Cmd-K is still notes-only by choice.
+
 ## Test suite (layered; `.github/workflows/test.yml` runs it on push/PR)
-- **Rust unit + integration** (`cargo test --lib`, 126 tests): pure logic across `scheduler`/`parser`/
+- **Rust unit + integration** (`cargo test --lib`, 174 tests): pure logic across `scheduler`/`parser`/
   `habits`/`db`/`hermes`/`booking`/`model_manager`/`commands`, plus **httpmock** integration for
   `llm::chat_json` (retry/error), `hermes::embed_text`, and `google.rs` (PKCE + the Calendar leaf
   fns — token refresh, incremental pull + **410 fallback**, push verbs — via a `#[cfg(test)]`
   `api_base()`/`token_url()` override seam). `secrets.rs` uses a `#[cfg(test)]` in-memory store seam
   (`test_store`) for roundtrip tests. In-memory DB via `db::test_conn()`. `httpmock`+`tempfile` dev-deps.
   **Deferred:** the full `sync()` orchestrator end-to-end (needs a seeded account/token in DB+keychain).
-- **Frontend unit + component** (`npm test` → Vitest + Testing-Library + jsdom, 64 tests):
+- **Frontend unit + component** (`npm test` → Vitest + Testing-Library + jsdom, 71 tests):
   `vitest.config.ts` + `vitest.setup.ts` (mocks `@tauri-apps/api/window` + `plugin-dialog`). Covers
   pure utils (`time`/`blocks`/`import`), the Zustand store (mocked ipc), an **IPC contract test**
   (`ipcContract.test.ts` — parses `lib.rs` `generate_handler![]` vs `ipc.ts` `invoke<>` names so a
@@ -264,7 +306,8 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 - **`rustc`/`cargo` are NOT on the default PATH.** Prefix with `export PATH="$HOME/.cargo/bin:$PATH"`.
 - **The Bash cwd resets to the project root between calls.** Use absolute paths or `--manifest-path`.
 - Build backend: `cargo build --manifest-path /Users/lucky/Documents/GitHub/Pushin/src-tauri/Cargo.toml`
-- Test backend (**15 tests** at last count): `cargo test --manifest-path .../src-tauri/Cargo.toml`
+- Test backend (**174 tests** at last count): `cargo test --manifest-path .../src-tauri/Cargo.toml`
+  (on WSL use the Windows `cargo.exe`; see memory `build-test-env`).
 - Build/typecheck frontend: `npm run build` (`tsc && vite build`).
 - Run the app (dev): `npm run tauri dev` (watches Rust → rebuilds + relaunches; Vite HMR for frontend).
 - Regenerate app icons from a PNG: `npm run tauri icon <path-to-1024.png>`.
@@ -276,21 +319,27 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 - `bin/llama-server` (+ dylibs) — auto-downloaded llama.cpp engine
 - `pushin.db` — SQLite (tasks, events, blocks, settings, Google tokens)
 
-## Current status (released **v0.2.2**; tagged on GitHub, `release.yml` builds installers)
+## Current status (released **v0.3.1**; tagged on GitHub, `release.yml` builds installers)
 - **Working — calendar core:** on-device planning pipeline, auto-scheduler, full-day (00–24) week +
   month calendar with drag-to-move/pin + re-plan, conversational create/update/remove of events, task
-  list, habits, booking mockup, settings, first-run model+engine auto-download, two-way Google sync
+  list, habits, settings, first-run model+engine auto-download, two-way Google sync
   (compiles + leaf fns httpmock-tested; first live connect still unverified).
 - **Working — second brain (v0.2.x):** collapsible left **sidebar** shell + **Cmd-K palette**;
-  Notion-style **vault** (BlockNote block editor, nested pages), Obsidian-style **`[[wikilinks]]` +
-  backlinks + connection graph**, **daily notes**, task/event↔page **entity links**, on-device
-  **semantic recall**, **AI-over-vault** (auto-recall into the planner, chat→memory chips, ask-your-
-  vault RAG, semantic Cmd-K), **quick capture → Inbox**, **Markdown/Obsidian import**, editor templates.
+  Notion-style **vault**, Obsidian-style **`[[wikilinks]]` + backlinks + connection graph**, **daily
+  notes**, task/event↔page **entity links**, on-device **semantic recall**, chat→memory chips,
+  ask-your-vault RAG, **quick capture → Inbox**, **Markdown/Obsidian import**, editor templates.
+- **Working — Context Engine + execution loop (v0.3.x):** cross-entity recall spine (`entity_index`,
+  reindex sweep, `recall_context` assembler) feeding planner auto-recall + `vault_ask`; **People/CRM**
+  (auto-created from bookings) + `PeoplePane`; **keyword auto-labeling** (confirm-chips); **Daily
+  Briefing** banner + **Cmd-K "Run" NL action bar**; **Focus timer** + **adaptive scheduler** (learned
+  durations); **Meeting Companion** (deterministic brief + confirm-chip action-item extraction); **public
+  booking page** via a hardened local HTTP server + tunnel (see `SECURITY_TEST_PLAN.md`). Several
+  model-dependent bits (action-item quality, planner recall on a real corpus) are **unverified live**.
 - **Working — shell polish:** custom **frameless `TitleBar`** (own min/max/close) that **auto-hides
   when maximized/fullscreen**, revealing on a top-edge hover (F11 toggles fullscreen).
-- **Tested:** layered suite — Rust `cargo test --lib` (126) + httpmock integration, Vitest (64 across
-  16 files) + IPC/bridge contract tests, Playwright mocked-IPC E2E (CI), live `llm_eval` battery
-  (~90%, manual). CI: `.github/workflows/test.yml`. See **Test suite** above.
+- **Tested:** layered suite — Rust `cargo test --lib` (174) + httpmock integration, Vitest (71) +
+  IPC/bridge contract tests, Playwright mocked-IPC E2E (CI), live `llm_eval` battery (~90%, manual).
+  CI: `.github/workflows/test.yml`. See **Test suite** above.
 - **Branding:** pushpin 📌 — sidebar brand, favicon, dock icon (`src-tauri/icons/`).
 - **Repo:** on GitHub (`Ilakkiyan/Pushin`), `main` is the default; releases are version tags (`v0.2.0`…).
 
@@ -302,7 +351,8 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
 - **Engine auto-download now spans macOS/Linux/Windows** (CPU build). Still TODO: optionally
   **bundle `llama-server`** as a per-OS sidecar (offline installs), and offer GPU builds
   (CUDA/Vulkan/Metal) instead of the GPU-agnostic CPU asset. Live-verify on Linux/Windows.
-- **Public booking page** needs a hosted relay (the in-app booking is a local mockup).
+- **Public booking page** is served by a hardened local HTTP server (`booking_server.rs`) exposed via a
+  user-run tunnel (ngrok/cloudflared). A managed hosted relay (no manual tunnel) is still a follow-up.
 - No **drag-to-resize** on the calendar yet (only drag-to-move).
 - **Test gap:** the full Google `sync()` orchestrator end-to-end (the leaf fns are httpmock-tested);
   needs a seeded account/token in DB+keychain. PageEditor real-editing is Playwright-only (jsdom can't
@@ -313,11 +363,11 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
   habits/projects/pages, a sidebar **Labels** section + **`LabelPane`** (cross-cutting filtered view +
   inline manager with scheduling prefs), Cmd-K label jumps, and **actionable scheduling** — labels'
   time-of-day window + min-chunk bias the planner (`db::resolve_task_prefs` → `scheduler::schedule_with_prefs`;
-  a *soft* preference that always falls back). **Still TODO (Phases 3/5/6):** calendar color-by-label +
-  filter chips; AI auto-labeling (keyword post-pass → confirm chips); read-only "system labels" for the
-  structural kinds; a `#`-trigger inline label chip in the editor; batching in the scheduler. Events
-  have no editor surface yet, so they're label-able only via the AI/back-end, not the UI. See memory
-  `labeling-system-plan`.
+  a *soft* preference that always falls back). **Now also shipped:** calendar color-by-label + filter
+  chips (`CalendarLabelControls`); **AI auto-labeling** (keyword word-boundary post-pass → "Suggested"
+  confirm-chips in `LabelPicker`, all kinds); **event labeling UI** (the calendar event-detail popover);
+  `person` is now a label kind. **Still TODO:** read-only "system labels" for structural kinds; a
+  `#`-trigger inline label chip in the editor; batching in the scheduler. See memory `labeling-system-plan`.
 
 ## Working style with this user
 Wants fast iteration and **honest assessment** — when something flaky is the model's limitation vs. a
