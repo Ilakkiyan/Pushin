@@ -20,6 +20,8 @@ import SettingsPane from "./panes/SettingsPane";
 import OnboardingModal from "./components/OnboardingModal";
 import CommandPalette from "./components/CommandPalette";
 import TitleBar from "./components/TitleBar";
+import MobileShell from "./components/MobileShell";
+import { useIsMobile } from "./lib/useIsMobile";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -27,6 +29,7 @@ export default function App() {
   const calMode = useStore((s) => s.calMode);
   const load = useStore((s) => s.load);
   const onboarded = useStore((s) => s.settings?.onboarded ?? true);
+  const isMobile = useIsMobile();
 
   useEffect(() => {
     load();
@@ -43,7 +46,7 @@ export default function App() {
   if (!loaded) {
     return (
       <div className="h-full flex flex-col">
-        <TitleBar />
+        {!isMobile && <TitleBar />}
         <div className="flex-1 grid place-items-center text-gray-500">Loading Pushin…</div>
       </div>
     );
@@ -51,37 +54,46 @@ export default function App() {
 
   return (
     <div className="h-full flex flex-col">
-      <TitleBar />
-      <div className="flex-1 min-h-0 flex">
-        <Sidebar />
-        <div className="flex-1 min-w-0 flex flex-col">
+      {!isMobile && <TitleBar />}
+      {isMobile ? (
+        <div className="flex-1 min-h-0 flex flex-col">
           <ConflictBanner />
-          <main className="flex-1 min-h-0 flex">
-          {view === "calendar" && (
-            <>
-              <div className="flex-1 min-w-0">{calMode === "month" ? <MonthPane /> : <CalendarPane />}</div>
-              <aside className="w-[400px] shrink-0 border-l border-white/10 flex flex-col min-h-0">
-                <div className="flex-1 min-h-0 overflow-hidden">
-                  <ChatPane />
-                </div>
-                <div className="h-[46%] shrink-0 border-t border-white/10 overflow-hidden">
-                  <TaskListPane />
-                </div>
-              </aside>
-            </>
-          )}
-          {view === "projects" && <ProjectsPane />}
-          {view === "habits" && <HabitsPane />}
-          {view === "vault" && <VaultPane />}
-          {view === "graph" && <GraphPane />}
-          {view === "inbox" && <InboxPane />}
-          {view === "label" && <LabelPane />}
-          {view === "people" && <PeoplePane />}
-          {view === "booking" && <BookingPane />}
-          {view === "settings" && <SettingsPane />}
-          </main>
+          <div className="flex-1 min-h-0">
+            <MobileShell />
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="flex-1 min-h-0 flex">
+          <Sidebar />
+          <div className="flex-1 min-w-0 flex flex-col">
+            <ConflictBanner />
+            <main className="flex-1 min-h-0 flex">
+              {view === "calendar" && (
+                <>
+                  <div className="flex-1 min-w-0">{calMode === "month" ? <MonthPane /> : <CalendarPane />}</div>
+                  <aside className="w-[400px] shrink-0 border-l border-white/10 flex flex-col min-h-0">
+                    <div className="flex-1 min-h-0 overflow-hidden">
+                      <ChatPane />
+                    </div>
+                    <div className="h-[46%] shrink-0 border-t border-white/10 overflow-hidden">
+                      <TaskListPane />
+                    </div>
+                  </aside>
+                </>
+              )}
+              {view === "projects" && <ProjectsPane />}
+              {view === "habits" && <HabitsPane />}
+              {view === "vault" && <VaultPane />}
+              {view === "graph" && <GraphPane />}
+              {view === "inbox" && <InboxPane />}
+              {view === "label" && <LabelPane />}
+              {view === "people" && <PeoplePane />}
+              {view === "booking" && <BookingPane />}
+              {view === "settings" && <SettingsPane />}
+            </main>
+          </div>
+        </div>
+      )}
       {!onboarded && <OnboardingModal />}
       <CommandPalette />
       <QuickCapture />

@@ -45,3 +45,6 @@ Thumbs.db
 /finetune/out/
 /finetune/data/
 /unsloth_compiled_cache/
+
+# Android build helper scripts (machine-specific absolute paths; see memory mobile-cross-compile)
+/and-*.bat

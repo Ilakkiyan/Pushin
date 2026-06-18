@@ -29,8 +29,9 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
 # Dates resolved in Rust, never trusted from the LLM
 chrono = { version = "0.4", features = ["serde"] }
-# HTTP: llama-server client + streaming model download
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# HTTP: llama-server client + streaming model download. rustls (not native-tls) so it cross-compiles
+# to Android/iOS without OpenSSL — and matches the TLS stack Iroh already uses.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2"] }
 futures-util = "0.3"
 # Model integrity verification
 sha2 = "0.10"
@@ -41,9 +42,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Google OAuth (PKCE) — base64url challenge + random verifier
 base64 = "0.22"
 getrandom = "0.2"
-# OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service) so Google
-# OAuth tokens are never persisted in plaintext SQLite.
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 # Error handling
 anyhow = "1"
 thiserror = "2"
@@ -54,6 +52,11 @@ tokio = { version = "1", features = ["time", "io-util", "sync", "rt", "rt-multi-
 iroh = "0.90"
 # Base32 for shareable pairing tickets (NodeAddr + mesh secret), QR-friendly + case-insensitive.
 data-encoding = "2"
+
+# OS keychain (macOS/iOS Keychain / Windows Credential Manager / Linux Secret Service) for Google
+# OAuth tokens + device-sync keys. Excluded on Android (no keyring backend — secrets.rs stubs it).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 # The LLM-evaluation harness (`tests/llm_eval.rs`) is a separate crate, so it needs its own async

@@ -9,6 +9,52 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-06-18
+
+### Mobile UI — responsive phone shell + single-day calendar + quick-capture FAB ✅
+Made the Android build actually usable on a phone (verified on the emulator at each step).
+- `lib/useIsMobile.ts` (viewport `matchMedia`, reactive) flips `App` between the desktop layout and a
+  new `components/MobileShell.tsx`: a bottom tab bar (Calendar / Plan / Tasks / Notes / More) showing
+  one full-height pane at a time, the sidebar's other destinations in a "More" bottom sheet, and the
+  frameless `TitleBar` hidden on mobile.
+- `CalendarPane` parameterized with a `days` prop — `7` = the desktop week grid (default, unchanged),
+  `1` = a phone day-view (full-width column, day-stepping nav, single-date header, always-visible
+  day-note button). All the old hardcoded-7 spots (grid templates, nav step, all-day-bar clamping) now
+  derive from `dayCount`.
+- Quick-capture **FAB** in `MobileShell` opens the existing `QuickCapture` modal (the desktop
+  Cmd/Ctrl+Shift+N has no touch equivalent).
+- Verified: `tsc` clean + Vitest **71** (desktop layout untouched — `matchMedia` mock reports non-mobile),
+  and rebuilt APK + emulator screenshots of the shell, day-view, and FAB→capture flow.
+- Follow-ups: per-pane touch polish, swipe-between-days; the bigger arc (in-process llama.cpp for
+  on-device AI, iOS on a Mac) is unchanged.
+
+### Mobile keystone — Rust core (incl. Iroh sync) cross-compiles to Android ✅
+Validated the riskiest assumption in the mobile plan (`~/.claude/plans/virtual-noodling-hoare.md`)
+*before* investing in UI/scaffold: does the synced Rust core build for a phone? **Yes** — produced
+`target/aarch64-linux-android/debug/libpushin_lib.so` (ELF aarch64, Android 24, NDK r27c). iroh +
+tokio + rusqlite + tauri + the whole `sync/` stack compile + link for Android.
+- Two desktop-safe changes unblocked it: **(1)** `keyring` scoped to `cfg(not(target_os="android"))`
+  (no Android backend) + an in-memory Android stub in `secrets.rs` (Keystore is a follow-up);
+  **(2)** `reqwest` → **rustls** (`default-features=false` + `rustls-tls`), since native-tls pulls
+  `openssl-sys` which won't cross-compile. The first build got all the way to `openssl-sys` before
+  failing — everything else was already compiling for Android.
+- Recipe (NDK r27c, env passed via `cmd.exe` since WSL env doesn't cross to Win32): set
+  `ANDROID_NDK_ROOT`, `CC_/CXX_/AR_aarch64-linux-android`, `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`
+  → `cargo build --lib --target aarch64-linux-android`. See memory `mobile-cross-compile`.
+- Verified no desktop regression: `cargo test --lib` still **188** green.
+- **Scope:** this proves the *compile*. Running on a device still needs the full Android SDK + emulator;
+  iOS needs a Mac (untested, but same pure-Rust deps + existing keychain path → expected to work).
+
+### Mobile — Pushin builds + RUNS on Android (full APK on an emulator) ✅
+Went past the compile: installed the full Android toolchain headlessly (JDK 17 + SDK + emulator), scaffolded
+`tauri android init`, built a universal debug APK, and launched it on a headless Android 14 emulator. The
+React UI + Rust core came up live (logcat showed the `path/getDataDir` IPC for the SQLite path; no crash).
+Screenshot captured. Full recipe + gotchas in memory `mobile-cross-compile`. Notable gotchas: the NDK must
+live *inside* the SDK (`$ANDROID_HOME/ndk/<ver>`), and the generated `gen/android` `BuildTask.kt` needed a
+`node.exe` + `tauri.js`-path fix (it's gitignored, so reapply after re-init). The debug APK is ~650 MB
+(unstripped ×2 ABIs). UI is still the desktop layout (cramped on a phone) — Phase 2 responsive/touch is next.
+iOS remains Mac-gated.
+
 ## 2026-06-17
 
 ### Device-to-device sync — private Iroh mesh + changeset log ✅ (built, live-unverified)

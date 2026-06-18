@@ -412,9 +412,20 @@ always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.
 - **Repo:** on GitHub (`Ilakkiyan/Pushin`), `main` is the default; releases are version tags (`v0.2.0`…).
 
 ## Known limitations / follow-ups
-- **Mobile:** the spawn-a-server approach won't work on iOS (no subprocess). Mobile needs **in-process
-  inference** (link llama.cpp via FFI, or MLC/MediaPipe) + a smaller default model (1.5B/0.5B). Memory
-  (~2GB for 3B) is the real wall on phones.
+- **Mobile (Android builds + runs; Tauri 2, same repo, sync-companion first):** plan in
+  `~/.claude/plans/virtual-noodling-hoare.md`; build/run recipe + gotchas in memory `mobile-cross-compile`.
+  **Done (2026-06-18):** full Rust core (incl. the Iroh sync mesh) cross-compiles to Android; a debug APK
+  builds and **runs on an emulator** (`gen/android` Tauri project, gitignored). Build changes (desktop
+  stays green): `keyring` scoped to `cfg(not(target_os="android"))` + in-memory Android stub in
+  `secrets.rs` (Android Keystore is a follow-up), and `reqwest` → **rustls** (native-tls pulls
+  `openssl-sys`, which won't cross-compile). **Mobile UI done:** a responsive shell —
+  `lib/useIsMobile.ts` flips `App` to `components/MobileShell.tsx` (bottom tab bar Calendar/Plan/Tasks/
+  Notes/More + a "More" sheet; no sidebar; `TitleBar` hidden); `CalendarPane` takes a `days` prop
+  (`1`=mobile day-view, `7`=desktop week — default unchanged); quick-capture **FAB** opens the existing
+  `QuickCapture` modal. **Still:** spawn-a-server inference won't work on iOS (no subprocess) — needs
+  **in-process llama.cpp via FFI** + a smaller default model (1.5B/0.5B; ~2 GB for the 3B is the phone-RAM
+  wall); v1 is companion-only (AI on desktop). **iOS untested — needs a Mac.** Per-pane touch polish +
+  swipe-between-days are nice-to-haves.
 - Google **tokens → OS keychain**; smarter **block-mirror diffing** (avoid delete+recreate churn).
 - **Engine auto-download now spans macOS/Linux/Windows** (CPU build). Still TODO: optionally
   **bundle `llama-server`** as a per-OS sidecar (offline installs), and offer GPU builds

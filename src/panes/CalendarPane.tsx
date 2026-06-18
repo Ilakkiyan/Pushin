@@ -37,7 +37,7 @@ interface DragState {
   deltaMin: number;
 }
 
-export default function CalendarPane() {
+export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) {
   const tasks = useStore((s) => s.tasks);
   const projects = useStore((s) => s.projects);
   const events = useStore((s) => s.events);
@@ -65,14 +65,26 @@ export default function CalendarPane() {
     return items;
   }, [settings]);
 
-  const [anchor, setAnchor] = useState(() => startOfWeek(focusDateIso ? parseLocal(focusDateIso) : new Date()));
+  // How many day-columns to render: 7 = the week grid (desktop), 1 = a single-day view (phones).
+  // The anchor is the week-start for the week grid, or the day-start for the day view.
+  const anchorStart = (date: Date) => {
+    if (dayCount >= 7) return startOfWeek(date);
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+  const gridCols = `56px repeat(${dayCount}, 1fr)`;
+  const lastCol = dayCount - 1;
+
+  const [anchor, setAnchor] = useState(() => anchorStart(focusDateIso ? parseLocal(focusDateIso) : new Date()));
   const [taskLabels, setTaskLabels] = useState<Record<number, Label[]>>({});
   const [eventLabels, setEventLabels] = useState<Record<number, Label[]>>({});
 
   // Month view hands off a day to open to; jump to its week when it changes.
   useEffect(() => {
-    if (focusDateIso) setAnchor(startOfWeek(parseLocal(focusDateIso)));
-  }, [focusDateIso]);
+    if (focusDateIso) setAnchor(anchorStart(parseLocal(focusDateIso)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusDateIso, dayCount]);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [modal, setModal] = useState<{ start: Date } | null>(null);
   // The event whose detail/label popover is open, plus a counter to refresh event labels (for
@@ -89,7 +101,7 @@ export default function CalendarPane() {
     scrollRef.current.scrollTop = focusHour * PX_PER_HOUR;
   }, []);
 
-  const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addMinutes(anchor, i * 1440)), [anchor]);
+  const days = useMemo(() => Array.from({ length: dayCount }, (_, i) => addMinutes(anchor, i * 1440)), [anchor, dayCount]);
   const taskById = useMemo(() => new Map(tasks.map((t) => [t.id, t])), [tasks]);
   const projectById = useMemo(() => new Map(projects.map((p) => [p.id, p])), [projects]);
   const labelFilterSet = useMemo(() => new Set(labelFilterIds), [labelFilterIds]);
@@ -124,9 +136,9 @@ export default function CalendarPane() {
       .map((e) => {
         const startIdx = dayIdx(parseLocal(e.start));
         const lastIdx = dayIdx(addDays(parseLocal(e.end), -1)); // end is exclusive midnight
-        return { e, startIdx, lastIdx, col0: Math.max(0, startIdx), col1: Math.min(6, lastIdx), labels: eventLabels[e.id] ?? [] };
+        return { e, startIdx, lastIdx, col0: Math.max(0, startIdx), col1: Math.min(lastCol, lastIdx), labels: eventLabels[e.id] ?? [] };
       })
-      .filter((b) => b.lastIdx >= 0 && b.startIdx <= 6)
+      .filter((b) => b.lastIdx >= 0 && b.startIdx <= lastCol)
       .sort((a, b) => a.startIdx - b.startIdx || parseLocal(a.e.start).getTime() - parseLocal(b.e.start).getTime());
   }, [events, days, eventLabels, labelFilterSet]);
 
@@ -179,18 +191,19 @@ export default function CalendarPane() {
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4 min-w-0 overflow-hidden">
         <ViewToggle />
         <div className="w-px h-5 bg-white/10 mx-1 shrink-0" />
-        <button onClick={() => setAnchor((a) => addMinutes(a, -7 * 1440))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => addDays(a, -dayCount))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronLeft className="size-4" />
         </button>
-        <button onClick={() => setAnchor(startOfWeek(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor(anchorStart(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
           Today
         </button>
-        <button onClick={() => setAnchor((a) => addMinutes(a, 7 * 1440))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => addDays(a, dayCount))} className="p-1 rounded hover:bg-white/10 shrink-0">
           <ChevronRight className="size-4" />
         </button>
         <span className="text-sm text-gray-300 ml-2 whitespace-nowrap truncate">
-          {anchor.toLocaleDateString([], { month: "short", day: "numeric" })} –{" "}
-          {days[6].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}
+          {dayCount === 1
+            ? anchor.toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" })
+            : `${anchor.toLocaleDateString([], { month: "short", day: "numeric" })} – ${days[lastCol].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`}
         </span>
         <CalendarLabelControls />
         {/* Legend is nice-to-have; hide it when the pane is too narrow (sidebar + chat aside squeeze it). */}
@@ -206,7 +219,7 @@ export default function CalendarPane() {
       <BriefingCard />
 
       {/* Day headers */}
-      <div className="shrink-0 grid border-b border-white/10" style={{ gridTemplateColumns: "56px repeat(7, 1fr)" }}>
+      <div className="shrink-0 grid border-b border-white/10" style={{ gridTemplateColumns: gridCols }}>
         <div />
         {days.map((d) => (
           <div key={d.toISOString()} className={clsx("group relative py-2 text-center text-xs", sameDay(d, now) ? "text-indigo-300" : "text-gray-400")}>
@@ -215,7 +228,10 @@ export default function CalendarPane() {
             <button
               onClick={() => openDaily(toLocalDate(d))}
               title="Open this day's note"
-              className="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 p-0.5 rounded text-gray-500 hover:text-indigo-300 hover:bg-white/10 transition"
+              className={clsx(
+                "absolute top-1.5 right-1.5 p-0.5 rounded text-gray-500 hover:text-indigo-300 hover:bg-white/10 transition",
+                dayCount === 1 ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+              )}
             >
               <NotebookPen className="size-3.5" />
             </button>
@@ -225,7 +241,7 @@ export default function CalendarPane() {
 
       {/* All-day / multi-day bar */}
       {allDayBars.length > 0 && (
-        <div className="shrink-0 border-b border-white/10 grid gap-y-0.5 py-1" style={{ gridTemplateColumns: "56px repeat(7, 1fr)" }}>
+        <div className="shrink-0 border-b border-white/10 grid gap-y-0.5 py-1" style={{ gridTemplateColumns: gridCols }}>
           <div className="text-[10px] text-gray-600 self-center text-right pr-1" style={{ gridColumn: 1, gridRow: 1 }}>
             all-day
           </div>
@@ -234,6 +250,7 @@ export default function CalendarPane() {
               key={b.e.id}
               bar={b}
               row={i + 1}
+              lastCol={lastCol}
               color={colorByLabel ? primaryLabelColor(b.labels) : null}
             />
           ))}
@@ -242,7 +259,7 @@ export default function CalendarPane() {
 
       {/* Scrollable grid */}
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto">
-        <div ref={gridRef} className="grid relative" style={{ gridTemplateColumns: "56px repeat(7, 1fr)", height: TOTAL_MIN / 60 * PX_PER_HOUR }}>
+        <div ref={gridRef} className="grid relative" style={{ gridTemplateColumns: gridCols, height: TOTAL_MIN / 60 * PX_PER_HOUR }}>
           {/* Time gutter */}
           <div className="relative">
             {Array.from({ length: END_HOUR - START_HOUR }, (_, i) => (
@@ -364,7 +381,7 @@ function matchesLabelFilter(labels: Label[] | undefined, active: Set<number>): b
   return active.size === 0 || (labels ?? []).some((label) => active.has(label.id));
 }
 
-function AllDayEventBar({ bar, row, color }: { bar: { e: CalEvent; startIdx: number; lastIdx: number; col0: number; col1: number }; row: number; color: string | null }) {
+function AllDayEventBar({ bar, row, color, lastCol }: { bar: { e: CalEvent; startIdx: number; lastIdx: number; col0: number; col1: number }; row: number; color: string | null; lastCol: number }) {
   return (
     <div
       onClick={(e) => e.stopPropagation()}
@@ -372,7 +389,7 @@ function AllDayEventBar({ bar, row, color }: { bar: { e: CalEvent; startIdx: num
         "text-[11px] px-2 py-0.5 truncate border self-center mx-0.5",
         !color && (bar.e.kind === "habit" ? "bg-emerald-500/20 border-emerald-400/40 text-emerald-100" : "bg-rose-500/20 border-rose-400/40 text-rose-100"),
         bar.startIdx >= 0 ? "rounded-l-md" : "",
-        bar.lastIdx <= 6 ? "rounded-r-md" : "",
+        bar.lastIdx <= lastCol ? "rounded-r-md" : "",
       )}
       style={{
         gridColumn: `${bar.col0 + 2} / ${bar.col1 + 3}`,
@@ -383,7 +400,7 @@ function AllDayEventBar({ bar, row, color }: { bar: { e: CalEvent; startIdx: num
     >
       {bar.startIdx < 0 ? "‹ " : ""}
       {bar.e.title}
-      {bar.lastIdx > 6 ? " ›" : ""}
+      {bar.lastIdx > lastCol ? " ›" : ""}
     </div>
   );
 }
