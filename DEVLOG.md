@@ -9,6 +9,34 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-06-17
+
+### Device-to-device sync — private Iroh mesh + changeset log ✅ (built, live-unverified)
+Run Pushin on multiple devices, synced **without a cloud** — a private peer-to-peer mesh (Iroh QUIC,
+E2E-encrypted) joined by a shared key, carrying a custom changeset log over SQLite. New `sync/` module +
+migration `0015_sync`. See CLAUDE.md ▸ **Device sync** for the full design.
+- **Data layer (the hard part, fully tested):** every synced table gets `uuid`/`updated_hlc`/`dirty`
+  columns + change-capture **triggers** (so `db.rs` CRUD is untouched), generated from one registry
+  (`sync::schema::TABLES`). FKs ship as referenced uuids and resolve to local ids on apply (polymorphic
+  refs + deferred fixup for out-of-order/self-refs). Hybrid Logical Clock + **row-level LWW**; tombstones
+  for deletes; per-peer watermarks. Capture suppression is **thread-local** (correct for inline triggers;
+  isolates parallel tests).
+- **Transport (`transport.rs` = only Iroh-touching file) + protocol (`protocol.rs`, transport-agnostic,
+  tested over an in-memory duplex) + engine (`engine.rs`: accept loop + 20s periodic pull + `SyncStore`).**
+  Identity/mesh key in the OS keychain; pairing by base32 invite ticket. Emits `sync-applied` → frontend
+  re-`load()`s.
+- **Commands + UI:** `sync_*` commands → `ipc.ts` → **Settings ▸ Devices & sync** (`DevicesSync.tsx`):
+  name device, create/paste invite, peer list, relay vs LAN-only toggle, sync-now, leave.
+- **⚠️ Iroh pinned to 0.90, not 1.0:** 1.0's `netwatch` forces `windows-core 0.62`, whose `wmi 0.18.4`
+  won't compile against the `0.61` Tauri 2.11 uses — a real Windows build break. 0.90's windows chain is
+  self-consistent. Revisit when upstream aligns.
+- **Verified:** `cargo test --lib` **188** (+14: hlc, changeset convergence/LWW/tombstones, protocol
+  over a real stream, state, identity), full `cargo build` ok, `tsc` clean, Vitest **71** (IPC contract
+  picks up the 8 new commands). **Not** verified: the live two-machine mesh (NAT traversal/relays) — like
+  Google sync, only provable on real devices.
+- **Follow-ups:** field-level LWW; per-device change-seq to kill the once-per-round echo; persist full
+  peer NodeAddr (today relies on n0 discovery by NodeId); managed/self-hosted relay.
+
 ## 2026-06-15
 
 ### Phase 4.3b — Meeting Companion: action-item extraction ✅ (Phase 4 complete)

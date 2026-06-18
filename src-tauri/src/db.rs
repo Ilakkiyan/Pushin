@@ -26,6 +26,8 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Register sync's change-capture function before migrating: the 0015 triggers reference it.
+    crate::sync::register_functions(&conn)?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -87,6 +89,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 14 {
         conn.execute_batch(MIGRATION_0014)?;
         conn.pragma_update(None, "user_version", 14)?;
+    }
+    if version < 15 {
+        // Device-sync substrate: uuid/updated_hlc/dirty columns + change-capture triggers +
+        // tombstones/peers/self tables. Generated from the synced-table registry (sync::schema).
+        conn.execute_batch(&crate::sync::schema::migration_sql())?;
+        conn.pragma_update(None, "user_version", 15)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -1220,7 +1228,11 @@ pub fn update_page(
         params![id, title, icon, content, content_json, now],
     )?;
     if let Some(emb) = embedding {
-        conn.execute("UPDATE notes SET embedding = ?2, embedding_model = ?3 WHERE id = ?1", params![id, emb, model])?;
+        // Embeddings are device-local (re-derived, never synced), so writing one must NOT mark the
+        // note dirty — otherwise re-embedding (e.g. a reindex) would needlessly re-ship the note.
+        crate::sync::with_capture_suppressed(|| {
+            conn.execute("UPDATE notes SET embedding = ?2, embedding_model = ?3 WHERE id = ?1", params![id, emb, model])
+        })?;
     }
     Ok(())
 }
@@ -1737,6 +1749,7 @@ pub fn page_graph(conn: &Connection) -> Result<PageGraph> {
 pub(crate) fn test_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    crate::sync::register_functions(&conn).unwrap();
     migrate(&conn).unwrap();
     conn
 }

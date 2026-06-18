@@ -17,6 +17,7 @@ pub mod parser;
 mod scheduler;
 mod schedule_service;
 mod secrets;
+mod sync;
 
 use commands::AppState;
 use std::sync::{Arc, Mutex};
@@ -44,7 +45,21 @@ pub fn run() {
                 server: Mutex::new(None),
                 embed_server: Mutex::new(None),
                 booking_server: Mutex::new(None),
+                sync_engine: Mutex::new(None),
             });
+
+            // If this device has already joined a sync network, bring the mesh engine up in the
+            // background (best-effort — sync failing must never block app startup).
+            if sync::identity::mesh_secret().is_some() {
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        if let Err(e) = commands::ensure_engine(handle.clone(), state.inner()).await {
+                            eprintln!("sync: engine did not start: {e}");
+                        }
+                    }
+                });
+            }
 
             // On macOS, native traffic-light controls are the reliable way out of fullscreen/
             // maximized states. A frameless custom titlebar can leave the window trapped.
@@ -141,6 +156,14 @@ pub fn run() {
             commands::model_present,
             commands::download_model,
             commands::ensure_inference,
+            commands::sync_status,
+            commands::sync_create_invite,
+            commands::sync_join,
+            commands::sync_now,
+            commands::sync_remove_peer,
+            commands::sync_set_device_name,
+            commands::sync_set_relay,
+            commands::sync_leave,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -148,6 +171,10 @@ pub fn run() {
             // Make sure we don't leave a llama-server orphaned on exit (chat + embeddings).
             if let RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    // Drop the sync engine (its Iroh endpoint closes on drop).
+                    if let Ok(mut guard) = state.sync_engine.lock() {
+                        guard.take();
+                    }
                     if let Ok(mut guard) = state.booking_server.lock() {
                         if let Some(server) = guard.take() {
                             server.stop();

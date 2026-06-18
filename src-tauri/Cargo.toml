@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.3.1"
+version = "0.4.0"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"
@@ -24,8 +24,9 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# DB: bundled SQLite, owned entirely by the Rust core
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+# DB: bundled SQLite, owned entirely by the Rust core. `functions` registers the sync_capturing()
+# SQL function the device-sync change-capture triggers call.
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "functions"] }
 # Dates resolved in Rust, never trusted from the LLM
 chrono = { version = "0.4", features = ["serde"] }
 # HTTP: llama-server client + streaming model download
@@ -46,8 +47,13 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # Error handling
 anyhow = "1"
 thiserror = "2"
-# Async sleep for inference-server readiness polling
-tokio = { version = "1", features = ["time"] }
+# Async runtime: inference-server readiness polling + the device-sync engine (io-util for the
+# length-prefixed wire protocol, sync for channels, net/rt for the Iroh transport).
+tokio = { version = "1", features = ["time", "io-util", "sync", "rt", "rt-multi-thread", "macros", "net"] }
+# Iroh: pure-Rust QUIC peer-to-peer mesh (NAT hole-punching + relay fallback). The "bundled tailnet".
+iroh = "0.90"
+# Base32 for shareable pairing tickets (NodeAddr + mesh secret), QR-friendly + case-insensitive.
+data-encoding = "2"
 
 [dev-dependencies]
 # The LLM-evaluation harness (`tests/llm_eval.rs`) is a separate crate, so it needs its own async

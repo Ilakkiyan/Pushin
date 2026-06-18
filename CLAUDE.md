@@ -46,6 +46,7 @@ Rust core
   ├─ context       : Context Engine — cross-entity recall over `entity_index` (projections, reindex, assembler)
   ├─ briefing      : deterministic Daily Briefing (today's events + due tasks + focus minutes)
   ├─ meeting       : Meeting Companion — deterministic pre-meeting brief + (LLM) action-item extraction
+  ├─ sync          : device-to-device sync — Iroh P2P mesh + custom changeset log (LWW over SQLite)
   └─ db            : projects, tasks, task_deps, events, blocks, settings, calendar_accounts, event_types, bookings, notes(=vault pages), page_links, labels, entity_labels, entity_index, people, focus_sessions
        │ spawns child process              │ OAuth + HTTPS
        ▼                                    ▼
@@ -58,14 +59,17 @@ Rust core
 - `commands.rs` — the IPC surface. **Never hold the DB `Mutex<Connection>` across an `.await`** (async commands must stay `Send`); use short scoped lock blocks.
 - `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, plus `Person`, `FocusSession`,
   `EntityKind`/`ContextItem` (Context Engine), `Briefing`, `MeetingBrief`/`AttendeeBrief`, etc.
-- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0014_focus_sessions`). `0008`
+- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0015_sync`). `0008`
   evolves `notes` into vault pages + adds `page_links`; `0009` adds `daily_date`, `entity_links`
   (page ↔ task/event), an `inbox` flag; `0010` adds `labels` + polymorphic `entity_labels`; `0011`
   makes booking public (slug/share_token/enabled + booking `event_id`); `0012` adds **`entity_index`**
   (Context Engine cross-entity recall); `0013` adds **`people`** (CRM); `0014` adds **`focus_sessions`**
-  (time-tracking). Page/graph/daily/inbox/entity-link/label CRUD, `resolve_task_prefs`, people CRUD,
+  (time-tracking); **`0015_sync`** adds `uuid`/`updated_hlc`/`dirty` columns + change-capture triggers to
+  every synced table, plus `sync_tombstones`/`sync_peers`/`sync_self` (generated from `sync::schema::TABLES`,
+  not hand-written). Page/graph/daily/inbox/entity-link/label CRUD, `resolve_task_prefs`, people CRUD,
   focus sessions + `estimation_samples`, `entity_index` CRUD + `entities_for_index`/`entity_neighbors`,
-  and keyword `suggest_labels` all live here.
+  and keyword `suggest_labels` all live here. `open`/`test_conn` call `sync::register_functions` before
+  migrating (the 0015 triggers call `sync_capturing()`).
 - `model_manager.rs` — model + engine auto-download, `llama-server` spawn/health, `MODELS` list.
   Cross-platform: picks the **CPU** llama.cpp release asset per OS/arch (asset substrings are
   extension-less since llama.cpp churns extensions — Linux moved `.zip`→`.tar.gz`). macOS/Linux
@@ -86,6 +90,14 @@ Rust core
   + `recall_context` live in `commands.rs`.) See the Context Engine section.
 - `briefing.rs` — pure Daily Briefing assembler (today's events + due/overdue tasks + scheduled focus minutes).
 - `meeting.rs` — pure Meeting Companion brief: event → booked attendees (→ `people`) + history + linked notes.
+- `sync/` — **device-to-device sync** (private Iroh mesh + changeset log). `schema.rs` = the synced-table
+  registry + generated `0015_sync` migration; `changeset.rs` = build/apply row deltas (FK→uuid, polymorphic,
+  LWW, tombstones, deferred FK fixup); `hlc.rs` = Hybrid Logical Clock; `state.rs` = `sync_self`/`sync_peers`
+  (clock, watermarks, peers); `identity.rs` = keychain node key + mesh secret; `protocol.rs` = transport-agnostic
+  wire protocol (testable over any stream); `transport.rs` = the **only** Iroh-touching file (endpoint, ticket,
+  bi-stream); `engine.rs` = the running engine (accept loop + periodic pull + `SyncStore` impl). See the **Device
+  sync** section. `sync_capturing()` (a registered SQL fn) gates the change-capture triggers; suppression is
+  **thread-local** (`with_capture_suppressed`).
 
 **Frontend (`src/`)**
 - `lib/ipc.ts` — typed wrappers over every Tauri command + shared types (incl. `Page`, `PageGraph`).
@@ -194,6 +206,58 @@ Rust core
   API enabled; self added as test user). Steps are in `README.md`. **This was built but NOT tested
   live** (no credentials in dev) — first connect is the real test; likely first snags are missing
   test-user or un-enabled Calendar API (readable errors surface in Settings).
+
+---
+
+## Device sync — private peer-to-peer mesh (`sync/`, migration `0015_sync`)
+Run Pushin on multiple devices and keep them in sync **without a cloud**: data flows device→device over
+a private **Iroh** QUIC mesh (E2E-encrypted), joined by a shared **mesh secret** (the "tailnet key").
+SQLite stays the source of truth; a **custom changeset log** reconciles state with last-writer-wins.
+Two layers — the transport (the easy part) and data reconciliation (the hard part).
+
+- **Two-layer split.** Everything above `transport.rs` is transport-agnostic and unit-tested over an
+  in-memory duplex; `transport.rs` is the **only** Iroh-touching file. The protocol/changeset have full
+  unit coverage; the actual mesh handshake/NAT-traversal is **only provable on two real machines** (like
+  Google sync — the leaf logic is tested, the live path isn't).
+- **Identity & the "key" (`identity.rs`, OS keychain via `secrets`).** Each device has a persisted Iroh
+  node key (its NodeId is its address). A per-network **mesh secret** is the shared key: a device only
+  accepts peers presenting the same one. Absent ⇒ sync is off. Pairing ticket = base32(NodeAddr + mesh
+  secret), shown as an invite code; the joiner adopts the secret and does an initial sync.
+- **Global ids, not local rowids.** Integer `AUTOINCREMENT` PKs collide across devices, so `0015` adds a
+  `uuid` to every synced table; FK columns ship as the **referenced row's uuid** and resolve back to the
+  peer's local id on apply (`changeset.rs`). Polymorphic refs (`entity_links`/`entity_labels`) resolve via
+  `entity_kind`→table. Out-of-order FKs use a deferred-fixup loop.
+- **Change capture = triggers, not instrumented CRUD.** `0015` adds `AFTER INSERT/UPDATE/DELETE` triggers
+  that stamp uuids, mark rows `dirty`, and write `sync_tombstones` — so the ~50 `db.rs` mutation functions
+  are untouched. Triggers consult the registered SQL fn `sync_capturing()`; our own build/apply writes run
+  inside `with_capture_suppressed` so they don't echo. **Suppression is thread-local** (a SQLite trigger
+  runs inline on the writing thread) — this also keeps parallel test threads isolated.
+- **HLC + LWW (`hlc.rs`).** A Hybrid Logical Clock gives a total order robust to clock skew; higher HLC
+  wins per row. `dirty` = "needs an HLC stamp"; `stamp_dirty` assigns them, `changes_since(hlc)` is the
+  delta a peer pulls, per-peer **watermarks** live in `sync_peers`. **Granularity is row-level** (concurrent
+  edits to *different fields of the same row* → later write wins the whole row; field-level is a follow-up).
+- **What syncs:** all user content (tasks/events/projects/habits/notes+links/labels+joins/people/focus/
+  bookings/event_types + **all** blocks). **Excluded** (device-local / re-derived): `settings`,
+  `calendar_accounts`+Google tokens, Iroh keys, `entity_index`, and `embedding`/vector columns (each
+  device re-embeds; writing an embedding is wrapped in `with_capture_suppressed` so it never re-dirties).
+- **Engine (`engine.rs`).** Started at boot if paired (best-effort, never blocks startup); owns the
+  endpoint, an **accept loop** (serve inbound sessions) + a **20s periodic pull** from known peers; impls
+  `SyncStore` against the live DB (short locked ops, never across `.await` — gotcha #8). On applying remote
+  changes it emits a Tauri **`sync-applied`** event; the frontend (`App.tsx`) re-`load()`s. Endpoint closes
+  on app exit (dropped in the `RunEvent::Exit` handler).
+- **Commands/UI.** `sync_status`/`sync_create_invite`/`sync_join`/`sync_now`/`sync_remove_peer`/
+  `sync_set_device_name`/`sync_set_relay`/`sync_leave` (in `lib.rs` handler) → `ipc.ts` → **Settings ▸
+  Devices & sync** (`components/DevicesSync.tsx`): name this device, create/paste invite, peer list,
+  relay/LAN-only toggle, sync-now, leave.
+- **Relay/privacy.** Default uses n0 relays for NAT traversal (they see only encrypted QUIC); a Settings
+  toggle switches to **LAN/direct-only** (no relay) for the strict-privacy user.
+- ⚠️ **Iroh is pinned to `0.90`, not `1.0`.** iroh 1.0's `netwatch` forces `windows-core 0.62`, whose
+  `wmi 0.18.4` doesn't compile against the `windows-core 0.61` Tauri 2.11 uses (a real Windows build break).
+  iroh 0.90's chain is self-consistent (`windows 0.59` throughout). Revisit when upstream aligns. Needs the
+  rusqlite **`functions`** feature + `data-encoding` (base32 tickets); `tokio` features were widened.
+- **Known follow-ups:** scalar-HLC watermark can re-ship a foreign-authored row **once** (idempotent,
+  quiesces in a round — a local per-device change-seq would make it minimal); field-level LWW; smarter block
+  handling; persisting full NodeAddr per peer (today periodic sync relies on n0 discovery by NodeId).
 
 ---
 
@@ -335,9 +399,13 @@ always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.
   durations); **Meeting Companion** (deterministic brief + confirm-chip action-item extraction); **public
   booking page** via a hardened local HTTP server + tunnel (see `SECURITY_TEST_PLAN.md`). Several
   model-dependent bits (action-item quality, planner recall on a real corpus) are **unverified live**.
+- **Working — device sync (built, live-unverified):** private **Iroh** P2P mesh + custom changeset log
+  (migration `0015`, `sync/`), Settings ▸ Devices pairing-by-invite, LWW reconciliation over all user
+  content. Changeset/protocol/HLC are unit-tested; the live mesh handshake is **only provable on two real
+  machines**. Iroh pinned to **0.90** (1.0 breaks the Windows build — see the Device sync section).
 - **Working — shell polish:** custom **frameless `TitleBar`** (own min/max/close) that **auto-hides
   when maximized/fullscreen**, revealing on a top-edge hover (F11 toggles fullscreen).
-- **Tested:** layered suite — Rust `cargo test --lib` (174) + httpmock integration, Vitest (71) +
+- **Tested:** layered suite — Rust `cargo test --lib` (**188**) + httpmock integration, Vitest (71) +
   IPC/bridge contract tests, Playwright mocked-IPC E2E (CI), live `llm_eval` battery (~90%, manual).
   CI: `.github/workflows/test.yml`. See **Test suite** above.
 - **Branding:** pushpin 📌 — sidebar brand, favicon, dock icon (`src-tauri/icons/`).

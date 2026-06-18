@@ -5,6 +5,7 @@ import clsx from "clsx";
 import { useStore } from "../state/store";
 import { type Settings } from "../lib/ipc";
 import { CommitmentList, SleepFields } from "../components/Personalization";
+import DevicesSync from "../components/DevicesSync";
 
 const REPO_URL = "https://github.com/Ilakkiyan/Pushin";
 const DOCS = {
@@ -244,6 +245,9 @@ export default function SettingsPane() {
           {googleMsg && <p className="text-xs text-gray-400">{googleMsg}</p>}
           {syncMsg && <p className="text-xs text-gray-400">{syncMsg}</p>}
         </section>
+
+        {/* Device-to-device sync (private Iroh mesh) */}
+        <DevicesSync />
 
         {/* Documentation */}
         <section className="space-y-3">

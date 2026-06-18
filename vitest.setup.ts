@@ -42,3 +42,19 @@ vi.mock("@tauri-apps/api/window", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
 }));
+
+// Event bus isn't present outside the webview — stub listen/emit so components that subscribe
+// (App's sync-applied refresh, InferenceSetup's progress) don't blow up under jsdom.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+  once: vi.fn().mockResolvedValue(() => {}),
+  emit: vi.fn().mockResolvedValue(undefined),
+}));
+
+// Event bus isn't present outside the webview — stub listen/emit so components that subscribe
+// (App's sync-applied refresh, InferenceSetup's progress) don't blow up under jsdom.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+  once: vi.fn().mockResolvedValue(() => {}),
+  emit: vi.fn().mockResolvedValue(undefined),
+}));

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ConflictBanner from "./components/ConflictBanner";
@@ -29,6 +30,14 @@ export default function App() {
 
   useEffect(() => {
     load();
+  }, [load]);
+
+  // When the sync engine applies remote changes from another device, refresh the app data.
+  useEffect(() => {
+    const un = listen("sync-applied", () => load());
+    return () => {
+      un.then((f) => f());
+    };
   }, [load]);
 
   if (!loaded) {

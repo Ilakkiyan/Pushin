@@ -42,6 +42,24 @@ export interface SyncSummary {
   blocksMirrored: number;
 }
 
+/** A device sharing this private sync mesh. */
+export interface SyncPeer {
+  nodeId: string;
+  name: string;
+  lastSeen: string | null;
+  lastAckedHlc: string;
+}
+
+/** State of the device-sync mesh for this device. */
+export interface SyncStatus {
+  enabled: boolean; // this device belongs to a network (has the shared key)
+  running: boolean; // the mesh engine is bound and serving
+  nodeId: string;
+  deviceName: string;
+  useRelay: boolean;
+  peers: SyncPeer[];
+}
+
 export interface Project {
   id: number;
   name: string;
@@ -474,4 +492,14 @@ export const api = {
   ensureInference: () => invoke<string>("ensure_inference"),
   // Hermes: auto-download the embedding model + start the embeddings server (idempotent).
   ensureEmbeddings: () => invoke<string>("ensure_embeddings"),
+
+  // Device sync: a private peer-to-peer mesh (Iroh) carrying a changeset log over SQLite.
+  syncStatus: () => invoke<SyncStatus>("sync_status"),
+  syncCreateInvite: () => invoke<string>("sync_create_invite"),
+  syncJoin: (ticket: string) => invoke<SyncStatus>("sync_join", { ticket }),
+  syncNow: () => invoke<number>("sync_now"),
+  syncRemovePeer: (nodeId: string) => invoke<void>("sync_remove_peer", { nodeId }),
+  syncSetDeviceName: (name: string) => invoke<void>("sync_set_device_name", { name }),
+  syncSetRelay: (useRelay: boolean) => invoke<void>("sync_set_relay", { useRelay }),
+  syncLeave: () => invoke<void>("sync_leave"),
 };

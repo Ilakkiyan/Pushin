@@ -25,6 +25,8 @@ pub struct AppState {
     /// The second llama-server, in embeddings mode, powering Hermes semantic recall.
     pub embed_server: Mutex<Option<Child>>,
     pub booking_server: Mutex<Option<BookingServerHandle>>,
+    /// The device-sync engine (Iroh mesh). `None` until the device joins/creates a network.
+    pub sync_engine: Mutex<Option<Arc<crate::sync::engine::SyncEngine>>>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -1466,6 +1468,127 @@ pub async fn ensure_embeddings(app: AppHandle, state: State<'_, AppState>) -> Re
         }
     }
     Err("Memory engine is taking a while to start — give it a moment.".into())
+}
+
+// ============================ Device sync (private Iroh mesh) ============================
+use crate::sync;
+use crate::sync::engine::SyncEngine;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    /// A mesh secret exists — this device belongs to a network.
+    enabled: bool,
+    /// The engine is bound and serving.
+    running: bool,
+    node_id: String,
+    device_name: String,
+    use_relay: bool,
+    peers: Vec<sync::state::Peer>,
+}
+
+fn build_status(state: &AppState) -> Result<SyncStatus, String> {
+    let enabled = sync::identity::mesh_secret().is_some();
+    let running = state.sync_engine.lock().map_err(err)?.is_some();
+    let conn = state.db.lock().map_err(err)?;
+    Ok(SyncStatus {
+        enabled,
+        running,
+        node_id: sync::state::node_id(&conn).map_err(err)?.unwrap_or_default(),
+        device_name: sync::state::device_name(&conn).map_err(err)?,
+        use_relay: sync::state::use_relay(&conn),
+        peers: sync::state::list_peers(&conn).map_err(err)?,
+    })
+}
+
+/// Return the running engine, starting it if the device is paired but the engine is down.
+pub(crate) async fn ensure_engine(app: AppHandle, state: &AppState) -> Result<Arc<SyncEngine>, String> {
+    if let Some(e) = state.sync_engine.lock().map_err(err)?.clone() {
+        return Ok(e);
+    }
+    if sync::identity::mesh_secret().is_none() {
+        return Err("This device hasn't joined a sync network yet.".into());
+    }
+    let use_relay = { sync::state::use_relay(&*state.db.lock().map_err(err)?) };
+    let engine = SyncEngine::start(state.db.clone(), app, use_relay).await.map_err(err)?;
+    *state.sync_engine.lock().map_err(err)? = Some(engine.clone());
+    Ok(engine)
+}
+
+#[tauri::command]
+pub async fn sync_status(state: State<'_, AppState>) -> Result<SyncStatus, String> {
+    build_status(state.inner())
+}
+
+/// Start a network (if needed) and mint an invite ticket another device pastes to join.
+#[tauri::command]
+pub async fn sync_create_invite(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    sync::identity::ensure_mesh_secret();
+    let engine = ensure_engine(app, state.inner()).await?;
+    engine.create_invite().await.map_err(err)
+}
+
+/// Join a network from an invite ticket: adopt its mesh secret, then do an initial sync.
+#[tauri::command]
+pub async fn sync_join(app: AppHandle, state: State<'_, AppState>, ticket: String) -> Result<SyncStatus, String> {
+    let (addr, mesh) = sync::transport::parse_ticket(&ticket).map_err(err)?;
+    if !sync::identity::set_mesh_secret(&mesh) {
+        return Err("Couldn't store the network key in the OS keychain.".into());
+    }
+    let engine = ensure_engine(app, state.inner()).await?;
+    engine.sync_with(addr).await.map_err(err)?;
+    build_status(state.inner())
+}
+
+#[tauri::command]
+pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
+    let engine = ensure_engine(app, state.inner()).await?;
+    Ok(engine.sync_all_peers().await)
+}
+
+#[tauri::command]
+pub async fn sync_remove_peer(state: State<'_, AppState>, node_id: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(err)?;
+    sync::state::remove_peer(&conn, &node_id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn sync_set_device_name(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    let conn = state.db.lock().map_err(err)?;
+    sync::state::set_device_name(&conn, &name).map_err(err)
+}
+
+/// Toggle relay use (LAN/direct-only when off). Restarts the engine to rebind.
+#[tauri::command]
+pub async fn sync_set_relay(app: AppHandle, state: State<'_, AppState>, use_relay: bool) -> Result<(), String> {
+    {
+        let conn = state.db.lock().map_err(err)?;
+        sync::state::set_use_relay(&conn, use_relay).map_err(err)?;
+    }
+    // Take the engine out (dropping the lock guard) before awaiting its shutdown.
+    let old = state.sync_engine.lock().map_err(err)?.take();
+    if let Some(e) = old {
+        e.shutdown().await;
+    }
+    if sync::identity::mesh_secret().is_some() {
+        ensure_engine(app, state.inner()).await?;
+    }
+    Ok(())
+}
+
+/// Leave the network: stop the engine, forget the mesh key + peers (the device keeps its identity).
+#[tauri::command]
+pub async fn sync_leave(state: State<'_, AppState>) -> Result<(), String> {
+    let old = state.sync_engine.lock().map_err(err)?.take();
+    if let Some(e) = old {
+        e.shutdown().await;
+    }
+    sync::identity::forget_mesh();
+    let conn = state.db.lock().map_err(err)?;
+    for p in sync::state::list_peers(&conn).unwrap_or_default() {
+        let _ = sync::state::remove_peer(&conn, &p.node_id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

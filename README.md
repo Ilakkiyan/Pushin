@@ -302,6 +302,36 @@ first‑run welcome, and you can change them here anytime.
 
 ---
 
+## Sync across your devices (optional)
+
+Run Pushin on more than one computer and keep them in sync **without any cloud or account**. Your
+devices form a small **private peer‑to‑peer network** (built on [Iroh](https://www.iroh.computer/)):
+data flows **directly device‑to‑device, end‑to‑end encrypted**, joined by a single shared key — true
+to Pushin's local‑first, on‑device spirit.
+
+**How to pair two devices**
+
+1. On the first device, open **Settings ▸ Devices & sync** and click **Create invite code**. Copy the
+   code that appears.
+2. On the second device, open the same screen, paste the code into **Join a network**, and click
+   **Join**. That's it — the two devices now sync automatically (and on demand via **Sync now**).
+3. Add more devices the same way (create an invite on any paired device).
+
+**Good to know**
+
+- **What syncs:** your tasks, events, projects, habits, vault pages + links, labels, people, and focus
+  sessions. Device‑specific settings (your AI model, Google connection) stay local to each device.
+- **Conflicts** are resolved last‑writer‑wins (the most recent edit to an item wins). Deletes propagate.
+- **Privacy:** connections are end‑to‑end encrypted. By default Pushin uses public relay servers to help
+  your devices find each other across networks (they only ever see encrypted traffic). For maximum
+  privacy you can switch to **LAN/direct‑only** in the same settings — devices then connect only when
+  reachable directly (e.g. on the same Wi‑Fi).
+- **Leaving:** **Leave this sync network** forgets the shared key and your paired devices on that device.
+- This feature is new; the underlying logic is unit‑tested, but the real proof is two machines talking —
+  if a device doesn't appear, try **Sync now**, and keep both apps open.
+
+---
+
 ## Google Calendar sync (optional)
 
 Two‑way sync with your **primary** calendar: Google events are pulled in (the scheduler plans
