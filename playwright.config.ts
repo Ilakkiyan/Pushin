@@ -4,6 +4,8 @@ import { defineConfig, devices } from "@playwright/test";
 // (tests/e2e/_mockBridge.ts) instead of the Rust process. Browser runs in CI (ubuntu-latest).
 export default defineConfig({
   testDir: "./tests/e2e",
+  // `_*.spec.ts` are dev-only screenshot utilities (e.g. _capture.spec.ts) — not run in CI.
+  testIgnore: "**/_*.spec.ts",
   timeout: 30_000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

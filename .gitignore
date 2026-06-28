@@ -12,6 +12,11 @@ src-tauri/target/
 src-tauri/target-eval/
 src-tauri/gen/
 
+# Playwright / dev screenshot output (root-level)
+/target/
+/test-results/
+/playwright-report/
+
 # Downloaded models & inference engine (fetched at runtime, large)
 src-tauri/models/
 *.gguf
