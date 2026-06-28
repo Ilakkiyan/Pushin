@@ -47,6 +47,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
   const openDaily = useStore((s) => s.openDaily);
+  const openEntityNote = useStore((s) => s.openEntityNote);
   const focusDateIso = useStore((s) => s.focusDateIso);
   const settings = useStore((s) => s.settings);
   const colorByLabel = useStore((s) => s.calColorByLabel);
@@ -91,6 +92,8 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   // color-by-label + filters) after the popover edits them.
   const [detail, setDetail] = useState<CalEvent | null>(null);
   const [labelRefresh, setLabelRefresh] = useState(0);
+  // Selected time slot (mouse click or keyboard arrows) — a {column, minutes-from-midnight} cursor.
+  const [cursor, setCursor] = useState<{ dayIdx: number; minutes: number } | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -174,14 +177,78 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   const top = (d: Date) => ((minutesFromMidnight(d) - TOP_MIN) / 60) * PX_PER_HOUR;
   const height = (mins: number) => Math.max(16, (mins / 60) * PX_PER_HOUR);
 
-  const onColumnClick = (day: Date, e: React.MouseEvent) => {
-    if (drag) return;
+  const SNAP = 30; // minutes per arrow step / click snap
+  const topMin = (minutes: number) => ((minutes - TOP_MIN) / 60) * PX_PER_HOUR;
+  const slotMinutes = (e: React.MouseEvent) => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const mins = snap(TOP_MIN + ((e.clientY - rect.top) / PX_PER_HOUR) * 60, 30);
-    const base = new Date(day);
-    base.setHours(0, 0, 0, 0);
-    setModal({ start: addMinutes(base, mins) });
+    return snap(TOP_MIN + ((e.clientY - rect.top) / PX_PER_HOUR) * 60, SNAP);
   };
+  // Single click SELECTS the slot (keyboard takes over from there); double-click / Enter CREATES.
+  const onColumnClick = (dayIdx: number, e: React.MouseEvent) => {
+    if (drag) return;
+    setCursor({ dayIdx, minutes: slotMinutes(e) });
+    gridRef.current?.focus();
+  };
+  const createAt = (dayIdx: number, minutes: number) => {
+    const base = new Date(days[dayIdx]);
+    base.setHours(0, 0, 0, 0);
+    setModal({ start: addMinutes(base, minutes) });
+  };
+  const onColumnDblClick = (dayIdx: number, e: React.MouseEvent) => {
+    if (drag) return;
+    createAt(dayIdx, slotMinutes(e));
+  };
+  const onGridKey = (e: React.KeyboardEvent) => {
+    const maxMin = TOP_MIN + TOTAL_MIN - SNAP;
+    if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      e.preventDefault();
+      setCursor((c) => {
+        const seed = c ?? {
+          dayIdx: Math.max(0, days.findIndex((d) => sameDay(d, new Date()))),
+          minutes: snap(Math.min(maxMin, Math.max(TOP_MIN, minutesFromMidnight(new Date()))), SNAP),
+        };
+        let { dayIdx, minutes } = seed;
+        if (e.key === "ArrowLeft") dayIdx = Math.max(0, dayIdx - 1);
+        if (e.key === "ArrowRight") dayIdx = Math.min(dayCount - 1, dayIdx + 1);
+        if (e.key === "ArrowUp") minutes = Math.max(TOP_MIN, minutes - SNAP);
+        if (e.key === "ArrowDown") minutes = Math.min(maxMin, minutes + SNAP);
+        return { dayIdx, minutes };
+      });
+    } else if (e.key === "Enter" && cursor) {
+      e.preventDefault();
+      createAt(cursor.dayIdx, cursor.minutes);
+    } else if (e.key === "Escape") {
+      setCursor(null);
+    }
+  };
+  // Keep the keyboard cursor in view as it moves.
+  useEffect(() => {
+    if (!cursor || !scrollRef.current) return;
+    const el = scrollRef.current;
+    const y = topMin(cursor.minutes);
+    if (y < el.scrollTop) el.scrollTop = Math.max(0, y - 60);
+    else if (y > el.scrollTop + el.clientHeight - 40) el.scrollTop = y - el.clientHeight + 80;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cursor]);
+
+  // Open (creating + linking on first use) the vault note for an event, auto-titled "Title — Mon D".
+  const makeEventNote = (ev: CalEvent) => {
+    const when = parseLocal(ev.start).toLocaleDateString([], { month: "short", day: "numeric" });
+    openEntityNote("event", ev.id, `${ev.title} — ${when}`);
+    setDetail(null);
+  };
+  // Ctrl/⌘+T → note for the event whose detail is open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "t" && detail) {
+        e.preventDefault();
+        makeEventNote(detail);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail]);
 
   const now = new Date();
 
@@ -259,7 +326,13 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
 
       {/* Scrollable grid */}
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto">
-        <div ref={gridRef} className="grid relative" style={{ gridTemplateColumns: gridCols, height: TOTAL_MIN / 60 * PX_PER_HOUR }}>
+        <div
+          ref={gridRef}
+          tabIndex={0}
+          onKeyDown={onGridKey}
+          className="grid relative outline-none"
+          style={{ gridTemplateColumns: gridCols, height: (TOTAL_MIN / 60) * PX_PER_HOUR }}
+        >
           {/* Time gutter */}
           <div className="relative">
             {Array.from({ length: END_HOUR - START_HOUR }, (_, i) => (
@@ -270,15 +343,23 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           </div>
 
           {/* Day columns */}
-          {days.map((day) => {
+          {days.map((day, dayIdx) => {
             const dayEvents = events.filter((e) => !isAllDay(e) && sameDay(parseLocal(e.start), day) && matchesLabelFilter(eventLabels[e.id], labelFilterSet));
             const dayBlocks = blocks.filter((b) => sameDay(parseLocal(b.start), day) && matchesLabelFilter(taskLabels[b.taskId], labelFilterSet));
             return (
               <div
                 key={day.toISOString()}
                 className="relative border-l border-white/5"
-                onClick={(e) => onColumnClick(day, e)}
+                onClick={(e) => onColumnClick(dayIdx, e)}
+                onDoubleClick={(e) => onColumnDblClick(dayIdx, e)}
               >
+                {/* Selected-slot cursor (mouse/keyboard) */}
+                {cursor?.dayIdx === dayIdx && (
+                  <div
+                    className="absolute left-0.5 right-0.5 z-30 pointer-events-none rounded-md ring-2 ring-white/70 bg-white/10"
+                    style={{ top: topMin(cursor.minutes), height: height(SNAP) }}
+                  />
+                )}
                 {/* Hour lines */}
                 {Array.from({ length: END_HOUR - START_HOUR }, (_, i) => (
                   <div key={i} className="absolute left-0 right-0 border-t border-white/5" style={{ top: i * PX_PER_HOUR }} />
@@ -365,6 +446,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       {detail && (
         <EventDetailModal
           ev={detail}
+          onNotes={() => makeEventNote(detail)}
           onClose={() => { setDetail(null); setLabelRefresh((n) => n + 1); }}
           onDelete={() => { deleteEvent(detail.id); setDetail(null); setLabelRefresh((n) => n + 1); }}
         />
@@ -497,7 +579,7 @@ function EventCard({ ev, top, height, color, onDelete, onOpen }: { ev: CalEvent;
 
 /** Click an event → a small popover to (re)label it and delete it. Events have no inline editor, and
  *  the calendar block itself is `overflow-hidden`, so labels live here rather than on the block. */
-function EventDetailModal({ ev, onClose, onDelete }: { ev: CalEvent; onClose: () => void; onDelete: () => void }) {
+function EventDetailModal({ ev, onClose, onDelete, onNotes }: { ev: CalEvent; onClose: () => void; onDelete: () => void; onNotes: () => void }) {
   const createTask = useStore((s) => s.createTask);
   const [brief, setBrief] = useState<MeetingBrief | null>(null);
   const [notes, setNotes] = useState("");
@@ -532,7 +614,7 @@ function EventDetailModal({ ev, onClose, onDelete }: { ev: CalEvent; onClose: ()
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/50" onClick={onClose}>
-      <div className="w-80 rounded-xl border border-white/10 bg-[#12151c] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-80 rounded-xl border border-white/10 bg-[var(--raised)] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-start justify-between gap-2">
           <h3 className="text-sm font-medium leading-snug">{ev.title}</h3>
           <button onClick={onClose} className="text-gray-500 hover:text-white shrink-0"><X className="size-4" /></button>
@@ -602,7 +684,15 @@ function EventDetailModal({ ev, onClose, onDelete }: { ev: CalEvent; onClose: ()
             </div>
           )}
         </div>
-        <div className="flex justify-end pt-1">
+        <div className="flex items-center justify-between pt-1">
+          <button
+            onClick={onNotes}
+            title="Open the linked note (creates one on first use)"
+            className="text-xs px-3 py-1.5 rounded-md bg-white/5 border border-white/10 hover:bg-white/10 inline-flex items-center gap-1.5"
+          >
+            <NotebookPen className="size-3.5" /> Notes
+            <kbd className="text-[10px] text-gray-500 border border-white/10 rounded px-1">⌘T</kbd>
+          </button>
           <button onClick={onDelete} className="text-xs px-3 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
             Delete event
           </button>
@@ -617,7 +707,7 @@ function AddEventModal({ start, onClose, onSave }: { start: Date; onClose: () =>
   const [duration, setDuration] = useState(60);
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/50" onClick={onClose}>
-      <div className="w-80 rounded-xl border border-white/10 bg-[#12151c] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-80 rounded-xl border border-white/10 bg-[var(--raised)] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-medium flex items-center gap-2"><Plus className="size-4" /> Add busy time</h3>
           <button onClick={onClose} className="text-gray-500 hover:text-white"><X className="size-4" /></button>
@@ -639,7 +729,7 @@ function AddEventModal({ start, onClose, onSave }: { start: Date; onClose: () =>
           <button
             disabled={!title.trim()}
             onClick={() => onSave(title.trim(), addMinutes(start, duration))}
-            className="ml-auto text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
+            className="ml-auto text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
           >
             Add
           </button>
