@@ -250,7 +250,7 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
             placeholder="New subtask…"
             className="flex-1 rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50"
           />
-          <button onClick={add} disabled={!title.trim()} className="text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40">
+          <button onClick={add} disabled={!title.trim()} className="text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40">
             Add
           </button>
         </div>

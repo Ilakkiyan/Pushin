@@ -169,8 +169,8 @@ export default function BookingPane() {
   };
 
   return (
-    <div className="h-full w-full overflow-hidden flex bg-[#0b0e13]">
-      <aside className="w-72 shrink-0 border-r border-white/10 flex flex-col bg-[#11141b]">
+    <div className="h-full w-full overflow-hidden flex bg-[var(--bg)]">
+      <aside className="w-72 shrink-0 border-r border-white/10 flex flex-col bg-[var(--surface)]">
         <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
           <div>
             <div className="text-sm font-medium">Booking</div>
@@ -479,7 +479,7 @@ export default function BookingPane() {
 }
 
 function Panel({ children }: { children: React.ReactNode }) {
-  return <section className="rounded-lg border border-white/10 bg-[#11141b] p-4">{children}</section>;
+  return <section className="rounded-lg border border-white/10 bg-[var(--surface)] p-4">{children}</section>;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -538,7 +538,7 @@ function BookingModal({
   const [busy, setBusy] = useState(false);
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4" onClick={onClose}>
-      <div className="w-full max-w-sm rounded-lg border border-white/10 bg-[#12151c] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+      <div className="w-full max-w-sm rounded-lg border border-white/10 bg-[var(--raised)] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-medium">Preview booking: {typeName}</h3>
           <button onClick={onClose} className="grid size-8 place-items-center rounded-md text-gray-500 hover:bg-white/10 hover:text-white">
@@ -560,7 +560,7 @@ function BookingModal({
               setBusy(false);
             }
           }}
-          className="w-full inline-flex items-center justify-center gap-2 text-sm py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
+          className="w-full inline-flex items-center justify-center gap-2 text-sm py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
         >
           {busy ? <RefreshCw className="size-4 animate-spin" /> : <Check className="size-4" />}
           Confirm booking
@@ -571,6 +571,6 @@ function BookingModal({
 }
 
 const inputCls = "w-full rounded-md bg-white/5 border border-white/10 px-2 py-2 text-sm outline-none focus:border-indigo-500/50";
-const primaryBtn = "inline-flex items-center gap-2 px-3 py-2 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40 text-sm";
+const primaryBtn = "inline-flex items-center gap-2 px-3 py-2 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40 text-sm";
 const ghostBtn = "inline-flex items-center gap-2 px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 text-sm text-gray-300";
 const dangerBtn = "inline-flex items-center gap-2 px-3 py-2 rounded-md bg-rose-500/15 hover:bg-rose-500/25 text-sm text-rose-200";

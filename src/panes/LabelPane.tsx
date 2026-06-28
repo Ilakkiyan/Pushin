@@ -139,7 +139,7 @@ function LabelEditor({ initial, onSave, onDelete }: { initial: { name: string; c
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => onSave(f)} className="text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 text-white">Save</button>
+        <button onClick={() => onSave(f)} className="text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900">Save</button>
         <button onClick={() => { if (confirm(`Delete label "${initial.name}"?`)) onDelete(); }} className="ml-auto text-xs px-2 py-1.5 rounded-md text-gray-400 hover:text-rose-300 flex items-center gap-1">
           <Trash2 className="size-3.5" /> Delete
         </button>

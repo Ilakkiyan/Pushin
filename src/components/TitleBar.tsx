@@ -55,11 +55,9 @@ export default function TitleBar() {
   const btn = "h-full px-3.5 grid place-items-center text-gray-400 hover:bg-white/10 hover:text-white transition";
 
   const bar = (
-    <div data-tauri-drag-region className="h-8 flex items-stretch justify-between bg-[#0b0e14] border-b border-white/10 select-none">
-      <div data-tauri-drag-region className="flex items-center gap-2 px-3 text-[11px] text-gray-500">
-        <span className="text-xs leading-none">📌</span>
-        Pushin
-      </div>
+    <div data-tauri-drag-region className="h-8 flex items-stretch justify-between bg-[var(--surface)] border-b border-white/10 select-none">
+      {/* Empty draggable region — the brand lives in the sidebar, so the title bar stays minimal. */}
+      <div data-tauri-drag-region className="flex-1" />
       <div className="flex items-stretch">
         <button onClick={() => appWindow.minimize()} title="Minimize" className={btn}>
           <Minus className="size-3.5" />

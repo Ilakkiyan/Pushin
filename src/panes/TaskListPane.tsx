@@ -166,7 +166,7 @@ export default function TaskListPane() {
               className="w-20 rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none"
             />
             <span className="text-xs text-gray-500">minutes</span>
-            <button onClick={add} className="ml-auto text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400">
+            <button onClick={add} className="ml-auto text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900">
               Add
             </button>
           </div>

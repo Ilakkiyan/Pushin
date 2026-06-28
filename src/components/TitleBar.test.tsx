@@ -23,11 +23,11 @@ function mockPlatform(platform: string) {
 }
 
 describe("TitleBar (frameless window controls)", () => {
-  it("renders the brand + controls and wires the window buttons", async () => {
+  it("renders the window controls and wires the window buttons", async () => {
     const platform = mockPlatform("Win32");
     render(<TitleBar />);
     await waitFor(() => expect(win.isMaximized).toHaveBeenCalled());
-    expect(screen.getByText("Pushin")).toBeInTheDocument();
+    // The brand wordmark lives in the sidebar now, not the title bar.
 
     await userEvent.click(screen.getByTitle("Minimize"));
     expect(win.minimize).toHaveBeenCalledOnce();

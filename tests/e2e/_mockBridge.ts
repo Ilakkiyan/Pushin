@@ -14,11 +14,17 @@ export async function installMockBridge(page: Page) {
       pages: [] as any[],
       inbox: [] as any[],
       settings: {
-        onboarded: true,
+        // `?new` in the URL → a fresh (un-onboarded) user, for capturing the WelcomeGuide.
+        onboarded: !new URLSearchParams(window.location.search).has("new"),
         googleConnected: false,
         timezone: "UTC",
         workStart: "09:00",
         workEnd: "17:00",
+        workDays: [1, 2, 3, 4, 5],
+        commitments: [],
+        sleepEnabled: false,
+        sleepStart: "23:00",
+        sleepEnd: "07:00",
         modelId: "lite",
         embedModel: "",
       },
@@ -97,9 +103,29 @@ export async function installMockBridge(page: Page) {
       vault_ask: () => ({ answer: "(mock answer)", citations: [] }),
       extract_memories: () => [],
       plan_tasks: () => ({ createdTaskIds: [], createdEventIds: [], projectNames: [], createdEventTitles: [], updatedEventTitles: [], removedEventTitles: [], createdHabitNames: [], clarifications: [] }),
+      daily_briefing: () => ({
+        date: "2026-06-28",
+        weekday: "Sunday",
+        events: [
+          { id: 1, title: "Morning standup", start: "2026-06-28T09:00:00", end: "2026-06-28T09:15:00", kind: "fixed", source: "manual", createdAt: "" },
+          { id: 2, title: "Lunch with Sam", start: "2026-06-28T12:30:00", end: "2026-06-28T13:30:00", kind: "fixed", source: "manual", createdAt: "" },
+          { id: 3, title: "Design review", start: "2026-06-28T15:00:00", end: "2026-06-28T16:00:00", kind: "fixed", source: "manual", createdAt: "" },
+        ],
+        dueTasks: [
+          { id: 10, title: "Finish the Q3 deck" },
+          { id: 11, title: "Email the vendor" },
+        ],
+        focusMinutes: 90,
+      }),
     };
 
     (window as any).__TAURI_INTERNALS__ = {
+      // Window/webview identity so @tauri-apps/api `getCurrentWindow()`/`getCurrentWebview()` (used by
+      // the frameless TitleBar) resolve instead of throwing during the initial render.
+      metadata: {
+        currentWindow: { label: "main" },
+        currentWebview: { label: "main", windowLabel: "main" },
+      },
       transformCallback: (cb: any) => cb,
       invoke: (cmd: string, args: any) => {
         if (handlers[cmd]) return Promise.resolve(handlers[cmd](args || {}));

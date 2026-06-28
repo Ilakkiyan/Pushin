@@ -93,7 +93,7 @@ export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKi
       </button>
 
       {open && (
-        <div className="absolute top-full left-0 mt-1 z-50 w-52 rounded-lg bg-[#0e1117] border border-white/10 shadow-xl p-1.5">
+        <div className="absolute top-full left-0 mt-1 z-50 w-52 rounded-lg bg-[var(--raised)] border border-white/10 shadow-xl p-1.5">
           {(() => {
             const fresh = suggestions.filter((s) => !selected.has(s.id));
             return fresh.length > 0 ? (

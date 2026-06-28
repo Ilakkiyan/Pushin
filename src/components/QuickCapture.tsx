@@ -46,8 +46,8 @@ export default function QuickCapture() {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-start justify-center pt-[20vh]" onClick={() => setOpen(false)}>
-      <div className="w-full max-w-lg mx-4 rounded-xl bg-[#0e1117] border border-white/10 shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
+    <div className="fade-in fixed inset-0 z-50 bg-black/50 flex items-start justify-center pt-[20vh]" onClick={() => setOpen(false)}>
+      <div className="pop-in w-full max-w-lg mx-4 rounded-xl bg-[var(--raised)] border border-white/10 shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 px-4 py-2 border-b border-white/10 text-sm text-gray-400">
           <Inbox className="size-4 text-indigo-400" /> Quick capture
           <span className="ml-auto text-[10px] text-gray-600">⌘/Ctrl+Enter to save · Esc to close</span>
@@ -74,7 +74,7 @@ export default function QuickCapture() {
           <button
             onClick={save}
             disabled={!text.trim() || saving}
-            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 text-white disabled:opacity-40"
+            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
           >
             {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Inbox className="size-3.5" />}
             Capture

@@ -110,7 +110,7 @@ export default function HabitsPane() {
             <button
               onClick={add}
               disabled={!name.trim()}
-              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
+              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
             >
               <Plus className="size-4" /> Add
             </button>

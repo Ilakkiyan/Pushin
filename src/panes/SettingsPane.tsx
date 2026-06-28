@@ -214,7 +214,7 @@ export default function SettingsPane() {
           <Field label="Model">
             <select value={form.modelId} onChange={(e) => update({ modelId: e.target.value })} className={inputCls}>
               {(llm?.models ?? [{ id: form.modelId, name: form.modelId }]).map((m) => (
-                <option key={m.id} value={m.id} className="bg-[#12151c]">{m.name}</option>
+                <option key={m.id} value={m.id} className="bg-[var(--raised)]">{m.name}</option>
               ))}
             </select>
           </Field>
@@ -328,7 +328,7 @@ export default function SettingsPane() {
               <button
                 onClick={installUpdates}
                 disabled={installing}
-                className="text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-50 inline-flex items-center gap-1.5"
+                className="text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-50 inline-flex items-center gap-1.5"
               >
                 {installing ? <Loader2 className="size-3.5 animate-spin" /> : <DownloadCloud className="size-3.5" />}
                 {installing ? (installPct !== null ? `Installing ${installPct}%…` : "Installing…") : `Update to ${pendingUpdate.version} & restart`}
@@ -348,7 +348,7 @@ export default function SettingsPane() {
         </section>
 
         <div className="flex items-center gap-3 pt-2">
-          <button onClick={save} className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400">
+          <button onClick={save} className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900">
             {saved ? <Check className="size-4" /> : null}
             {saved ? "Saved" : "Save settings"}
           </button>

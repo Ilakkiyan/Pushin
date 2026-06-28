@@ -106,7 +106,7 @@ export default function MobileShell() {
       <button
         onClick={() => setCaptureOpen(true)}
         aria-label="Quick capture"
-        className="fixed right-4 z-30 size-14 rounded-full bg-indigo-500 active:bg-indigo-400 text-white grid place-items-center shadow-lg shadow-indigo-900/40"
+        className="fixed right-4 z-30 size-14 rounded-full bg-white/90 active:bg-white text-gray-900 grid place-items-center shadow-lg shadow-indigo-900/40"
         style={{ bottom: "calc(env(safe-area-inset-bottom) + 72px)" }}
       >
         <Plus className="size-6" />
@@ -114,7 +114,7 @@ export default function MobileShell() {
 
       {/* Bottom tab bar (respects Android/iOS bottom safe-area inset). */}
       <nav
-        className="shrink-0 flex items-stretch border-t border-white/10 bg-[#0e1117]"
+        className="shrink-0 flex items-stretch border-t border-white/10 bg-[var(--surface)]"
         style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       >
         {TABS.map((t) => {
@@ -143,7 +143,7 @@ export default function MobileShell() {
         <div className="fixed inset-0 z-40 flex flex-col justify-end" onClick={() => setMoreOpen(false)}>
           <div className="absolute inset-0 bg-black/50" />
           <div
-            className="relative bg-[#0e1117] border-t border-white/10 rounded-t-2xl"
+            className="relative bg-[var(--surface)] border-t border-white/10 rounded-t-2xl"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
             onClick={(e) => e.stopPropagation()}
           >

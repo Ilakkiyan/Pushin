@@ -21,6 +21,8 @@ export default function ChatPane() {
   // Transcript lives in the store so it persists across page/settings changes (cleared on app close).
   const messages = useStore((s) => s.chatMessages);
   const setMessages = useStore((s) => s.setChatMessages);
+  const pendingChat = useStore((s) => s.pendingChat);
+  const setPendingChat = useStore((s) => s.setPendingChat);
   const [input, setInput] = useState("");
   // Durable facts the AI noticed in the last message — offered for the user to confirm into memory.
   const [memSuggestions, setMemSuggestions] = useState<string[]>([]);
@@ -115,6 +117,15 @@ export default function ChatPane() {
       setMessages((m) => [...m, { role: "ai", text: "I couldn't plan that — " + String(e) }]);
     }
   };
+
+  // A message handed off from the welcome screen's chat box — send it once, then clear.
+  useEffect(() => {
+    if (!pendingChat) return;
+    const text = pendingChat;
+    setPendingChat(null);
+    send(text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingChat]);
 
   return (
     <div className="h-full flex flex-col">
@@ -217,7 +228,7 @@ export default function ChatPane() {
           <button
             type="submit"
             disabled={busy || !input.trim()}
-            className="size-9 shrink-0 grid place-items-center rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:opacity-40"
+            className="size-9 shrink-0 grid place-items-center rounded-lg bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
           >
             <Send className="size-4" />
           </button>

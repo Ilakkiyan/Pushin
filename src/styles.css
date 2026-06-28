@@ -1,7 +1,97 @@
 @import "tailwindcss";
 
+/* ============================================================================
+   Grey-minimalist "slate" theme.
+   Strategy: the app colors almost everything with Tailwind accent classes
+   (indigo/fuchsia/sky) + translucent white/X overlays. Redefining those accent
+   scales to a single neutral cool-grey ramp here recolors the WHOLE app to a
+   monochrome slate aesthetic with zero component edits. Surface backgrounds use
+   the --bg/--surface/--raised vars (see the hex sweep across components).
+   ============================================================================ */
+@theme {
+  /* Brand accents → NEUTRAL grey ramp (no blue tinge). 400 = readable accent
+     text/icon on slate; 500/600 = button fills that keep white text legible. */
+  --color-indigo-100: #e8e8e8;
+  --color-indigo-200: #d6d6d6;
+  --color-indigo-300: #bcbcbc;
+  --color-indigo-400: #a0a0a0;
+  --color-indigo-500: #6e6e6e;
+  --color-indigo-600: #585858;
+  --color-indigo-700: #454545;
+
+  --color-fuchsia-200: #d6d6d6;
+  --color-fuchsia-300: #bcbcbc;
+  --color-fuchsia-400: #a0a0a0;
+  --color-fuchsia-500: #6e6e6e;
+
+  --color-sky-300: #bcbcbc;
+  --color-sky-400: #a0a0a0;
+  --color-sky-500: #6e6e6e;
+
+  /* The wide wordmark font — Saira variable, used at max width (wdth 125) for the Porsche-wide look. */
+  --font-wordmark: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
+}
+
 :root {
   color-scheme: dark;
+  /* Neutral dark-charcoal ramp (no blue tinge). Page is the base; chrome/cards
+     sit slightly lighter (raised). */
+  --bg: #1a1a1a;
+  --surface: #202020;
+  --raised: #262626;
+  /* Premium decel curve (easeOutExpo) used for entrances + interactions. */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ===== Motion: premium + tactile, but fast (never hinders quick use) ======= */
+@media (prefers-reduced-motion: no-preference) {
+  /* Every button gets a smooth, snappy transition + a subtle press for tactile feedback. */
+  button {
+    transition-property: transform, background-color, border-color, color, opacity, box-shadow;
+    transition-duration: 130ms;
+    transition-timing-function: var(--ease-out);
+  }
+  button:not(:disabled):active {
+    transform: scale(0.97);
+  }
+}
+
+/* Modal / popover entrance — quick scale+fade so it feels alive without slowing you down. */
+.pop-in {
+  animation: popIn 150ms var(--ease-out) both;
+}
+@keyframes popIn {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pop-in {
+    animation: none;
+  }
+}
+
+/* Quick scrim fade for modal backdrops. */
+.fade-in {
+  animation: fadeIn 130ms var(--ease-out) both;
+}
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fade-in {
+    animation: none;
+  }
 }
 
 html,
@@ -12,22 +102,105 @@ body,
 }
 
 body {
-  background: #0b0d12;
-  color: #e5e7eb;
+  background: var(--bg);
+  color: #eceef1;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }
 
-/* Thin scrollbars to match the dark UI */
+/* Thin scrollbars tuned to the slate UI */
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2a2f3a;
+  background: #3a3a3a;
   border-radius: 8px;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ===== Wide PUSHIN wordmark + opening animation ============================ */
+.wordmark {
+  font-family: var(--font-wordmark);
+  font-variation-settings: "wght" 600, "wdth" 125; /* bold + max width */
+  text-transform: uppercase;
+  color: #f5f6f8;
+  white-space: nowrap;
+}
+
+/* Full-bleed splash; a touch lighter than the app chrome so the white wordmark glows. */
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  background: #1f1f1f;
+  opacity: 1;
+  transition: opacity 450ms var(--ease-out);
+}
+.splash--out {
+  opacity: 0;
+  pointer-events: none;
+}
+.splash__mark {
+  font-size: clamp(2.75rem, 9vw, 7rem);
+  letter-spacing: 0.24em;
+  /* letter-spacing adds trailing space on the last glyph; nudge to keep it optically centered */
+  text-indent: 0.24em;
+  animation: splashIn 850ms var(--ease-out) both;
+}
+.splash--out .splash__mark {
+  animation: splashOut 420ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+@keyframes splashIn {
+  0% {
+    opacity: 0;
+    letter-spacing: 0.52em;
+    filter: blur(8px);
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    letter-spacing: 0.24em;
+    filter: blur(0);
+    transform: translateY(0);
+  }
+}
+@keyframes splashOut {
+  to {
+    opacity: 0;
+    letter-spacing: 0.32em;
+    transform: scale(1.025);
+    filter: blur(2px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .splash__mark,
+  .splash--out .splash__mark {
+    animation: none;
+  }
+}
+
+/* Welcome / guide screens fade up as the splash clears. */
+.welcome-in {
+  animation: welcomeIn 450ms var(--ease-out) both;
+}
+@keyframes welcomeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .welcome-in {
+    animation: none;
+  }
 }

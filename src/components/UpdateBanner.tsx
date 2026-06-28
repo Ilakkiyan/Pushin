@@ -67,7 +67,7 @@ export default function UpdateBanner() {
         <>
           <button
             onClick={onInstall}
-            className="shrink-0 rounded-md bg-indigo-500 hover:bg-indigo-400 text-white px-3 py-1 text-xs font-medium"
+            className="shrink-0 rounded-md bg-white/90 hover:bg-white text-gray-900 px-3 py-1 text-xs font-medium"
           >
             Update &amp; restart
           </button>

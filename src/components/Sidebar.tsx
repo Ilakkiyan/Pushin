@@ -118,16 +118,15 @@ export default function Sidebar() {
   return (
     <aside
       className={clsx(
-        "shrink-0 h-full flex flex-col bg-[#0e1117] border-r border-white/10 transition-[width] duration-150",
+        "shrink-0 h-full flex flex-col bg-[var(--surface)] border-r border-white/10 transition-[width] duration-150",
         collapsed ? "w-[60px]" : "w-[232px]",
       )}
     >
       {/* Brand + collapse toggle */}
       <div className={clsx("h-14 shrink-0 flex items-center border-b border-white/10", collapsed ? "justify-center px-0" : "justify-between px-3")}>
         {!collapsed && (
-          <div className="flex items-center gap-2 min-w-0">
-            <div className="size-7 rounded-lg bg-gradient-to-br from-indigo-500 to-fuchsia-500 grid place-items-center text-sm leading-none shrink-0">📌</div>
-            <span className="font-semibold tracking-tight truncate">Pushin</span>
+          <div className="wordmark truncate text-sm text-gray-200" style={{ letterSpacing: "0.22em" }}>
+            Pushin
           </div>
         )}
         <button

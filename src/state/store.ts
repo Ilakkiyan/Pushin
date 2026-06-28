@@ -69,6 +69,9 @@ interface State {
   // Chat transcript, persisted for the session so it isn't lost on page/settings changes.
   chatMessages: ChatMsg[];
   setChatMessages: (m: ChatMsg[] | ((prev: ChatMsg[]) => ChatMsg[])) => void;
+  // A message handed off from the welcome screen's chat box; ChatPane sends it once on mount.
+  pendingChat: string | null;
+  setPendingChat: (t: string | null) => void;
 
   setView: (v: View) => void;
   setSidebarCollapsed: (c: boolean) => void;
@@ -200,8 +203,10 @@ export const useStore = create<State>((set, get) => {
     labels: [],
     currentLabelId: null,
     chatMessages: [],
+    pendingChat: null,
 
     setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
+    setPendingChat: (t) => set({ pendingChat: t }),
 
     setView: (v) => set({ view: v }),
     setSidebarCollapsed: (c) => set({ sidebarCollapsed: c }),

@@ -1,9 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ConflictBanner from "./components/ConflictBanner";
 import UpdateBanner from "./components/UpdateBanner";
+import OpeningAnimation from "./components/OpeningAnimation";
+import WelcomeBack from "./components/WelcomeBack";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
@@ -18,11 +20,12 @@ import TaskListPane from "./panes/TaskListPane";
 import PeoplePane from "./panes/PeoplePane";
 import BookingPane from "./panes/BookingPane";
 import SettingsPane from "./panes/SettingsPane";
-import OnboardingModal from "./components/OnboardingModal";
+import WelcomeGuide from "./components/WelcomeGuide";
 import CommandPalette from "./components/CommandPalette";
 import TitleBar from "./components/TitleBar";
 import MobileShell from "./components/MobileShell";
 import { useIsMobile } from "./lib/useIsMobile";
+import { useHotkeys } from "./lib/useHotkeys";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -31,6 +34,31 @@ export default function App() {
   const load = useStore((s) => s.load);
   const onboarded = useStore((s) => s.settings?.onboarded ?? true);
   const isMobile = useIsMobile();
+  const [splashDone, setSplashDone] = useState(false);
+  const splash = splashDone ? null : <OpeningAnimation onDone={() => setSplashDone(true)} />;
+  // The returning-user "welcome back" landing shows after the splash until the user enters the app.
+  // Skipped in unit tests; `?enter=1` skips it for inner-app screenshots.
+  const [entered, setEntered] = useState(() => {
+    if (import.meta.env.MODE === "test") return true;
+    return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("enter") === "1";
+  });
+  // New users get the guided intro; returning users get the welcome-back landing. Both sit over the
+  // (already-mounted) shell and clear once the user is in. The guide flips `onboarded` on save.
+  const guide = !onboarded ? <WelcomeGuide onDone={() => setEntered(true)} /> : null;
+  const welcome =
+    onboarded && !entered ? (
+      <WelcomeBack
+        onEnter={(t) => {
+          if (t) {
+            useStore.getState().setView("calendar");
+            useStore.getState().setPendingChat(t);
+          }
+          setEntered(true);
+        }}
+      />
+    ) : null;
+
+  useHotkeys(); // global "g then key" navigation
 
   useEffect(() => {
     load();
@@ -47,14 +75,18 @@ export default function App() {
   if (!loaded) {
     return (
       <div className="h-full flex flex-col">
+        {splash}
         {!isMobile && <TitleBar />}
-        <div className="flex-1 grid place-items-center text-gray-500">Loading Pushin…</div>
+        <div className="flex-1 grid place-items-center text-gray-500" />
       </div>
     );
   }
 
   return (
     <div className="h-full flex flex-col">
+      {splash}
+      {guide}
+      {welcome}
       {!isMobile && <TitleBar />}
       {isMobile ? (
         <div className="flex-1 min-h-0 flex flex-col">
@@ -96,7 +128,6 @@ export default function App() {
           </div>
         </div>
       )}
-      {!onboarded && <OnboardingModal />}
       <CommandPalette />
       <QuickCapture />
     </div>

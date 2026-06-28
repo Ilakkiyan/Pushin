@@ -3,6 +3,7 @@ import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarCloc
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type Page, type PlanOutcome, type VaultAnswer } from "../lib/ipc";
+import { NAV_HOTKEYS } from "../lib/useHotkeys";
 
 /** A one-line summary of what a natural-language command did, for the action-bar result. */
 function summarizeOutcome(o: PlanOutcome): string {
@@ -178,9 +179,9 @@ export default function CommandPalette() {
   const citedPages = answer ? answer.citations.map((id) => allPages.find((p) => p.id === id)).filter((p): p is Page => !!p) : [];
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-start justify-center pt-[15vh]" onClick={close}>
+    <div className="fade-in fixed inset-0 z-50 bg-black/50 flex items-start justify-center pt-[15vh]" onClick={close}>
       <div
-        className="w-full max-w-lg mx-4 rounded-xl bg-[#0e1117] border border-white/10 shadow-2xl overflow-hidden"
+        className="pop-in w-full max-w-lg mx-4 rounded-xl bg-[var(--raised)] border border-white/10 shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2 px-4 border-b border-white/10">
@@ -279,6 +280,15 @@ export default function CommandPalette() {
               </button>
             ))
           )}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/10 px-4 py-2 text-[10px] text-gray-600">
+          <span className="text-gray-500">Jump</span>
+          {NAV_HOTKEYS.slice(0, 6).map((h) => (
+            <span key={h.combo} className="flex items-center gap-1">
+              <kbd className="rounded border border-white/10 px-1 py-0.5 font-mono text-gray-400">{h.combo}</kbd>
+              {h.label}
+            </span>
+          ))}
         </div>
       </div>
     </div>

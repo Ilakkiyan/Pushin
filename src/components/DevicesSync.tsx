@@ -4,7 +4,7 @@ import { api, type SyncStatus } from "../lib/ipc";
 
 const inputCls = "w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50";
 const btn = "rounded-md bg-white/5 border border-white/10 px-3 py-1.5 text-sm hover:bg-white/10 disabled:opacity-50";
-const btnPrimary = "rounded-md bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 text-sm disabled:opacity-50";
+const btnPrimary = "rounded-md bg-white/90 hover:bg-white text-gray-900 px-3 py-1.5 text-sm disabled:opacity-50";
 
 function shortId(id: string) {
   return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;

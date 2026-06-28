@@ -148,7 +148,7 @@ export default function InferenceSetup() {
         onClick={start}
         disabled={working || !anyPresent}
         title={anyPresent ? "" : "Download a model first"}
-        className="w-full flex items-center justify-center gap-2 text-sm py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 disabled:opacity-50 disabled:hover:bg-indigo-500"
+        className="w-full flex items-center justify-center gap-2 text-sm py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900 disabled:opacity-50 disabled:hover:bg-indigo-500"
       >
         {working ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
         {working ? "Starting…" : "Start the AI"}
