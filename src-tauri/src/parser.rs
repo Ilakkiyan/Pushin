@@ -511,7 +511,34 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
     route_recurring_to_habits(plan, user_text);
+    strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
+}
+
+/// **Few-shot leakage guard.** The static prompt examples include a "Blog → Pick platform / Write
+/// posts" project (a formatting sample). Small models copy those exact task titles into unrelated
+/// answers — e.g. "go to the gym every weekday" came back with a phantom "Pick platform" task, and
+/// "maybe I'll go for a run" produced "Pick platform"/"Write posts". Drop tasks whose titles match
+/// that boilerplate UNLESS the user actually mentions a blog/platform/post, so a real "plan a blog"
+/// request keeps them. Runs before the restraint guard so a sample-only project doesn't read as a
+/// fabricated create.
+fn strip_example_boilerplate(plan: &mut ParsedPlan, user_text: &str) {
+    let t = user_text.to_lowercase();
+    if t.contains("blog") || t.contains("platform") || t.contains("post") {
+        return; // the user genuinely referenced the sample's subject — keep their tasks
+    }
+    fn is_boilerplate(title: &str) -> bool {
+        matches!(
+            title.trim().to_lowercase().as_str(),
+            "pick platform" | "write posts" | "write 3 posts" | "write blog posts" | "write a blog post"
+        )
+    }
+    for proj in &mut plan.projects {
+        proj.tasks.retain(|task| !is_boilerplate(&task.title));
+    }
+    // A project left with no tasks (the sample "Blog") is dropped by store_plan anyway; clear it here
+    // so it isn't counted as a fabricated create by the restraint guard that runs next.
+    plan.projects.retain(|p| !p.tasks.is_empty());
 }
 
 /// **Restraint guard.** Small on-device models — especially once shown create-shaped few-shot
@@ -1619,6 +1646,16 @@ fn find_relative_date(text: &str, today: NaiveDate) -> Option<NaiveDate> {
     if lc.contains("day after tomorrow") {
         return Some(today + Duration::days(2));
     }
+    if lc.contains("fortnight") {
+        return Some(today + Duration::days(14)); // a fortnight = two weeks
+    }
+    // "end of the month" → the last calendar day of the current month.
+    if lc.contains("end of the month") || lc.contains("end of month") || lc.contains("month end") {
+        let (ny, nm) = if today.month() == 12 { (today.year() + 1, 1) } else { (today.year(), today.month() + 1) };
+        if let Some(first_next) = NaiveDate::from_ymd_opt(ny, nm, 1) {
+            return Some(first_next - Duration::days(1));
+        }
+    }
     let toks: Vec<&str> = lc.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
     for w in toks.windows(3) {
         if w[0] == "in" || w[0] == "within" {
@@ -2560,6 +2597,9 @@ fn filter_clarifications(
             continue; // skip restatements / chatter
         }
         let c_lc = c.to_lowercase();
+        if is_schema_leak(&c_lc) {
+            continue; // raw schema field names leaked into a "question" — never show the user JSON
+        }
         if is_chatter(&c_lc) {
             continue; // "is there anything else…" filler, not a real question
         }
@@ -2576,16 +2616,39 @@ fn filter_clarifications(
         if made_habit && is_recurrence_question(&c_lc) {
             continue;
         }
-        push_unique(&mut out, c);
+        push_unique(&mut out, &tidy_question(c));
     }
     // Our own clarifications (an event we genuinely couldn't place) are always real.
     for c in extra {
         let c = c.trim();
         if c.contains('?') {
-            push_unique(&mut out, c);
+            push_unique(&mut out, &tidy_question(c));
         }
     }
     out
+}
+
+/// Raw schema field names / JSON fragments the model sometimes dumps into a "clarification"
+/// (e.g. `removeEvents=['Lunch with Dan']?`). Never surface internal structure to the user.
+fn is_schema_leak(c_lc: &str) -> bool {
+    const TOKENS: &[&str] = &[
+        "removeevents", "updateevents", "\"events\"", "events=", "events:[", "durationminutes",
+        "starttime", "endtime", "estimated_minutes", "depends_on", "=[",
+    ];
+    TOKENS.iter().any(|t| c_lc.contains(t))
+}
+
+/// Collapse a run of trailing `?` (and surrounding spaces) into a single `?` — the model
+/// occasionally emits "… to add or remove? ?". Only touches strings that already END in `?`, so a
+/// clarification ending in other punctuation ("… provide more details.") keeps it. Internal `?`
+/// (a multi-question string) is preserved.
+fn tidy_question(c: &str) -> String {
+    let trimmed = c.trim_end();
+    if !trimmed.ends_with('?') {
+        return trimmed.to_string();
+    }
+    let base = trimmed.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
+    format!("{}?", base.trim_end())
 }
 
 /// Persist a parsed plan; resolve event dates in Rust; dedupe; clean up clarifications.
@@ -3836,6 +3899,8 @@ mod tests {
         assert_eq!(find_relative_date("review in two weeks at 2pm", today), NaiveDate::from_ymd_opt(2026, 6, 19));
         assert_eq!(find_relative_date("call in 3 days", today), NaiveDate::from_ymd_opt(2026, 6, 8));
         assert_eq!(find_relative_date("ship within a week", today), NaiveDate::from_ymd_opt(2026, 6, 12));
+        assert_eq!(find_relative_date("project review in a fortnight at 2pm", today), NaiveDate::from_ymd_opt(2026, 6, 19));
+        assert_eq!(find_relative_date("renew passport at the end of the month", today), NaiveDate::from_ymd_opt(2026, 6, 30));
         // not a date: durations, "in N hours", a trip span, plain "in vietnam"
         assert_eq!(find_relative_date("in 2 hours", today), None);
         assert_eq!(find_relative_date("staying in vietnam for two weeks", today), None);
@@ -3853,6 +3918,64 @@ mod tests {
         let (s, en) = resolve_event(now, &plan.events[0]).unwrap();
         assert_eq!(s.date(), NaiveDate::from_ymd_opt(2026, 6, 19).unwrap());
         assert_eq!((en - s).num_minutes(), 60); // a normal-length event, not all-day
+    }
+
+    #[test]
+    fn strips_few_shot_example_tasks() {
+        // The model copied the "Blog → Pick platform" sample into a gym request. The phantom task
+        // (and its now-empty Blog project) must be dropped; the habit is created elsewhere.
+        let mut plan = ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Blog".into(),
+                tasks: vec![
+                    ParsedTask { title: "Pick platform".into(), ..Default::default() },
+                    ParsedTask { title: "Write posts".into(), ..Default::default() },
+                ],
+            }],
+            ..Default::default()
+        };
+        strip_example_boilerplate(&mut plan, "go to the gym every weekday at 7am");
+        assert!(plan.projects.is_empty(), "sample tasks + empty project dropped");
+
+        // A genuine blog request keeps them.
+        let mut keep = ParsedPlan {
+            projects: vec![ParsedProject { name: "Blog".into(), tasks: vec![ParsedTask { title: "Pick platform".into(), ..Default::default() }] }],
+            ..Default::default()
+        };
+        strip_example_boilerplate(&mut keep, "help me plan a blog");
+        assert_eq!(keep.projects.len(), 1, "real blog request keeps its tasks");
+
+        // A real task that merely sits next to the boilerplate survives.
+        let mut mixed = ParsedPlan {
+            projects: vec![ParsedProject {
+                name: "Trip".into(),
+                tasks: vec![
+                    ParsedTask { title: "Pick platform".into(), ..Default::default() },
+                    ParsedTask { title: "Book flights".into(), ..Default::default() },
+                ],
+            }],
+            ..Default::default()
+        };
+        strip_example_boilerplate(&mut mixed, "plan my trip to japan");
+        assert_eq!(mixed.projects.len(), 1);
+        assert_eq!(mixed.projects[0].tasks.len(), 1);
+        assert_eq!(mixed.projects[0].tasks[0].title, "Book flights");
+    }
+
+    #[test]
+    fn clarifications_drop_schema_leaks_and_tidy_question_marks() {
+        // Raw schema dumped into a "question" (e.g. removeEvents=[...]) is never shown.
+        let out = filter_clarifications(&["removeEvents=['Lunch with Dan']?".into()], &[], &[], &[], &[], &[]);
+        assert!(out.is_empty(), "schema leak suppressed");
+        // A trailing "? ?" collapses to a single "?".
+        let out = filter_clarifications(&["Are you sure there's nothing to add or remove? ?".into()], &[], &[], &[], &[], &[]);
+        assert_eq!(out, vec!["Are you sure there's nothing to add or remove?".to_string()]);
+        // A normal question is untouched; an internal "?" is preserved.
+        let out = filter_clarifications(&["Is it Monday or Tuesday? Which one?".into()], &[], &[], &[], &[], &[]);
+        assert_eq!(out, vec!["Is it Monday or Tuesday? Which one?".to_string()]);
+        // A clarification that ends in other punctuation keeps it (no forced "?" → no "details.?").
+        let out = filter_clarifications(&["What would you like to plan? Please provide more details.".into()], &[], &[], &[], &[], &[]);
+        assert_eq!(out, vec!["What would you like to plan? Please provide more details.".to_string()]);
     }
 
     #[test]
