@@ -6,6 +6,7 @@ import { Check, FileText, Loader2, Link2, CheckSquare, CalendarDays } from "luci
 import { useStore } from "../state/store";
 import { api, type Page, type EntityRef } from "../lib/ipc";
 import { blocksToPlainText, extractLinkTitles, pageToInitialContent } from "../lib/blocks";
+import { pageRelPath } from "../lib/vaultExport";
 import { schema, type PartialPageBlock } from "../lib/editorSchema";
 import LabelPicker from "./LabelPicker";
 
@@ -22,6 +23,7 @@ export default function PageEditor({ page }: { page: Page }) {
   const tasks = useStore((s) => s.tasks);
   const events = useStore((s) => s.events);
   const setView = useStore((s) => s.setView);
+  const settings = useStore((s) => s.settings);
   const [title, setTitle] = useState(page.title === "Untitled" ? "" : page.title);
   const [status, setStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [backlinks, setBacklinks] = useState<Page[]>([]);
@@ -62,6 +64,17 @@ export default function PageEditor({ page }: { page: Page }) {
     const finalTitle = titleRef.current.trim() || text.split("\n")[0]?.slice(0, 80) || "Untitled";
     await savePage(page.id, finalTitle, page.icon ?? null, text, JSON.stringify(blocks), extractLinkTitles(blocks));
     dirty.current = false;
+    // Two-way vault: mirror the page to a markdown file in the user's chosen folder. Best-effort —
+    // a save must never fail because the file write did. No-op server-side if no vault folder is set.
+    if (settings?.vaultDir) {
+      try {
+        const markdown = await editor.blocksToMarkdownLossy(blocks);
+        const relPath = pageRelPath({ ...page, title: finalTitle }, pages);
+        await api.vaultWrite(page.id, relPath, markdown);
+      } catch {
+        /* file mirror is best-effort */
+      }
+    }
   };
 
   // Debounced autosave; reads the latest title + document at fire time.

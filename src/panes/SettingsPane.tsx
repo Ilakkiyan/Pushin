@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
-import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, Github, Loader2, Moon, RefreshCw } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, FolderOpen, Github, Loader2, Moon, RefreshCw } from "lucide-react";
+import { openUrl, openPath } from "@tauri-apps/plugin-opener";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import type { Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
+import { exportAllPages } from "../lib/vaultExport";
 import { CommitmentList, SleepFields } from "../components/Personalization";
 import DevicesSync from "../components/DevicesSync";
 
@@ -69,11 +71,32 @@ export default function SettingsPane() {
   const disconnectGoogle = useStore((s) => s.disconnectGoogle);
   const syncGoogle = useStore((s) => s.syncGoogle);
   const syncing = useStore((s) => s.syncing);
+  const pages = useStore((s) => s.pages);
   const [form, setForm] = useState<Settings>(settings);
   const [saved, setSaved] = useState(false);
   const [googleMsg, setGoogleMsg] = useState("");
   const [googleBusy, setGoogleBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
+  const [vaultMsg, setVaultMsg] = useState("");
+
+  // Vault folder: pick a directory, persist it, and bulk-export existing notes so it isn't empty.
+  const chooseVault = async () => {
+    const picked = await open({ directory: true, multiple: false, title: "Choose a vault folder" });
+    if (!picked || Array.isArray(picked)) return;
+    const next = { ...form, vaultDir: picked };
+    setForm(next);
+    await saveSettings(next);
+    setVaultMsg("Exporting your notes…");
+    try {
+      const n = await exportAllPages(pages);
+      setVaultMsg(`Mirrored ${n} note${n === 1 ? "" : "s"} to this folder.`);
+    } catch {
+      setVaultMsg("Folder set — notes will export as you edit them.");
+    }
+  };
+  const revealVault = () => {
+    if (form.vaultDir) openPath(form.vaultDir).catch(() => {});
+  };
 
   // In-app auto-update (desktop). `appVersion` is the running build; `pendingUpdate` holds a found
   // newer release so the user can install it from here as well as from the launch banner.
@@ -232,6 +255,25 @@ export default function SettingsPane() {
             Powers semantic memory recall in <span className="text-gray-300">Hermes</span>. Pushin downloads a small embedding model
             (~37 MB) and runs it on-device automatically — no setup. Leave blank to use keyword-only recall.
           </p>
+        </section>
+
+        {/* Two-way markdown vault */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><FolderOpen className="size-4 text-amber-400" /> Vault folder</h2>
+          <p className="text-[11px] text-gray-500">
+            Mirror your notes as markdown files in a folder you choose — edit them in Pushin or any editor,
+            and see them in your file manager. Leave unset to keep the vault inside Pushin only.
+          </p>
+          {form.vaultDir ? (
+            <div className="flex items-center gap-2">
+              <code className="flex-1 truncate rounded bg-[var(--raised)] px-2 py-1.5 text-[11px] text-gray-300" title={form.vaultDir}>{form.vaultDir}</code>
+              <button onClick={revealVault} className="rounded-lg border border-white/10 bg-[var(--raised)] px-3 py-1.5 text-xs font-medium text-gray-200 hover:bg-white/10">Reveal</button>
+              <button onClick={chooseVault} className="rounded-lg border border-white/10 bg-[var(--raised)] px-3 py-1.5 text-xs font-medium text-gray-200 hover:bg-white/10">Change…</button>
+            </div>
+          ) : (
+            <button onClick={chooseVault} className="rounded-lg bg-white/90 px-3 py-1.5 text-xs font-medium text-gray-900 hover:bg-white">Choose folder…</button>
+          )}
+          {vaultMsg && <p className="text-[11px] text-gray-400">{vaultMsg}</p>}
         </section>
 
         {/* Google Calendar two-way sync */}

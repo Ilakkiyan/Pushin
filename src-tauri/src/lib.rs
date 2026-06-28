@@ -20,6 +20,7 @@ mod scheduler;
 pub mod schedule_service;
 mod secrets;
 mod sync;
+mod vault;
 
 use commands::AppState;
 use std::sync::{Arc, Mutex};
@@ -87,6 +88,7 @@ pub fn run() {
             commands::load_all,
             commands::reschedule,
             commands::save_settings,
+            commands::vault_write,
             commands::plan_tasks,
             commands::create_task,
             commands::set_task_status,

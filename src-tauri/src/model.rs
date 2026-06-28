@@ -468,6 +468,10 @@ pub struct Settings {
     /// semantic off (recall falls back to keyword search).
     #[serde(default = "default_embed_model")]
     pub embed_model: String,
+    /// Folder the vault is mirrored to as markdown files (two-way Obsidian-style). Absolute path;
+    /// None = no file vault yet (vault stays SQLite-only). Device-local — paths differ per machine.
+    #[serde(default)]
+    pub vault_dir: Option<String>,
 }
 
 /// Keep in sync with `model_manager::EMBED_MODEL.id`.
@@ -500,6 +504,7 @@ impl Default for Settings {
             sleep_end: "07:00".into(),
             commitments: Vec::new(),
             embed_model: default_embed_model(),
+            vault_dir: None,
         }
     }
 }

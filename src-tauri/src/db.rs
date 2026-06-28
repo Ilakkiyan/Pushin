@@ -21,6 +21,7 @@ const MIGRATION_0011: &str = include_str!("../migrations/0011_booking_public.sql
 const MIGRATION_0012: &str = include_str!("../migrations/0012_context_index.sql");
 const MIGRATION_0013: &str = include_str!("../migrations/0013_people.sql");
 const MIGRATION_0014: &str = include_str!("../migrations/0014_focus_sessions.sql");
+const MIGRATION_0016: &str = include_str!("../migrations/0016_vault_files.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -95,6 +96,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // tombstones/peers/self tables. Generated from the synced-table registry (sync::schema).
         conn.execute_batch(&crate::sync::schema::migration_sql())?;
         conn.pragma_update(None, "user_version", 15)?;
+    }
+    if version < 16 {
+        // Two-way markdown vault: notes.rel_path (page → file mapping).
+        conn.execute_batch(MIGRATION_0016)?;
+        conn.pragma_update(None, "user_version", 16)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -171,6 +177,20 @@ pub fn save_settings(conn: &Connection, s: &Settings) -> Result<()> {
         params![json],
     )?;
     Ok(())
+}
+
+/// Record the on-disk file a vault page maps to (two-way markdown vault). `None` clears it.
+pub fn set_page_rel_path(conn: &Connection, page_id: i64, rel_path: Option<&str>) -> Result<()> {
+    conn.execute("UPDATE notes SET rel_path = ?2 WHERE id = ?1", params![page_id, rel_path])?;
+    Ok(())
+}
+
+/// The page currently mapped to `rel_path`, if any (the file→page lookup for the watcher).
+#[allow(dead_code)] // used by the Phase 3e files→DB watcher
+pub fn page_id_for_rel_path(conn: &Connection, rel_path: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT id FROM notes WHERE rel_path = ?1 LIMIT 1", params![rel_path], |r| r.get(0))
+        .optional()?)
 }
 
 // ---------- Projects ----------

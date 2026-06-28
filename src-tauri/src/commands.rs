@@ -83,6 +83,19 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
     db::save_settings(&conn, &settings).map_err(err)
 }
 
+/// Mirror a vault page to `<vault_dir>/<rel_path>.md` (two-way markdown vault). No-op if the user
+/// hasn't picked a vault folder. Records the page→file mapping for the file→DB watcher.
+#[tauri::command]
+pub fn vault_write(state: State<AppState>, page_id: i64, rel_path: String, markdown: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    let Some(dir) = db::get_settings(&conn).map_err(err)?.vault_dir else {
+        return Ok(());
+    };
+    crate::vault::write_file(&dir, &rel_path, &markdown).map_err(err)?;
+    db::set_page_rel_path(&conn, page_id, Some(&rel_path)).map_err(err)?;
+    Ok(())
+}
+
 /// The cosine floor for injecting a recalled note into the planner. bge-small's similarity for
 /// *unrelated* short text measures ~0.59 (two random notes scored 0.587 in testing), so the floor
 /// must clear that baseline with margin — better to recall nothing than feed the prompt-sensitive

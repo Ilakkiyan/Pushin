@@ -33,6 +33,7 @@ export interface Settings {
   sleepEnd: string; // wake time "HH:MM"
   commitments: Commitment[];
   embedModel: string; // Hermes embedding model ("" = keyword-only recall)
+  vaultDir?: string | null; // folder the vault is mirrored to as markdown files (null = SQLite-only)
 }
 
 export interface SyncSummary {
@@ -373,6 +374,9 @@ export const api = {
   loadAll: () => invoke<AppData>("load_all"),
   reschedule: () => invoke<ScheduleResult>("reschedule"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
+  /** Mirror a page to `<vault_dir>/<relPath>` as markdown (no-op if no vault folder is set). */
+  vaultWrite: (pageId: number, relPath: string, markdown: string) =>
+    invoke<void>("vault_write", { pageId, relPath, markdown }),
 
   planTasks: (text: string, history: { role: string; content: string }[]) =>
     invoke<PlanOutcome>("plan_tasks", { text, history }),
