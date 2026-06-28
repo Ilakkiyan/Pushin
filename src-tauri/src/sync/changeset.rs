@@ -226,7 +226,9 @@ pub fn changes_since(conn: &Connection, since: &str) -> Result<Vec<Change>> {
 }
 
 /// Convenience for the simple "stamp everything dirty, then emit a full snapshot" flow (tests + a
-/// first sync). Equivalent to [`stamp_dirty`] followed by [`changes_since`]`("")`.
+/// first sync). Equivalent to [`stamp_dirty`] followed by [`changes_since`]`("")`. Currently only the
+/// unit tests below exercise it (production stamps + diffs separately), hence `allow(dead_code)`.
+#[allow(dead_code)]
 pub fn build_outbox(conn: &Connection, node: &str, clock: &mut HlcState, now_ms: u64) -> Result<Vec<Change>> {
     stamp_dirty(conn, node, clock, now_ms)?;
     changes_since(conn, "")

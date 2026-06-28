@@ -6,7 +6,6 @@
 //! (gotcha #8): each [`SyncStore`] method takes a short lock, does its work, and releases.
 
 use super::changeset::{self, Change};
-use super::hlc::HlcState;
 use super::protocol::{self, SessionStats, SyncStore};
 use super::{identity, state, transport};
 use anyhow::{anyhow, Context, Result};
@@ -54,10 +53,6 @@ impl SyncEngine {
         engine.clone().spawn_accept_loop();
         engine.clone().spawn_periodic();
         Ok(engine)
-    }
-
-    pub fn node_id(&self) -> &str {
-        &self.node_id
     }
 
     /// Mint an invite ticket for another device to join this network.

@@ -422,6 +422,10 @@ pub fn estimation_factor(samples: &[(i64, i64)]) -> f64 {
 /// Schedule all non-done tasks. `fixed` = immovable events; `locked` = pinned blocks
 /// (task_id, interval) that are kept and counted toward their task's progress.
 /// Returns NEW blocks (locked ones are preserved by the caller).
+///
+/// The no-prefs convenience wrapper: production calls `schedule_with_prefs` directly (with
+/// label-derived prefs), so only the unit tests below use this — hence `allow(dead_code)`.
+#[allow(dead_code)]
 pub fn schedule(
     now: NaiveDateTime,
     s: &Settings,

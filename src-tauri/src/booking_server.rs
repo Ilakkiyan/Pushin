@@ -574,7 +574,7 @@ mod tests {
         let id = db::insert_event_type(&conn, "Intro call", 30, 0, "#0ea5e9").unwrap();
         let et = db::get_event_type(&conn, id).unwrap();
         let settings = Settings::default();
-        let slot = booking::available_slots(&conn, &settings, &et, 2).unwrap().remove(0);
+        let slot = booking::available_slots(&conn, &settings, &et, 7).unwrap().remove(0);
         let db = Arc::new(Mutex::new(conn));
         let body = serde_json::to_vec(&json!({
             "name": "Ava",
@@ -608,7 +608,7 @@ mod tests {
         let conn = db::test_conn();
         let et = et_with(&conn, 30);
         let settings = Settings::default();
-        let slot = booking::available_slots(&conn, &settings, &et, 2).unwrap().remove(0);
+        let slot = booking::available_slots(&conn, &settings, &et, 7).unwrap().remove(0);
         let db = Arc::new(Mutex::new(conn));
         let http = reqwest::Client::new();
 

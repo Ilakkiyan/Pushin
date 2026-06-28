@@ -199,7 +199,7 @@ mod tests {
         let mut conn = db::test_conn();
         let settings = Settings::default();
         let event_type = inserted_et(&conn, 30, 0);
-        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        let slot = available_slots(&conn, &settings, &event_type, 7).unwrap().remove(0);
         let err = confirm_booking(&mut conn, &settings, &event_type, "Ava", "not-email", &slot.start, &slot.end).unwrap_err();
         assert!(err.to_string().contains("email"));
     }
@@ -209,7 +209,7 @@ mod tests {
         let mut conn = db::test_conn();
         let settings = Settings::default();
         let event_type = inserted_et(&conn, 30, 0);
-        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        let slot = available_slots(&conn, &settings, &event_type, 7).unwrap().remove(0);
         confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
         assert_eq!(db::list_bookings(&conn).unwrap().len(), 1);
         assert!(db::list_events(&conn).unwrap().iter().any(|e| e.title.contains("Ava")));
@@ -220,7 +220,7 @@ mod tests {
         let mut conn = db::test_conn();
         let settings = Settings::default();
         let event_type = inserted_et(&conn, 30, 0);
-        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        let slot = available_slots(&conn, &settings, &event_type, 7).unwrap().remove(0);
         confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
         let people = db::list_people(&conn).unwrap();
         assert_eq!(people.len(), 1, "the invitee becomes a person");
@@ -233,7 +233,7 @@ mod tests {
         let mut conn = db::test_conn();
         let settings = Settings::default();
         let event_type = inserted_et(&conn, 30, 0);
-        let slot = available_slots(&conn, &settings, &event_type, 2).unwrap().remove(0);
+        let slot = available_slots(&conn, &settings, &event_type, 7).unwrap().remove(0);
         confirm_booking(&mut conn, &settings, &event_type, "Ava", "ava@example.com", &slot.start, &slot.end).unwrap();
         let err = confirm_booking(&mut conn, &settings, &event_type, "Bea", "bea@example.com", &slot.start, &slot.end).unwrap_err();
         assert!(err.to_string().contains("available"));
