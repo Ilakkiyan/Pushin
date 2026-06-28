@@ -15,7 +15,9 @@ pub mod model;
 mod model_manager;
 pub mod parser;
 mod scheduler;
-mod schedule_service;
+// Public so the model regression battery (`tests/model_battery.rs`) can run the same post-plan
+// reschedule the app does, then project the resulting calendar. No external consumers otherwise.
+pub mod schedule_service;
 mod secrets;
 mod sync;
 
@@ -25,9 +27,20 @@ use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+
+    // In-app auto-update from GitHub Releases. Desktop-only: the updater swaps the installed app
+    // bundle (user data in the app-data dir is untouched) and `process` provides relaunch() after
+    // install. Mobile updates ship via the app stores, so the plugins aren't built there (Cargo.toml).
+    // cfg-gated shadowing (not `mut`) so the mobile build stays warning-free.
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
+
+    builder
         .setup(|app| {
             let handle = app.handle();
             let data_dir = handle.path().app_data_dir()?;

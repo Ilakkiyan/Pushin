@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.4.0"
+version = "0.5.0"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"
@@ -44,7 +44,6 @@ base64 = "0.22"
 getrandom = "0.2"
 # Error handling
 anyhow = "1"
-thiserror = "2"
 # Async runtime: inference-server readiness polling + the device-sync engine (io-util for the
 # length-prefixed wire protocol, sync for channels, net/rt for the Iroh transport).
 tokio = { version = "1", features = ["time", "io-util", "sync", "rt", "rt-multi-thread", "macros", "net"] }
@@ -57,6 +56,13 @@ data-encoding = "2"
 # OAuth tokens + device-sync keys. Excluded on Android (no keyring backend — secrets.rs stubs it).
 [target.'cfg(not(target_os = "android"))'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+# In-app auto-update from GitHub Releases. Desktop-only: the updater swaps the installed app bundle
+# (user data in the app-data dir is untouched); mobile updates via the app stores. `process` provides
+# the relaunch() the frontend calls after an update installs.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [dev-dependencies]
 # The LLM-evaluation harness (`tests/llm_eval.rs`) is a separate crate, so it needs its own async
@@ -79,3 +85,16 @@ path = "../finetune/datagen/main.rs"
 [[example]]
 name = "grpo"
 path = "../finetune/grpo/main.rs"
+
+# Release profile tuned to shrink the shipped installer (what `tauri build` produces). The biggest
+# lever is `strip` (drops debug symbols); `lto` + `codegen-units = 1` let the linker delete unused
+# code across the whole dependency tree (Iroh/Tauri/reqwest are large); `opt-level = "s"` optimizes
+# for size — safe here because the heavy compute runs in the external llama-server, not this binary.
+# Trade-off: release builds are slower (fat LTO + single codegen unit). `panic` is left as unwind on
+# purpose — the booking server uses thread-per-connection, and `abort` would turn a worker panic into
+# a whole-process crash.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

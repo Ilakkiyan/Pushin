@@ -27,6 +27,13 @@ yarn-error.log*
 .env.*
 !.env.example
 
+# Signing keys & secrets — never commit. The Tauri updater private key lives in ~/.tauri (outside the
+# repo); these patterns are a safety net in case a key is ever copied in. The *.pub is safe to share.
+*.key
+!*.pub
+.tauri/
+*.pem
+
 # Editor / OS
 .DS_Store
 Thumbs.db

@@ -496,8 +496,36 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds every platform in parallel and creates a **draft** Release with the installers
-attached — review it and click *Publish*. (You can also trigger it from the **Actions** tab.)
+The workflow builds every platform in parallel and **publishes** a Release with the installers
+attached — no manual *Publish* click, so the in-app updater can fetch it right away. (You can also
+trigger it from the **Actions** tab.) Each per‑OS job uploads to the same release, so it fills in
+over a few minutes as the slower platforms finish.
+
+### Automatic in‑app updates
+
+Once installed, Pushin checks GitHub for a newer release **on launch** and shows an "Update &
+restart" banner (there's also a **Check for updates** button in *Settings → Updates*). Installing an
+update **never touches your data** — your database, downloaded models, and notes live in the OS
+app‑data folder, while the updater only swaps the app itself. This is the official
+[Tauri updater](https://v2.tauri.app/plugin/updater/); update artifacts are signed and described by a
+`latest.json` manifest attached to each Release.
+
+To enable signed updates on your fork (one time):
+
+1. Generate a signing keypair (keep the private key safe — losing it means you can't ship updates to
+   already‑installed apps):
+   ```bash
+   npm run tauri signer generate -- -w ~/.tauri/pushin_updater.key
+   ```
+2. Put the **public key** into `src-tauri/tauri.conf.json` → `plugins.updater.pubkey`, and point
+   `plugins.updater.endpoints` at your repo's `releases/latest/download/latest.json`.
+3. Add the **private key** as a repo **Actions secret** named `TAURI_SIGNING_PRIVATE_KEY` (if you set
+   a key password, add `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` too — it's optional otherwise). The
+   release workflow signs the artifacts and uploads `latest.json` automatically.
+4. That's it — the workflow publishes each Release (not a draft), so the updater's
+   `releases/latest/...` endpoint resolves to it automatically. Just remember to **bump the version**
+   (in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`) before each tag, or
+   the updater won't consider the build newer.
 
 **Building locally** (your current OS only):
 ```bash

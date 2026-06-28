@@ -1,9 +1,12 @@
-import { useState } from "react";
-import { BookOpen, Calendar, Check, Cpu, ExternalLink, Github, Moon, RefreshCw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, Github, Loader2, Moon, RefreshCw } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
+import type { Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { type Settings } from "../lib/ipc";
+import { checkForUpdate, installUpdate } from "../lib/updates";
 import { CommitmentList, SleepFields } from "../components/Personalization";
 import DevicesSync from "../components/DevicesSync";
 
@@ -71,6 +74,50 @@ export default function SettingsPane() {
   const [googleMsg, setGoogleMsg] = useState("");
   const [googleBusy, setGoogleBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
+
+  // In-app auto-update (desktop). `appVersion` is the running build; `pendingUpdate` holds a found
+  // newer release so the user can install it from here as well as from the launch banner.
+  const [appVersion, setAppVersion] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateMsg, setUpdateMsg] = useState("");
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installPct, setInstallPct] = useState<number | null>(null);
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
+  const checkUpdates = async () => {
+    setCheckingUpdate(true);
+    setUpdateMsg("");
+    setPendingUpdate(null);
+    try {
+      const u = await checkForUpdate();
+      if (u) {
+        setPendingUpdate(u);
+        setUpdateMsg(`Pushin ${u.version} is available.`);
+      } else {
+        setUpdateMsg(`You're on the latest version${appVersion ? ` (v${appVersion})` : ""}.`);
+      }
+    } catch (e) {
+      setUpdateMsg(`Couldn't check for updates: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const installUpdates = async () => {
+    if (!pendingUpdate) return;
+    setInstalling(true);
+    try {
+      await installUpdate(pendingUpdate, (p) => setInstallPct(p.pct));
+      // installUpdate relaunches on success — nothing after this runs.
+    } catch (e) {
+      setInstalling(false);
+      setUpdateMsg(`Update failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   const update = (patch: Partial<Settings>) => {
     setForm((f) => ({ ...f, ...patch }));
@@ -266,6 +313,38 @@ export default function SettingsPane() {
               <ExternalLink className="size-3.5" /> Troubleshooting
             </ExtLink>
           </div>
+        </section>
+
+        {/* In-app auto-update from GitHub Releases */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><DownloadCloud className="size-4 text-indigo-400" /> Updates</h2>
+          <p className="text-xs text-gray-500">
+            Pushin checks GitHub for a newer release on launch and offers a one-click update. Installing keeps all your
+            data — tasks, notes, people, and settings live outside the app and aren't touched.
+          </p>
+          <div className="flex items-center gap-2 flex-wrap">
+            {appVersion && <span className="text-xs px-2 py-1 rounded-full bg-white/5 border border-white/10 text-gray-300">v{appVersion}</span>}
+            {pendingUpdate ? (
+              <button
+                onClick={installUpdates}
+                disabled={installing}
+                className="text-xs px-3 py-1.5 rounded-md bg-indigo-500 hover:bg-indigo-400 disabled:opacity-50 inline-flex items-center gap-1.5"
+              >
+                {installing ? <Loader2 className="size-3.5 animate-spin" /> : <DownloadCloud className="size-3.5" />}
+                {installing ? (installPct !== null ? `Installing ${installPct}%…` : "Installing…") : `Update to ${pendingUpdate.version} & restart`}
+              </button>
+            ) : (
+              <button
+                onClick={checkUpdates}
+                disabled={checkingUpdate}
+                className="text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15 disabled:opacity-50 inline-flex items-center gap-1.5"
+              >
+                {checkingUpdate ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                {checkingUpdate ? "Checking…" : "Check for updates"}
+              </button>
+            )}
+          </div>
+          {updateMsg && <p className="text-xs text-gray-400">{updateMsg}</p>}
         </section>
 
         <div className="flex items-center gap-3 pt-2">

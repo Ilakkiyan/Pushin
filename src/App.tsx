@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import ConflictBanner from "./components/ConflictBanner";
+import UpdateBanner from "./components/UpdateBanner";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
@@ -66,6 +67,7 @@ export default function App() {
         <div className="flex-1 min-h-0 flex">
           <Sidebar />
           <div className="flex-1 min-w-0 flex flex-col">
+            <UpdateBanner />
             <ConflictBanner />
             <main className="flex-1 min-h-0 flex">
               {view === "calendar" && (

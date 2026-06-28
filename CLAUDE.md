@@ -261,6 +261,36 @@ Two layers — the transport (the easy part) and data reconciliation (the hard p
 
 ---
 
+## Auto-update from GitHub Releases (Tauri updater; `tauri-plugin-updater`)
+In-app self-update so installed builds notice new releases and update in place. Uses the **official
+Tauri 2 updater** — desktop-only (the `updater` + `process` deps are gated to
+`cfg(not(any(target_os="android", target_os="ios")))` in `Cargo.toml`, registered under `#[cfg(desktop)]`
+in `lib.rs`; mobile updates via the stores).
+- **Data is preserved by construction.** The updater swaps only the installed app bundle; `pushin.db`,
+  downloaded `models/*.gguf`, and the `bin/` engine live in the app-data dir and are never touched. DB
+  migrations are additive + `user_version`-gated, so a newer build just runs new migrations forward. No
+  backup/restore code exists or is needed.
+- **Config (`tauri.conf.json`):** `bundle.createUpdaterArtifacts: true` + `plugins.updater` with the
+  inline **pubkey** and an `endpoints` array pointing at
+  `https://github.com/Ilakkiyan/Pushin/releases/latest/download/latest.json` (Windows `installMode: passive`).
+  Capabilities add `updater:default` + `process:allow-restart`.
+- **Frontend:** `lib/updates.ts` (`checkForUpdate` — wraps `check()`, swallows errors → `null` so dev/
+  offline/mobile no-op; `installUpdate` — `downloadAndInstall` + `relaunch()`). `components/UpdateBanner.tsx`
+  checks once on mount and shows a top banner ("Pushin vX is available — Update & restart / Later", with a
+  "What's new" expander), mounted **only in the desktop branch** of `App.tsx`. *Settings → Updates* adds a
+  current-version chip + **Check for updates** / inline install. Tested in `UpdateBanner.test.tsx` (mocks
+  `lib/updates`); `App.integration.test.tsx` still passes because `checkForUpdate` returns `null` under jsdom.
+- **Releases:** `release.yml` passes `TAURI_SIGNING_PRIVATE_KEY` (+ optional
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) secrets to `tauri-action`, which signs artifacts and
+  generates/merges `latest.json`. **`releaseDraft: false`** so each release is published immediately
+  and `releases/latest/...` resolves to it (the per-OS matrix jobs upload to the same release, landing
+  a few minutes apart). Signing keypair: `tauri signer generate` (private key is a repo secret, never
+  committed; pubkey is in the config). Default key here has an **empty password**.
+  ⚠️ **Bump the version** (`package.json` + `tauri.conf.json` + `Cargo.toml`) before each tag, or the
+  updater won't consider the build newer.
+
+---
+
 ## The vault — Notion-style documents + Obsidian-style links/graph (`hermes.rs`, `db.rs` pages, `notes` table)
 The "second brain" direction. **v2 (built): the flat Hermes notes grew into full vault pages.** The
 `notes` table is kept (preserves embeddings) but extended by **migration `0008_pages.sql`** with
@@ -365,6 +395,18 @@ always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.
   Playwright has no browser build for this WSL sandbox's OS, so it runs on `ubuntu-latest`.
 - **Live model eval** (`tests/llm_eval.rs`, `--ignored`): the parser-quality battery; needs a running
   `:8080`, stays out of CI (manual gate). Baseline ~90% of checks, judge per-category (gotcha #1).
+- **Model battery with UI projection** (`tests/model_battery.rs`, `--ignored`) — the **pre-push model
+  gate**. Same live path as `llm_eval` but it also runs `schedule_service::reschedule_inner` (so task
+  blocks land on the calendar) and prints, per case, a readable **text "screen"**: the chat reply (a
+  Rust port of `ChatPane.tsx`), the calendar (events + scheduled blocks, sorted, overlaps flagged), the
+  task/habit lists, and any conflicts. ~45 hard/weird cases (shorthand, ambiguity, self-correction,
+  overnight, fuzzy durations, recurrence edges, restraint, multi-turn pronouns, unschedulable conflicts,
+  adversarial). Crisp `Expect` checks where truth is unambiguous; a `note` ("what good looks like") for
+  eye-judged cases. Output → stdout **and** `target/model-battery/report.md`. Self-skips with no server.
+  Run: `cargo test --test model_battery -- --ignored --nocapture` (app open → `:8080`), or against Ollama:
+  `PUSHIN_LLM_URL=http://localhost:11434 PUSHIN_LLM_MODEL=qwen2.5:3b cargo test --test model_battery -- --ignored --nocapture`.
+  (`render_chat` mirrors `ChatPane.tsx` — keep in sync; calendar/task/habit views read the same DB rows
+  the UI binds to, so they're faithful.)
 
 ## Build / run / test (macOS, IMPORTANT specifics)
 - **`rustc`/`cargo` are NOT on the default PATH.** Prefix with `export PATH="$HOME/.cargo/bin:$PATH"`.
@@ -376,6 +418,8 @@ always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.
 - Run the app (dev): `npm run tauri dev` (watches Rust → rebuilds + relaunches; Vite HMR for frontend).
 - Regenerate app icons from a PNG: `npm run tauri icon <path-to-1024.png>`.
 - **Test the model directly** without the GUI: a `llama-server` runs on `:8080` when the app is up — POST to `/v1/chat/completions` with the `json_schema` body to validate parser behavior (this is how parser changes were verified — invaluable, do it).
+- **`[profile.release]` is tuned for install size** (`Cargo.toml`): `strip` + `lto = true` + `codegen-units = 1` + `opt-level = "s"`. This shrinks the shipped binary (`tauri build`) but makes **release** builds noticeably slower — dev/debug builds are unaffected. `panic` is intentionally left as unwind (the booking server is thread-per-connection; `abort` would turn a worker panic into a whole-process crash).
+- **Booking tests are date-independent:** `booking`/`booking_server` tests that pull a real slot use a **7-day** horizon (any 7-day window contains workdays) — a 2-day horizon makes them fail on weekends (Sat+Sun have no Mon–Fri slots).
 
 ## Local data (outside the repo, gitignored)
 `~/Library/Application Support/com.pushin.app/`

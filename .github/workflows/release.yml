@@ -71,10 +71,20 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Sign the update artifacts so the in-app updater will accept them, and generate/merge the
+          # `latest.json` manifest the updater fetches. Set these two repo secrets (private key from
+          # `tauri signer generate`); without them the build still produces installers but no updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Pushin ${{ github.ref_name }}"
           releaseBody: "Download the installer for your platform below, then run it — no separate install needed."
-          releaseDraft: true
+          # Publish immediately (not a draft) so GitHub's `releases/latest/...` resolves to it and the
+          # in-app updater can fetch `latest.json`. Each matrix job uploads its platform's installer +
+          # signed manifest to this same release; the per-OS jobs may land a few minutes apart, so a
+          # client checking mid-publish just sees the platforms already uploaded (and updates once its
+          # own appears). `prerelease: false` keeps it eligible to be the "latest" release.
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
