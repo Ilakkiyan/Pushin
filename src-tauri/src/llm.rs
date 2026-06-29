@@ -82,6 +82,42 @@ async fn try_once(client: &reqwest::Client, base: &str, body: &Value) -> Result<
     parse_json_lenient(content)
 }
 
+/// Free-form chat completion — the "deharnessed" mode: NO json_schema, warmer sampling, returns the
+/// raw assistant prose. Powers the general-purpose assistant (not the constrained calendar planner,
+/// which stays on `chat_json`). Same local server, same model — just an unconstrained request.
+pub async fn chat_text(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    messages: Value,
+) -> Result<String> {
+    let base = base_url.trim_end_matches('/');
+    let body = json!({
+        "model": model,
+        "temperature": 0.7, // warmer than the planner's greedy 0.0 — prose, not extraction
+        "max_tokens": 2048,
+        "repeat_penalty": 1.1,
+        "cache_prompt": true,
+        "messages": messages,
+    });
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("inference server unreachable: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("inference error {status}: {}", truncate(&text, 200)));
+    }
+    let v: Value = resp.json().await?;
+    let content = v["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no content in completion"))?;
+    Ok(content.trim().to_string())
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
@@ -172,6 +208,28 @@ mod tests {
             then.status(500).body("boom");
         });
         assert!(chat_json(&reqwest::Client::new(), &server.base_url(), "m", json!([]), json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_text_returns_trimmed_prose() {
+        let server = MockServer::start_async().await;
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(completion("  Sure — here's a thought.  "));
+        });
+        let s = chat_text(&reqwest::Client::new(), &server.base_url(), "m", json!([])).await.unwrap();
+        assert_eq!(s, "Sure — here's a thought.");
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn chat_text_surfaces_http_errors() {
+        let server = MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(500).body("boom");
+        });
+        assert!(chat_text(&reqwest::Client::new(), &server.base_url(), "m", json!([])).await.is_err());
     }
 
     #[tokio::test]

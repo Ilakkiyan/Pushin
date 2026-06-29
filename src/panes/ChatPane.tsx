@@ -24,6 +24,10 @@ export default function ChatPane() {
   const pendingChat = useStore((s) => s.pendingChat);
   const setPendingChat = useStore((s) => s.setPendingChat);
   const [input, setInput] = useState("");
+  // Plan = the harnessed calendar planner (schema-constrained); Chat = the deharnessed general
+  // "second brain" assistant (free-form, RAG-grounded, grows with you). Same 7B, two modes.
+  const [mode, setMode] = useState<"plan" | "chat">("plan");
+  const [chatBusy, setChatBusy] = useState(false);
   // Durable facts the AI noticed in the last message — offered for the user to confirm into memory.
   const [memSuggestions, setMemSuggestions] = useState<string[]>([]);
   // Deterministic label guesses for just-created tasks/events — confirmed before storing.
@@ -54,13 +58,30 @@ export default function ChatPane() {
 
   const send = async (text: string) => {
     const trimmed = text.trim();
-    if (!trimmed || busy) return;
+    if (!trimmed || busy || chatBusy) return;
     // Conversation context (prior turns) so follow-ups like "this friday at 7pm" work.
     const history = messages.map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.text }));
     setInput("");
     setLabelSuggestions([]);
     setMemSuggestions([]);
     setMessages((m) => [...m, { role: "user", text: trimmed }]);
+
+    // Chat mode → the deharnessed assistant: free-form reply + offer to remember durable facts (the
+    // "grows with you" loop — saved facts become grounding context for future chats).
+    if (mode === "chat") {
+      setChatBusy(true);
+      try {
+        const reply = await api.assistantChat(trimmed, history);
+        setMessages((m) => [...m, { role: "ai", text: reply || "…" }]);
+        api.extractMemories(trimmed).then((facts) => facts.length && setMemSuggestions(facts)).catch(() => {});
+      } catch (e) {
+        setMessages((m) => [...m, { role: "ai", text: "I couldn't respond — " + String(e) }]);
+      } finally {
+        setChatBusy(false);
+      }
+      return;
+    }
+
     try {
       const o = await plan(trimmed, history);
       const n = o.createdTaskIds.length;
@@ -129,9 +150,24 @@ export default function ChatPane() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="px-4 py-3 border-b border-white/10 flex items-center gap-2 shrink-0">
+      <div className="px-4 py-2.5 border-b border-white/10 flex items-center gap-2 shrink-0">
         <Sparkles className="size-4 text-fuchsia-400" />
-        <span className="text-sm font-medium">Plan with AI</span>
+        <span className="text-sm font-medium flex-1">AI</span>
+        {/* Plan = schema-harnessed calendar planner · Chat = deharnessed second-brain assistant. */}
+        <div className="flex items-center rounded-lg bg-white/[0.06] p-0.5 text-xs">
+          <button
+            onClick={() => setMode("plan")}
+            className={mode === "plan" ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium" : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"}
+          >
+            Plan
+          </button>
+          <button
+            onClick={() => setMode("chat")}
+            className={mode === "chat" ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium" : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"}
+          >
+            Chat
+          </button>
+        </div>
       </div>
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
@@ -139,7 +175,11 @@ export default function ChatPane() {
 
         {messages.length === 0 && llm?.reachable && (
           <div className="text-sm text-gray-400 space-y-3">
-            <p>Describe what you’re working on in plain language and I’ll break it into tasks and schedule them.</p>
+            {mode === "plan" ? (
+              <p>Describe what you’re working on in plain language and I’ll break it into tasks and schedule them.</p>
+            ) : (
+              <p>Think out loud, ask questions, or capture a thought. I’ll remember what matters and get more useful over time.</p>
+            )}
           </div>
         )}
 
@@ -157,7 +197,7 @@ export default function ChatPane() {
           </div>
         ))}
 
-        {busy && <div className="text-xs text-gray-500">Thinking…</div>}
+        {(busy || chatBusy) && <div className="text-xs text-gray-500">Thinking…</div>}
       </div>
 
       {memSuggestions.length > 0 && (
@@ -222,7 +262,7 @@ export default function ChatPane() {
               }
             }}
             rows={2}
-            placeholder={llm?.reachable ? "Describe your projects and tasks…" : "Set up the AI above to start planning…"}
+            placeholder={!llm?.reachable ? "Set up the AI above to start…" : mode === "plan" ? "Describe your projects and tasks…" : "Ask anything, or think out loud…"}
             className="flex-1 resize-none rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-indigo-500/50 placeholder:text-gray-600"
           />
           <button

@@ -457,6 +457,9 @@ export const api = {
   unlinkedMentions: (id: number) => invoke<Page[]>("unlinked_mentions", { id }),
   pageGraph: () => invoke<PageGraph>("page_graph"),
   vaultAsk: (question: string) => invoke<VaultAnswer>("vault_ask", { question }),
+  /** Deharnessed general assistant (the "second brain" chat) — free-form reply grounded in the vault. */
+  assistantChat: (message: string, history: { role: string; content: string }[]) =>
+    invoke<string>("assistant_chat", { message, history }),
   dailyBriefing: (date?: string) => invoke<Briefing>("daily_briefing", { date: date ?? null }),
   meetingBrief: (eventId: number) => invoke<MeetingBrief>("meeting_brief", { eventId }),
   extractActionItems: (notes: string) => invoke<string[]>("extract_action_items", { notes }),

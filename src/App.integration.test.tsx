@@ -68,7 +68,7 @@ describe("App (mocked-IPC integration)", () => {
     render(<App />);
     // Sidebar + calendar toolbar appear once load_all resolves.
     expect(await screen.findByText("Today")).toBeInTheDocument();
-    expect(screen.getByText("Plan with AI")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Plan" })).toBeInTheDocument(); // AI chat pane (Plan/Chat toggle)
     expect(api.loadAll).toHaveBeenCalled();
   });
 

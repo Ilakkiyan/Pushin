@@ -158,6 +158,7 @@ pub fn run() {
             commands::extract_memories,
             commands::unlinked_mentions,
             commands::vault_ask,
+            commands::assistant_chat,
             commands::list_people,
             commands::get_person,
             commands::create_person,

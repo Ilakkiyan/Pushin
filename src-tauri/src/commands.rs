@@ -1344,6 +1344,59 @@ numbers of the notes you actually used.\n\nNotes:\n{context}"
     Ok(VaultAnswer { answer, citations })
 }
 
+/// A prior turn in the assistant conversation (for multi-turn continuity).
+#[derive(serde::Deserialize)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// The "deharnessed" general assistant: a free-form, on-device chat grounded with RAG over the user's
+/// vault/entities. The SAME 7B as the planner, just unconstrained (no json_schema) and warmer — for
+/// thinking out loud, Q&A, and capturing/organizing thoughts. The planner (`plan_tasks`) still owns
+/// scheduling; the frontend toggles between the two modes.
+#[tauri::command]
+pub async fn assistant_chat(state: State<'_, AppState>, message: String, history: Vec<ChatTurn>) -> Result<String, String> {
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Ok(String::new());
+    }
+    // Best-effort RAG: pull possibly-relevant context. The assistant still answers general questions
+    // when nothing relevant is found (unlike `vault_ask`, which is notes-only).
+    let context = match recall_context(&state, &message, &[EntityKind::Task, EntityKind::Event, EntityKind::Page, EntityKind::Person], 6).await {
+        Ok(b) if !b.items.is_empty() => {
+            let mut c = String::from("\n\nPossibly-relevant notes from the user's vault (use only if they help):\n");
+            for it in b.items.iter() {
+                let snip: String = it.text.trim().chars().take(400).collect();
+                c.push_str(&format!("- {}\n", snip.replace('\n', " ")));
+            }
+            c
+        }
+        _ => String::new(),
+    };
+    let settings = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?
+    };
+    let system = format!(
+        "You are Pushin, a private, on-device assistant and \"second brain\" for the user. Be helpful, \
+warm, and concise. Help them think things through, answer questions, and capture/organize their \
+thoughts. Everything stays on their device. Never invent facts about their life — if you don't know, \
+say so or ask.{context}"
+    );
+    let mut messages = vec![serde_json::json!({ "role": "system", "content": system })];
+    // Keep the last ~10 turns for continuity without overrunning the context window.
+    let start = history.len().saturating_sub(10);
+    for turn in &history[start..] {
+        let role = if turn.role == "user" { "user" } else { "assistant" };
+        messages.push(serde_json::json!({ "role": role, "content": turn.content }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": message }));
+    llm::chat_text(&state.http, &settings.llm_base_url, &settings.model_id, serde_json::Value::Array(messages))
+        .await
+        .map_err(err)
+}
+
 /// Keyword auto-label suggestions for an entity: existing labels whose name appears in the entity's
 /// text and aren't already applied. Surfaced as confirm-chips in the label picker.
 #[tauri::command]
