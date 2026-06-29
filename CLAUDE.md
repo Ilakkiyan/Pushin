@@ -350,6 +350,14 @@ plaintext** that backs recall/search. Frontend type = `Page`; Rust = `model::Pag
   (`read_markdown_dir` walks a folder via `tauri-plugin-dialog`; `lib/import.ts` converts each file with
   a headless BlockNote editor, `[[links]]` → `set_page_links`), and **editor templates** (custom `/`
   slash items).
+- **Two-way markdown file vault (built, live-unverified):** the SQLite vault mirrors to real `.md`
+  files in a user-picked folder (Settings ▸ Vault folder), Obsidian-style. **Export** (`lib/vaultExport.ts`
+  → `PageEditor.persist` `blocksToMarkdownLossy` → `vault_write` → `vault.rs::write_file`): daily notes →
+  `Daily/YYYY-MM/YYYY-MM-DD.md`, others mirror the page tree as folders. **Watch** (`notify` crate, `vault.rs::
+  start_watch` → `vault-changed` event → `App.tsx` → `lib/vaultImport.ts::applyVaultChange` md→blocks +
+  upsert by `rel_path`). `notes.rel_path` (migration `0016`) = the page↔file map. **Echo guard:** `vault_write`
+  records a content hash per path; the watcher skips matching events so in-app saves don't loop. Compiles +
+  unit-tested; the live round-trip needs the running app + a real folder (see memory `vault-two-way-files`).
 - **Next steps (not built):** per-page icons; global (OS-level) quick-capture hotkey; Notion-export
   importer; progressive-disclosure onboarding. (Re-indexing pre-embed-server pages is now handled by the
   Context Engine reindex sweep.)
