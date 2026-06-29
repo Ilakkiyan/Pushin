@@ -25,12 +25,21 @@ jobs:
           # One universal macOS binary — runs NATIVELY on both Apple Silicon and Intel, so installs are
           # never the "Intel app" that macOS warns is being deprecated. (Built by lipo-merging both arch
           # slices; the toolchain step below installs both apple targets.)
+          # `lto`/`cgu` override [profile.release] per platform: Win/macOS keep the size-tuned full LTO
+          # (codegen-units=1); the ubuntu runner has only ~7GB RAM, where that profile OOMs during codegen,
+          # so Linux uses thin LTO + more codegen units to stay under the cap (slightly larger binary).
           - platform: macos-latest # Universal macOS (.dmg / .app)
             args: "--target universal-apple-darwin"
+            lto: "fat"
+            cgu: "1"
           - platform: ubuntu-22.04 # Linux (.AppImage / .deb)
             args: ""
+            lto: "thin"
+            cgu: "16"
           - platform: windows-latest # Windows (.msi / NSIS .exe)
             args: ""
+            lto: "fat"
+            cgu: "1"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -97,6 +106,10 @@ jobs:
           # `tauri signer generate`); without them the build still produces installers but no updates.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Per-platform [profile.release] override (see the matrix): lighter LTO on Linux so the
+          # 7GB ubuntu runner doesn't OOM during codegen; full LTO (size-tuned) on Win/macOS.
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.cgu }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Pushin ${{ github.ref_name }}"
