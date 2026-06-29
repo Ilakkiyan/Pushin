@@ -226,11 +226,59 @@ fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
     }
 }
 
-/// Find the newest llama.cpp release asset for this platform ("latest" sometimes has no
-/// assets yet, so we scan recent releases; within a release we honor candidate order).
-async fn find_server_asset(client: &reqwest::Client) -> Result<(String, String, String)> {
-    let candidates = platform_asset_candidates()
-        .ok_or_else(|| anyhow!("automatic engine download isn't supported on this OS yet — install llama.cpp or Ollama"))?;
+/// One engine download: the server binaries + (for a CUDA build) the matching cudart runtime DLLs,
+/// from the same llama.cpp release.
+struct EngineDownload {
+    /// (asset name, download url, "sha256:<hex>" digest)
+    binaries: (String, String, String),
+    cudart: Option<(String, String, String)>,
+}
+
+/// True if we should prefer a CUDA engine build — i.e. an NVIDIA GPU is present. Best-effort: just
+/// check whether `nvidia-smi` runs. (macOS uses Metal, which the macos build already has, so skip it.)
+fn prefer_cuda() -> bool {
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.arg("-L").stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// CUDA release-asset substrings for this platform (None where there's no prebuilt CUDA engine).
+/// cu12.4 over cu13 on purpose: it runs on more drivers and handles Blackwell (sm_120) via PTX JIT,
+/// whereas cu13 needs a very recent driver (>=580). Linux CUDA prebuilt naming is unsettled → CPU there.
+fn cuda_asset_candidates() -> Option<&'static [&'static str]> {
+    if cfg!(target_os = "windows") && !cfg!(target_arch = "aarch64") {
+        Some(&["bin-win-cuda-12.4-x64"])
+    } else {
+        None
+    }
+}
+
+/// Extract (name, url, "sha256:" digest) from a release asset, but only for a verifiable archive.
+fn asset_tuple(a: &serde_json::Value) -> Option<(String, String, String)> {
+    let name = a["name"].as_str()?;
+    let is_archive = name.ends_with(".zip") || name.ends_with(".tar.gz");
+    let url = a["browser_download_url"].as_str().unwrap_or_default();
+    let digest = a["digest"].as_str().unwrap_or_default();
+    // Never run an unverified binary: require GitHub's published sha256 digest.
+    if is_archive && !url.is_empty() && digest.starts_with("sha256:") {
+        Some((name.to_string(), url.to_string(), digest.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Find the newest llama.cpp release engine for this platform. With `want_cuda`, prefer a CUDA build
+/// (binaries + matching cudart, both verifiable, from one release); otherwise — or if no CUDA build is
+/// found — return the CPU build. ("latest" sometimes has no assets, so scan recent releases.)
+async fn find_engine_download(client: &reqwest::Client, want_cuda: bool) -> Result<EngineDownload> {
     let releases: serde_json::Value = client
         .get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15")
         .header("User-Agent", "pushin-app")
@@ -240,36 +288,86 @@ async fn find_server_asset(client: &reqwest::Client) -> Result<(String, String, 
         .json()
         .await?;
     let empty = Vec::new();
-    for rel in releases.as_array().unwrap_or(&empty) {
-        let assets = match rel["assets"].as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        for cand in candidates {
-            for a in assets {
-                if let Some(name) = a["name"].as_str() {
-                    // Match the OS/arch substring but only on an actual archive (skip any
-                    // future checksum/signature sidecars sharing the same prefix).
-                    let is_archive = name.ends_with(".zip") || name.ends_with(".tar.gz");
-                    if is_archive && name.contains(cand) {
-                        let url = a["browser_download_url"].as_str().unwrap_or_default();
-                        // GitHub publishes a "sha256:<hex>" digest per asset. We only accept an
-                        // asset we can verify, and check the bytes against it before running them
-                        // (the engine is an executable we spawn — never run an unverified binary).
-                        let digest = a["digest"].as_str().unwrap_or_default();
-                        if !url.is_empty() && digest.starts_with("sha256:") {
-                            return Ok((name.to_string(), url.to_string(), digest.to_string()));
-                        }
+    let rels = releases.as_array().unwrap_or(&empty);
+
+    // 1) CUDA: need BOTH the binaries (`llama-…-bin-…-cuda-…`) and cudart (`cudart-…`) from one release.
+    if want_cuda {
+        if let Some(cands) = cuda_asset_candidates() {
+            for rel in rels {
+                let Some(assets) = rel["assets"].as_array() else { continue };
+                for cand in cands {
+                    let has = |pred: &dyn Fn(&str) -> bool| {
+                        assets.iter().find(|a| a["name"].as_str().map(pred).unwrap_or(false)).and_then(asset_tuple)
+                    };
+                    let binaries = has(&|n| n.contains(cand) && !n.starts_with("cudart"));
+                    let cudart = has(&|n| n.contains(cand) && n.starts_with("cudart"));
+                    if let (Some(b), Some(c)) = (binaries, cudart) {
+                        return Ok(EngineDownload { binaries: b, cudart: Some(c) });
                     }
                 }
+            }
+        }
+        // No CUDA build in recent releases — fall through to the CPU build.
+    }
+
+    // 2) CPU build.
+    let cands = platform_asset_candidates()
+        .ok_or_else(|| anyhow!("automatic engine download isn't supported on this OS yet — install llama.cpp or Ollama"))?;
+    for rel in rels {
+        let Some(assets) = rel["assets"].as_array() else { continue };
+        for cand in cands {
+            if let Some(b) = assets.iter().find(|a| a["name"].as_str().map(|n| n.contains(cand)).unwrap_or(false)).and_then(asset_tuple) {
+                return Ok(EngineDownload { binaries: b, cudart: None });
             }
         }
     }
     Err(anyhow!("couldn't find a prebuilt llama.cpp server for this platform"))
 }
 
-/// Ensure a runnable `llama-server` exists in the app's bin/ dir, downloading + unpacking
-/// the prebuilt llama.cpp engine if needed. Emits `inference-status` updates.
+/// Download one verified asset, unpack it, and flatten its files into `dir` (bin/).
+async fn download_and_unpack(client: &reqwest::Client, dir: &Path, asset: &(String, String, String)) -> Result<()> {
+    let (name, url, digest) = asset;
+    let archive = dir.join(name);
+    let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
+    // Integrity gate: verify against GitHub's checksum BEFORE writing/unpacking/spawning.
+    verify_sha256(&bytes, digest)?;
+    std::fs::write(&archive, &bytes)?;
+
+    let staging = dir.join("_unpack");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    let unpacked = if name.ends_with(".zip") {
+        extract_zip(&archive, &staging)
+    } else {
+        extract_tar_gz(&archive, &staging)
+    };
+    let _ = std::fs::remove_file(&archive);
+    if let Err(e) = unpacked.and_then(|()| flatten_files_into(&staging, dir)) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+/// Download + unpack the engine into `dir` — a CUDA build (binaries + cudart) when `want_cuda`, else CPU.
+async fn download_engine(app: &AppHandle, client: &reqwest::Client, dir: &Path, want_cuda: bool) -> Result<()> {
+    let dl = find_engine_download(client, want_cuda).await?;
+    let _ = app.emit(
+        "inference-status",
+        if dl.cudart.is_some() { "Downloading the GPU inference engine (~600 MB)…" } else { "Downloading the inference engine…" },
+    );
+    download_and_unpack(client, dir, &dl.binaries).await?;
+    if let Some(cudart) = &dl.cudart {
+        let _ = app.emit("inference-status", "Downloading the GPU runtime…");
+        download_and_unpack(client, dir, cudart).await?;
+    }
+    Ok(())
+}
+
+/// Ensure a runnable `llama-server` exists in the app's bin/ dir, downloading + unpacking the prebuilt
+/// llama.cpp engine if needed — a CUDA build when an NVIDIA GPU is present, else CPU. Emits
+/// `inference-status` updates.
 pub async fn ensure_server_binary(app: &AppHandle, client: &reqwest::Client) -> Result<PathBuf> {
     let dir = server_dir(app)?;
     let target = dir.join(server_bin_name());
@@ -281,33 +379,20 @@ pub async fn ensure_server_binary(app: &AppHandle, client: &reqwest::Client) -> 
         return Ok(p);
     }
 
-    let _ = app.emit("inference-status", "Downloading the inference engine…");
-    let (name, url, digest) = find_server_asset(client).await?;
-    let archive = dir.join(&name);
-    let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
-    // Integrity gate: verify against GitHub's published checksum BEFORE writing/unpacking/spawning.
-    verify_sha256(&bytes, &digest)?;
-    std::fs::write(&archive, &bytes)?;
-
-    let _ = app.emit("inference-status", "Unpacking the inference engine…");
-    // Unpack into a scratch dir, then flatten the engine + its shared libraries up into
-    // `bin/`. Archive layouts vary by platform (flat on Windows, nested under a top dir
-    // on macOS/Linux), so we don't assume where inside the archive the binary lives.
-    let staging = dir.join("_unpack");
-    let _ = std::fs::remove_dir_all(&staging); // clear any prior partial extraction
-    std::fs::create_dir_all(&staging)?;
-
-    let unpacked = if name.ends_with(".zip") {
-        extract_zip(&archive, &staging)
-    } else {
-        extract_tar_gz(&archive, &staging)
-    };
-    let _ = std::fs::remove_file(&archive); // best-effort cleanup regardless of outcome
-    if let Err(e) = unpacked.and_then(|()| flatten_files_into(&staging, &dir)) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+    // Prefer a CUDA build when a GPU is present, but NEVER let a GPU hiccup leave the user without an
+    // engine: any failure falls back to the CPU build (worst case is CPU, never a broken install).
+    let want_cuda = prefer_cuda();
+    if let Err(gpu_err) = download_engine(app, client, &dir, want_cuda).await {
+        if want_cuda {
+            let _ = app.emit("inference-status", "GPU engine unavailable — using the CPU build…");
+            let _ = std::fs::remove_dir_all(dir.join("_unpack"));
+            download_engine(app, client, &dir, false)
+                .await
+                .map_err(|cpu_err| anyhow!("engine download failed (gpu: {gpu_err}; cpu: {cpu_err})"))?;
+        } else {
+            return Err(gpu_err);
+        }
     }
-    let _ = std::fs::remove_dir_all(&staging);
 
     if !target.exists() {
         return Err(anyhow!("engine archive didn't contain {}", server_bin_name()));
@@ -538,6 +623,23 @@ mod tests {
     fn platform_has_an_engine_asset_candidate() {
         // The CI build runs on a supported OS/arch, so there must be a candidate list for it.
         assert!(platform_asset_candidates().is_some(), "this platform should have llama.cpp asset substrings");
+    }
+
+    // Hits the real llama.cpp releases API — manual gate (network), like the live eval harness.
+    #[tokio::test]
+    #[ignore]
+    async fn find_engine_download_picks_cuda_binaries_and_cudart() {
+        let client = reqwest::Client::new();
+        let cuda = find_engine_download(&client, true).await.unwrap();
+        // On Windows x64 a GPU build = the CUDA binaries (not the cudart archive) + a matching cudart.
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            assert!(cuda.binaries.0.contains("cuda") && !cuda.binaries.0.starts_with("cudart"), "binaries: {}", cuda.binaries.0);
+            assert!(cuda.cudart.as_ref().map(|c| c.0.starts_with("cudart")).unwrap_or(false), "cudart: {:?}", cuda.cudart);
+        }
+        // A CPU build never carries a cudart.
+        let cpu = find_engine_download(&client, false).await.unwrap();
+        assert!(cpu.cudart.is_none(), "cpu build should have no cudart");
     }
 
     #[test]
