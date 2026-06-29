@@ -419,6 +419,19 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// True if a CUDA/HIP/Metal GPU backend lib sits next to the engine binary (e.g. `ggml-cuda.dll`,
+/// `libggml-cuda.so`). When present we offload to the GPU; a CPU-only build won't have it.
+fn has_gpu_backend(bin_dir: &std::path::Path) -> bool {
+    std::fs::read_dir(bin_dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                n.contains("ggml-cuda") || n.contains("ggml-hip") || n.contains("ggml-metal")
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn port_from_url(url: &str) -> u16 {
     url.rsplit(':')
         .next()
@@ -456,6 +469,13 @@ fn spawn_llama(app: &AppHandle, model: &std::path::Path, port: u16, embeddings: 
 
     let mut cmd = Command::new(&bin);
     cmd.args(["-m", model_s, "--host", "127.0.0.1", "--port", &port_s, "-c", ctx]);
+    // GPU offload: when a CUDA/GPU build is in bin/ (a `ggml-cuda`/`ggml-metal` lib alongside the
+    // binary), push all layers onto the GPU — ~10x faster than CPU on a discrete card. Harmless with a
+    // CPU-only engine (it just ignores -ngl). On a fresh CUDA server the first request pays a one-time
+    // PTX-JIT warmup (Blackwell/sm_120 on an older driver), then runs at full speed.
+    if bin.parent().map(has_gpu_backend).unwrap_or(false) {
+        cmd.args(["-ngl", "99"]);
+    }
     if embeddings {
         cmd.arg("--embeddings");
     }
