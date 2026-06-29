@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.6.0"
+version = "0.6.1"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"
@@ -54,6 +54,11 @@ data-encoding = "2"
 # File-system watcher for the two-way markdown vault (files -> DB). Cross-platform (ReadDirectoryChangesW
 # on Windows, FSEvents on macOS, inotify on Linux).
 notify = "6"
+# netwatch 0.6 (pulled in by iroh) uses socket2's `all`-gated APIs (Type::RAW, Socket->UnixStream) in
+# its macOS/BSD network monitor (netmon/bsd.rs). netwatch resolves socket2 **0.5**, which gates those
+# behind the `all` feature — so enable it here (feature-unifies into netwatch's socket2) or the macOS
+# build fails to compile. Windows and Linux never compile that file. Not used directly by Pushin.
+socket2 = { version = "0.5", features = ["all"] }
 
 # OS keychain (macOS/iOS Keychain / Windows Credential Manager / Linux Secret Service) for Google
 # OAuth tokens + device-sync keys. Excluded on Android (no keyring backend — secrets.rs stubs it).
