@@ -30,6 +30,18 @@
 
   /* The wide wordmark font — Saira variable, used at max width (wdth 125) for the Porsche-wide look. */
   --font-wordmark: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
+
+  /* Brutalist — SHARP CORNERS. Zero the box-radius scale so every rounded-{sm..4xl}/rounded utility is
+     square (cards, buttons, inputs, modals). `rounded-full` (pills, status dots, avatars) is a separate
+     literal and stays circular on purpose. One global change, no per-component edits. */
+  --radius-xs: 0;
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-2xl: 0;
+  --radius-3xl: 0;
+  --radius-4xl: 0;
 }
 
 :root {

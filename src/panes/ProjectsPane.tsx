@@ -93,7 +93,7 @@ export default function ProjectsPane() {
                 const last = new Date(parseLocal(e.end).getTime() - 86_400_000); // inclusive last day
                 const days = Math.round((parseLocal(e.end).getTime() - s.getTime()) / 86_400_000);
                 return (
-                  <div key={e.id} className="rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 flex items-center gap-3">
+                  <div key={e.id} className="rounded-xl px-4 py-3 flex items-center gap-3 transition-colors hover:bg-white/[0.025]">
                     <span className="size-2 rounded-full bg-rose-400 shrink-0" />
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{e.title}</div>
@@ -178,7 +178,7 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
   };
 
   return (
-    <section className={clsx("rounded-xl border border-white/10 bg-white/[0.02] overflow-hidden", archived && "opacity-60")}>
+    <section className={clsx("group rounded-xl overflow-hidden transition-colors hover:bg-white/[0.025]", archived && "opacity-60")}>
       <div className="px-4 pt-3 pb-2">
         <div className="flex items-center gap-2">
           <span className="size-2.5 rounded-full shrink-0" style={{ background: color }} />
@@ -186,26 +186,29 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
           <span className="text-xs text-gray-500 shrink-0">
             {done}/{total} done
           </span>
-          {(!isReal || !archived) && (
-            <button onClick={() => setAdding((v) => !v)} title="Add subtask" className="text-gray-500 hover:text-white shrink-0">
-              <Plus className="size-4" />
-            </button>
-          )}
-          {isReal && !archived && (
-            <button onClick={() => setProjectArchived(project.id, true)} title="Mark project complete" className="text-gray-500 hover:text-emerald-400 shrink-0">
-              <Check className="size-4" />
-            </button>
-          )}
-          {isReal && archived && (
-            <button onClick={() => setProjectArchived(project.id, false)} title="Restore project" className="text-gray-500 hover:text-white shrink-0">
-              <RotateCcw className="size-4" />
-            </button>
-          )}
-          {isReal && (
-            <button onClick={onDelete} title="Delete project" className="text-gray-500 hover:text-rose-400 shrink-0">
-              <Trash2 className="size-4" />
-            </button>
-          )}
+          {/* Action buttons stay hidden until the card is hovered (or a button is focused). */}
+          <div className="flex items-center gap-1 shrink-0 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
+            {(!isReal || !archived) && (
+              <button onClick={() => setAdding((v) => !v)} title="Add subtask" className="text-gray-500 hover:text-white">
+                <Plus className="size-4" />
+              </button>
+            )}
+            {isReal && !archived && (
+              <button onClick={() => setProjectArchived(project.id, true)} title="Mark project complete" className="text-gray-500 hover:text-emerald-400">
+                <Check className="size-4" />
+              </button>
+            )}
+            {isReal && archived && (
+              <button onClick={() => setProjectArchived(project.id, false)} title="Restore project" className="text-gray-500 hover:text-white">
+                <RotateCcw className="size-4" />
+              </button>
+            )}
+            {isReal && (
+              <button onClick={onDelete} title="Delete project" className="text-gray-500 hover:text-rose-400">
+                <Trash2 className="size-4" />
+              </button>
+            )}
+          </div>
         </div>
         {isReal && project && (
           <div className="mt-1.5">
