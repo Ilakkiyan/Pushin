@@ -182,7 +182,7 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
       <div className="px-4 pt-3 pb-2">
         <div className="flex items-center gap-2">
           <span className="size-2.5 rounded-full shrink-0" style={{ background: color }} />
-          <h2 className="font-medium truncate flex-1">{project?.name ?? "No project"}</h2>
+          <h2 className="font-medium truncate flex-1">{project ? project.name.trim() || "Untitled project" : "No project"}</h2>
           <span className="text-xs text-gray-500 shrink-0">
             {done}/{total} done
           </span>
@@ -226,7 +226,7 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
       {confirmDel && isReal && (
         <div className="px-4 pb-2 flex items-center gap-2 text-xs text-gray-400 flex-wrap">
           <span>
-            Delete “{project.name}”? Its {total} task{total === 1 ? "" : "s"} will move to No project.
+            Delete “{project.name.trim() || "Untitled project"}”? Its {total} task{total === 1 ? "" : "s"} will move to No project.
           </span>
           <button onClick={() => deleteProject(project.id)} className="px-2 py-1 rounded-md bg-rose-500/90 hover:bg-rose-500 text-white">
             Delete

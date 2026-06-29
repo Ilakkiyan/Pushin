@@ -144,7 +144,10 @@ export default function Sidebar() {
         <NavItem active={view === "calendar"} collapsed={collapsed} onClick={go("calendar")} icon={<CalendarDays className="size-4" />} label="Calendar" />
         <NavItem active={view === "projects"} collapsed={collapsed} onClick={go("projects")} icon={<FolderKanban className="size-4" />} label="Projects" />
         <NavItem active={view === "habits"} collapsed={collapsed} onClick={go("habits")} icon={<Flame className="size-4" />} label="Habits" />
-        <NavItem active={view === "booking"} collapsed={collapsed} onClick={go("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
+        {/* Booking hidden from public release builds for now (still available in `npm run tauri dev`). */}
+        {import.meta.env.DEV && (
+          <NavItem active={view === "booking"} collapsed={collapsed} onClick={go("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
+        )}
         <NavItem active={view === "people"} collapsed={collapsed} onClick={go("people")} icon={<Users className="size-4" />} label="People" />
 
         {!collapsed && <SectionLabel>Vault</SectionLabel>}

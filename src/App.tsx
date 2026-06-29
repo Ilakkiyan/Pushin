@@ -49,6 +49,9 @@ export default function App() {
   // The post-update "what's new" intro (shown once after the app version changes — see the effect below).
   const [whatsNew, setWhatsNew] = useState(false);
   const [appVersion, setAppVersion] = useState<string | undefined>(undefined);
+  // Until the version check resolves we don't yet know whether to show "what's new"; cover the gap so
+  // the app never flashes the calendar before the intro. (`true` in tests so they render the app.)
+  const [versionChecked, setVersionChecked] = useState(import.meta.env.MODE === "test");
   // New users get the guided intro; returning users get the welcome-back landing. Both sit over the
   // (already-mounted) shell and clear once the user is in. The guide flips `onboarded` on save.
   const guide = !onboarded ? <WelcomeGuide onDone={() => setEntered(true)} /> : null;
@@ -70,6 +73,9 @@ export default function App() {
     splashDone && whatsNew ? (
       <WhatsNew version={appVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
     ) : null;
+  // Cover the brief window between the splash clearing and the version check resolving, so the app
+  // never flashes behind the (about-to-appear) "what's new" intro.
+  const bootCover = splashDone && !versionChecked ? <div className="fixed inset-0 z-[55] bg-[var(--bg)]" /> : null;
 
   useHotkeys(); // global "g then key" navigation
 
@@ -92,7 +98,8 @@ export default function App() {
         localStorage.setItem(key, v);
         if (!forced && (useStore.getState().settings?.onboarded ?? false) && last !== v) setWhatsNew(true);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setVersionChecked(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
@@ -133,6 +140,7 @@ export default function App() {
   return (
     <div className="h-full flex flex-col">
       {splash}
+      {bootCover}
       {guide}
       {welcome}
       {whatsNewEl}
@@ -171,7 +179,7 @@ export default function App() {
               {view === "inbox" && <InboxPane />}
               {view === "label" && <LabelPane />}
               {view === "people" && <PeoplePane />}
-              {view === "booking" && <BookingPane />}
+              {view === "booking" && import.meta.env.DEV && <BookingPane />}
               {view === "settings" && <SettingsPane />}
             </main>
           </div>

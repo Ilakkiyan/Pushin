@@ -22,10 +22,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest # Apple Silicon (.dmg / .app)
-            args: "--target aarch64-apple-darwin"
-          - platform: macos-latest # Intel macs (.dmg / .app)
-            args: "--target x86_64-apple-darwin"
+          # One universal macOS binary — runs NATIVELY on both Apple Silicon and Intel, so installs are
+          # never the "Intel app" that macOS warns is being deprecated. (Built by lipo-merging both arch
+          # slices; the toolchain step below installs both apple targets.)
+          - platform: macos-latest # Universal macOS (.dmg / .app)
+            args: "--target universal-apple-darwin"
           - platform: ubuntu-22.04 # Linux (.AppImage / .deb)
             args: ""
           - platform: windows-latest # Windows (.msi / NSIS .exe)
@@ -58,7 +59,7 @@ jobs:
       - name: Install Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: ".nvmrc" # pin to the dev Node (24 / npm 11) so the lockfile can't drift across npm majors
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

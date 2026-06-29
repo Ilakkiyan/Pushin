@@ -61,7 +61,7 @@ export default function PeoplePane() {
             onDeleted={() => { setSelectedId(null); load(); }}
           />
         ) : (
-          <div className="grid h-full place-items-center text-sm text-gray-500">Select a person to see their details.</div>
+          <div className="flex h-full items-center justify-center px-6 text-center text-sm text-gray-500">Select a person to see their details.</div>
         )}
       </div>
     </div>
