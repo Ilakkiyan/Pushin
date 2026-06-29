@@ -34,6 +34,26 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need the tag's annotation/history to build the release notes
+
+      - name: Build release notes from the tag
+        id: notes
+        shell: bash
+        run: |
+          # The "what changed" changelog is the tag's message (annotated tag, or the tagged commit's
+          # message for a lightweight tag) — we write the bullets there when cutting a release.
+          NOTES="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")"
+          [ -z "$NOTES" ] && NOTES="$(git log -1 --pretty=%B "$GITHUB_REF_NAME")"
+          NOTES="$(printf '%s\n' "$NOTES" | sed -E '/^(Co-Authored-By|Signed-off-by):/d')"
+          {
+            echo 'body<<__NOTES_EOF__'
+            printf '%s\n' "$NOTES"
+            echo
+            echo '---'
+            echo 'Download the installer for your platform below, then run it — no separate install needed.'
+            echo '__NOTES_EOF__'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Node
         uses: actions/setup-node@v4
@@ -79,7 +99,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Pushin ${{ github.ref_name }}"
-          releaseBody: "Download the installer for your platform below, then run it — no separate install needed."
+          releaseBody: ${{ steps.notes.outputs.body }}
           # Publish immediately (not a draft) so GitHub's `releases/latest/...` resolves to it and the
           # in-app updater can fetch `latest.json`. Each matrix job uploads its platform's installer +
           # signed manifest to this same release; the per-OS jobs may land a few minutes apart, so a
