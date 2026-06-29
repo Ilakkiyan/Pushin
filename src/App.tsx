@@ -35,6 +35,7 @@ export default function App() {
   const loaded = useStore((s) => s.loaded);
   const view = useStore((s) => s.view);
   const calMode = useStore((s) => s.calMode);
+  const chatMode = useStore((s) => s.chatMode);
   const load = useStore((s) => s.load);
   const onboarded = useStore((s) => s.settings?.onboarded ?? true);
   const isMobile = useIsMobile();
@@ -162,13 +163,20 @@ export default function App() {
               {view === "calendar" && (
                 <>
                   <div className="flex-1 min-w-0">{calMode === "month" ? <MonthPane /> : <CalendarPane />}</div>
-                  <aside className="w-[400px] shrink-0 border-l border-white/10 flex flex-col min-h-0">
+                  {/* Chat mode → a wider, focused conversation: the tasks panel steps aside. */}
+                  <aside
+                    className={`shrink-0 border-l border-white/10 flex flex-col min-h-0 transition-[width] duration-300 ease-out ${
+                      chatMode === "chat" ? "w-[480px]" : "w-[400px]"
+                    }`}
+                  >
                     <div className="flex-1 min-h-0 overflow-hidden">
                       <ChatPane />
                     </div>
-                    <div className="h-[46%] shrink-0 border-t border-white/10 overflow-hidden">
-                      <TaskListPane />
-                    </div>
+                    {chatMode !== "chat" && (
+                      <div className="h-[46%] shrink-0 border-t border-white/10 overflow-hidden">
+                        <TaskListPane />
+                      </div>
+                    )}
                   </aside>
                 </>
               )}

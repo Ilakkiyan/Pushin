@@ -25,8 +25,10 @@ export default function ChatPane() {
   const setPendingChat = useStore((s) => s.setPendingChat);
   const [input, setInput] = useState("");
   // Plan = the harnessed calendar planner (schema-constrained); Chat = the deharnessed general
-  // "second brain" assistant (free-form, RAG-grounded, grows with you). Same 7B, two modes.
-  const [mode, setMode] = useState<"plan" | "chat">("plan");
+  // "second brain" assistant (free-form, RAG-grounded, grows with you). Same 7B, two modes. Lifted to
+  // the store so the shell can widen the pane + hide the tasks panel in chat mode.
+  const mode = useStore((s) => s.chatMode);
+  const setMode = useStore((s) => s.setChatMode);
   const [chatBusy, setChatBusy] = useState(false);
   // Durable facts the AI noticed in the last message — offered for the user to confirm into memory.
   const [memSuggestions, setMemSuggestions] = useState<string[]>([]);
