@@ -204,3 +204,23 @@ body {
     animation: none;
   }
 }
+
+/* "What's new" feature cards rise + fade in one by one (staggered via inline animation-delay). */
+.wn-rise {
+  animation: wnRise 460ms var(--ease-out) both;
+}
+@keyframes wnRise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wn-rise {
+    animation: none;
+  }
+}

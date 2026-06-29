@@ -6,6 +6,7 @@ import ConflictBanner from "./components/ConflictBanner";
 import UpdateBanner from "./components/UpdateBanner";
 import OpeningAnimation from "./components/OpeningAnimation";
 import WelcomeBack from "./components/WelcomeBack";
+import WhatsNew from "./components/WhatsNew";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
@@ -28,6 +29,7 @@ import { useIsMobile } from "./lib/useIsMobile";
 import { useHotkeys } from "./lib/useHotkeys";
 import { applyVaultChange } from "./lib/vaultImport";
 import type { VaultChange } from "./lib/ipc";
+import { getVersion } from "@tauri-apps/api/app";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -44,11 +46,14 @@ export default function App() {
     if (import.meta.env.MODE === "test") return true;
     return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("enter") === "1";
   });
+  // The post-update "what's new" intro (shown once after the app version changes — see the effect below).
+  const [whatsNew, setWhatsNew] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | undefined>(undefined);
   // New users get the guided intro; returning users get the welcome-back landing. Both sit over the
   // (already-mounted) shell and clear once the user is in. The guide flips `onboarded` on save.
   const guide = !onboarded ? <WelcomeGuide onDone={() => setEntered(true)} /> : null;
   const welcome =
-    onboarded && !entered ? (
+    onboarded && !entered && !whatsNew ? (
       <WelcomeBack
         onEnter={(t) => {
           if (t) {
@@ -59,12 +64,37 @@ export default function App() {
         }}
       />
     ) : null;
+  // After an update + restart an existing user gets the "what's new" intro instead of the welcome-back
+  // landing; dismissing it drops them straight into the app.
+  const whatsNewEl =
+    splashDone && whatsNew ? (
+      <WhatsNew version={appVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
+    ) : null;
 
   useHotkeys(); // global "g then key" navigation
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Show the "what's new" intro once, on the first launch after the app version changes (i.e. an
+  // update was installed + the app restarted). New users (not onboarded) and unit tests are skipped;
+  // localStorage remembers the last version seen so it shows exactly once per release.
+  useEffect(() => {
+    if (!loaded || import.meta.env.MODE === "test") return;
+    const forced = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1";
+    if (forced) setWhatsNew(true); // dev/preview hook (works without a Tauri getVersion)
+    getVersion()
+      .then((v) => {
+        setAppVersion(v);
+        const key = "pushin:lastSeenVersion";
+        const last = localStorage.getItem(key);
+        localStorage.setItem(key, v);
+        if (!forced && (useStore.getState().settings?.onboarded ?? false) && last !== v) setWhatsNew(true);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   // When the sync engine applies remote changes from another device, refresh the app data.
   useEffect(() => {
@@ -105,6 +135,7 @@ export default function App() {
       {splash}
       {guide}
       {welcome}
+      {whatsNewEl}
       {!isMobile && <TitleBar />}
       {isMobile ? (
         <div className="flex-1 min-h-0 flex flex-col">
