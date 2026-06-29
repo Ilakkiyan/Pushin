@@ -6,7 +6,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import type { Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { type Settings } from "../lib/ipc";
+import { api, type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
 import { exportAllPages } from "../lib/vaultExport";
 import { CommitmentList, SleepFields } from "../components/Personalization";
@@ -93,6 +93,8 @@ export default function SettingsPane() {
     } catch {
       setVaultMsg("Folder set — notes will export as you edit them.");
     }
+    // Start watching the new folder so external edits flow back in (files → DB).
+    await api.vaultRefreshWatch().catch(() => {});
   };
   const revealVault = () => {
     if (form.vaultDir) openPath(form.vaultDir).catch(() => {});

@@ -26,6 +26,8 @@ import TitleBar from "./components/TitleBar";
 import MobileShell from "./components/MobileShell";
 import { useIsMobile } from "./lib/useIsMobile";
 import { useHotkeys } from "./lib/useHotkeys";
+import { applyVaultChange } from "./lib/vaultImport";
+import type { VaultChange } from "./lib/ipc";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -71,6 +73,22 @@ export default function App() {
       un.then((f) => f());
     };
   }, [load]);
+
+  // Two-way vault: when an external editor changes a `.md` file, fold it into the DB and refresh the
+  // page tree. Best-effort — a malformed file is skipped, never crashes the app.
+  useEffect(() => {
+    const un = listen<VaultChange>("vault-changed", async (e) => {
+      try {
+        await applyVaultChange(e.payload);
+        await useStore.getState().loadPages();
+      } catch {
+        /* skip a change that won't apply */
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   if (!loaded) {
     return (

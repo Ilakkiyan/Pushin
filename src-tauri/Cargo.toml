@@ -51,6 +51,9 @@ tokio = { version = "1", features = ["time", "io-util", "sync", "rt", "rt-multi-
 iroh = "0.90"
 # Base32 for shareable pairing tickets (NodeAddr + mesh secret), QR-friendly + case-insensitive.
 data-encoding = "2"
+# File-system watcher for the two-way markdown vault (files -> DB). Cross-platform (ReadDirectoryChangesW
+# on Windows, FSEvents on macOS, inotify on Linux).
+notify = "6"
 
 # OS keychain (macOS/iOS Keychain / Windows Credential Manager / Linux Secret Service) for Google
 # OAuth tokens + device-sync keys. Excluded on Android (no keyring backend — secrets.rs stubs it).

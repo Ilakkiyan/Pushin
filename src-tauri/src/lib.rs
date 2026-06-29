@@ -60,7 +60,15 @@ pub fn run() {
                 embed_server: Mutex::new(None),
                 booking_server: Mutex::new(None),
                 sync_engine: Mutex::new(None),
+                vault_watcher: Mutex::new(None),
+                vault_echo: Default::default(),
             });
+
+            // If a two-way vault folder is already configured, start watching it (files → DB). No-op
+            // when unset; never blocks startup.
+            if let Some(state) = handle.try_state::<AppState>() {
+                commands::start_vault_watch(handle, state.inner());
+            }
 
             // If this device has already joined a sync network, bring the mesh engine up in the
             // background (best-effort — sync failing must never block app startup).
@@ -89,6 +97,10 @@ pub fn run() {
             commands::reschedule,
             commands::save_settings,
             commands::vault_write,
+            commands::vault_page_for_path,
+            commands::vault_link_path,
+            commands::vault_unlink_path,
+            commands::vault_refresh_watch,
             commands::plan_tasks,
             commands::create_task,
             commands::set_task_status,
@@ -188,6 +200,10 @@ pub fn run() {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     // Drop the sync engine (its Iroh endpoint closes on drop).
                     if let Ok(mut guard) = state.sync_engine.lock() {
+                        guard.take();
+                    }
+                    // Stop the vault file watcher.
+                    if let Ok(mut guard) = state.vault_watcher.lock() {
                         guard.take();
                     }
                     if let Ok(mut guard) = state.booking_server.lock() {

@@ -36,6 +36,13 @@ export interface Settings {
   vaultDir?: string | null; // folder the vault is mirrored to as markdown files (null = SQLite-only)
 }
 
+/** A `.md` change the Rust watcher saw on disk (two-way vault, files→DB). Emitted as `vault-changed`. */
+export interface VaultChange {
+  relPath: string;
+  content: string;
+  kind: "update" | "remove";
+}
+
 export interface SyncSummary {
   pulled: number;
   pushed: number;
@@ -377,6 +384,14 @@ export const api = {
   /** Mirror a page to `<vault_dir>/<relPath>` as markdown (no-op if no vault folder is set). */
   vaultWrite: (pageId: number, relPath: string, markdown: string) =>
     invoke<void>("vault_write", { pageId, relPath, markdown }),
+  /** The page id currently mapped to `relPath`, or null (file→page lookup for the watcher). */
+  vaultPageForPath: (relPath: string) => invoke<number | null>("vault_page_for_path", { relPath }),
+  /** Map an externally-created file to a (just-created) page, without writing the file back. */
+  vaultLinkPath: (pageId: number, relPath: string) => invoke<void>("vault_link_path", { pageId, relPath }),
+  /** A file was deleted on disk: unlink the page→file mapping (the page survives). */
+  vaultUnlinkPath: (relPath: string) => invoke<void>("vault_unlink_path", { relPath }),
+  /** (Re)start the vault file watcher to match the current vault folder (boot / after a change). */
+  vaultRefreshWatch: () => invoke<void>("vault_refresh_watch"),
 
   planTasks: (text: string, history: { role: string; content: string }[]) =>
     invoke<PlanOutcome>("plan_tasks", { text, history }),

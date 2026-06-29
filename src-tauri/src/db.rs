@@ -185,6 +185,13 @@ pub fn set_page_rel_path(conn: &Connection, page_id: i64, rel_path: Option<&str>
     Ok(())
 }
 
+/// Clear the file mapping for whatever page points at `rel_path` (its file was deleted externally).
+/// The page itself survives — an external `rm` shouldn't destroy the note.
+pub fn unlink_rel_path(conn: &Connection, rel_path: &str) -> Result<()> {
+    conn.execute("UPDATE notes SET rel_path = NULL WHERE rel_path = ?1", params![rel_path])?;
+    Ok(())
+}
+
 /// The page currently mapped to `rel_path`, if any (the file→page lookup for the watcher).
 #[allow(dead_code)] // used by the Phase 3e files→DB watcher
 pub fn page_id_for_rel_path(conn: &Connection, rel_path: &str) -> Result<Option<i64>> {

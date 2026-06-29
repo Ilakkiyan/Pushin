@@ -27,6 +27,12 @@ pub struct AppState {
     pub booking_server: Mutex<Option<BookingServerHandle>>,
     /// The device-sync engine (Iroh mesh). `None` until the device joins/creates a network.
     pub sync_engine: Mutex<Option<Arc<crate::sync::engine::SyncEngine>>>,
+    /// The two-way markdown-vault file watcher (`None` until a vault folder is set). Dropping it stops
+    /// watching, so changing/clearing the folder just replaces it.
+    pub vault_watcher: Mutex<Option<crate::vault::VaultWatcher>>,
+    /// Hashes of files Pushin itself just wrote, so the watcher doesn't echo our own saves back into
+    /// the DB. Shared with `vault_write`.
+    pub vault_echo: crate::vault::EchoGuard,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -84,16 +90,66 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
 }
 
 /// Mirror a vault page to `<vault_dir>/<rel_path>.md` (two-way markdown vault). No-op if the user
-/// hasn't picked a vault folder. Records the page→file mapping for the file→DB watcher.
+/// hasn't picked a vault folder. Records the page→file mapping + an echo hash so the watcher ignores
+/// this write.
 #[tauri::command]
 pub fn vault_write(state: State<AppState>, page_id: i64, rel_path: String, markdown: String) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
-    let Some(dir) = db::get_settings(&conn).map_err(err)?.vault_dir else {
-        return Ok(());
-    };
-    crate::vault::write_file(&dir, &rel_path, &markdown).map_err(err)?;
-    db::set_page_rel_path(&conn, page_id, Some(&rel_path)).map_err(err)?;
+    {
+        let conn = state.db.lock().unwrap();
+        let Some(dir) = db::get_settings(&conn).map_err(err)?.vault_dir else {
+            return Ok(());
+        };
+        // Record the echo hash *before* writing so the watcher (another thread) can't process the OS
+        // event before we've registered it.
+        if let Ok(mut echo) = state.vault_echo.lock() {
+            echo.insert(rel_path.clone(), crate::vault::content_hash(&markdown));
+        }
+        crate::vault::write_file(&dir, &rel_path, &markdown).map_err(err)?;
+        db::set_page_rel_path(&conn, page_id, Some(&rel_path)).map_err(err)?;
+    }
     Ok(())
+}
+
+/// The page currently mapped to `rel_path`, if any (file→page lookup used by the watcher path).
+#[tauri::command]
+pub fn vault_page_for_path(state: State<AppState>, rel_path: String) -> Result<Option<i64>, String> {
+    let conn = state.db.lock().unwrap();
+    db::page_id_for_rel_path(&conn, &rel_path).map_err(err)
+}
+
+/// Map an externally-created file to a (just-created) page, without writing the file back.
+#[tauri::command]
+pub fn vault_link_path(state: State<AppState>, page_id: i64, rel_path: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::set_page_rel_path(&conn, page_id, Some(&rel_path)).map_err(err)
+}
+
+/// A file was deleted on disk: unlink the page→file mapping (the page itself survives — deleting it on
+/// an external `rm` would be too destructive).
+#[tauri::command]
+pub fn vault_unlink_path(state: State<AppState>, rel_path: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::unlink_rel_path(&conn, &rel_path).map_err(err)
+}
+
+/// (Re)start the vault file watcher to match the current `vault_dir` setting — start it when a folder
+/// is set, drop it (stop watching) when cleared. Called at boot and after the folder changes.
+#[tauri::command]
+pub fn vault_refresh_watch(state: State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    start_vault_watch(&app, &state);
+    Ok(())
+}
+
+/// Sync the watcher to the `vault_dir` setting. Best-effort — a failed watch never breaks the app.
+pub fn start_vault_watch(app: &tauri::AppHandle, state: &AppState) {
+    let dir = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).ok().and_then(|s| s.vault_dir)
+    };
+    let next = dir.and_then(|d| crate::vault::start_watch(&d, app.clone(), state.vault_echo.clone()).ok());
+    if let Ok(mut guard) = state.vault_watcher.lock() {
+        *guard = next; // dropping the old watcher stops the previous folder
+    }
 }
 
 /// The cosine floor for injecting a recalled note into the planner. bge-small's similarity for
