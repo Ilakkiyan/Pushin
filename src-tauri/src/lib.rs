@@ -159,6 +159,7 @@ pub fn run() {
             commands::unlinked_mentions,
             commands::vault_ask,
             commands::assistant_chat,
+            commands::route_intent,
             commands::list_people,
             commands::get_person,
             commands::create_person,

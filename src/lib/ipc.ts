@@ -460,6 +460,8 @@ export const api = {
   /** Deharnessed general assistant (the "second brain" chat) — free-form reply grounded in the vault. */
   assistantChat: (message: string, history: { role: string; content: string }[]) =>
     invoke<string>("assistant_chat", { message, history }),
+  /** Classify a message → "plan" (calendar planner) or "chat" (assistant), for the AI pane's Auto mode. */
+  routeIntent: (message: string) => invoke<"plan" | "chat">("route_intent", { message }),
   dailyBriefing: (date?: string) => invoke<Briefing>("daily_briefing", { date: date ?? null }),
   meetingBrief: (eventId: number) => invoke<MeetingBrief>("meeting_brief", { eventId }),
   extractActionItems: (notes: string) => invoke<string[]>("extract_action_items", { notes }),

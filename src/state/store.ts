@@ -50,9 +50,10 @@ interface State {
   // Calendar view mode (week vs month), independent of which page you're on.
   calMode: CalMode;
   calColorByLabel: boolean;
-  // AI pane mode: "plan" (calendar planner) vs "chat" (general second-brain assistant). Lifted to the
-  // store so the shell can widen the pane + drop the tasks panel in chat mode.
-  chatMode: "plan" | "chat";
+  // AI pane mode: "auto" (classify each message), "plan" (calendar planner), or "chat" (general
+  // second-brain assistant). Lifted to the store so the shell can widen the pane + drop the tasks
+  // panel in chat mode.
+  chatMode: "auto" | "plan" | "chat";
   calLabelFilterIds: number[];
   // When the month view hands off to the week view, the day to open to.
   focusDateIso: string | null;
@@ -79,7 +80,7 @@ interface State {
   setView: (v: View) => void;
   setSidebarCollapsed: (c: boolean) => void;
   setCalMode: (m: CalMode) => void;
-  setChatMode: (m: "plan" | "chat") => void;
+  setChatMode: (m: "auto" | "plan" | "chat") => void;
   setCalColorByLabel: (enabled: boolean) => void;
   toggleCalLabelFilter: (id: number) => void;
   clearCalLabelFilters: () => void;
@@ -196,7 +197,7 @@ export const useStore = create<State>((set, get) => {
     llm: null,
     embedReady: false,
     calMode: "week",
-    chatMode: "plan",
+    chatMode: "auto",
     calColorByLabel: false,
     calLabelFilterIds: [],
     focusDateIso: null,

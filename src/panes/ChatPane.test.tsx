@@ -14,6 +14,7 @@ vi.mock("../lib/ipc", () => ({
     labelsFor: vi.fn().mockResolvedValue([]),
     setEntityLabels: vi.fn().mockResolvedValue(undefined),
     listLabels: vi.fn().mockResolvedValue([]),
+    routeIntent: vi.fn().mockResolvedValue("plan"),
   },
 }));
 
@@ -23,7 +24,7 @@ import { useStore } from "../state/store";
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useStore.setState({ llm: { reachable: true } as never, busy: false, chatMessages: [], settings: { googleConnected: false } as never });
+  useStore.setState({ llm: { reachable: true } as never, busy: false, chatMessages: [], chatMode: "plan", settings: { googleConnected: false } as never });
 });
 
 describe("ChatPane", () => {

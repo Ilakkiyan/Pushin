@@ -1397,6 +1397,40 @@ say so or ask.{context}"
         .map_err(err)
 }
 
+/// Route a chat message to the calendar planner ("plan") or the free-form assistant ("chat") for the
+/// AI pane's Auto mode. A tiny schema-constrained classify — far easier for the small model than full
+/// planning. **Biased toward "chat"**: only a clear scheduling/task request routes to the planner, so a
+/// stray sentence never silently creates a phantom task (the manual toggle is always there to override).
+#[tauri::command]
+pub async fn route_intent(state: State<'_, AppState>, message: String) -> Result<String, String> {
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Ok("chat".into());
+    }
+    let settings = {
+        let conn = state.db.lock().unwrap();
+        db::get_settings(&conn).map_err(err)?
+    };
+    let system = "Route the user's message to one of two handlers. Answer with intent \"plan\" ONLY if \
+it is a clear request to schedule, create, change, or remove tasks, events, reminders, deadlines, or \
+habits — things that go on a calendar or to-do list. For questions, brainstorming, statements, notes, \
+or anything else, answer \"chat\". When unsure, prefer \"chat\".";
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "intent": { "type": "string", "enum": ["plan", "chat"] } },
+        "required": ["intent"]
+    });
+    let messages = serde_json::json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": message }
+    ]);
+    let raw = llm::chat_json(&state.http, &settings.llm_base_url, &settings.model_id, messages, schema)
+        .await
+        .map_err(err)?;
+    Ok(if raw["intent"].as_str() == Some("plan") { "plan".to_string() } else { "chat".to_string() })
+}
+
 /// Keyword auto-label suggestions for an entity: existing labels whose name appears in the entity's
 /// text and aren't already applied. Surfaced as confirm-chips in the label picker.
 #[tauri::command]

@@ -68,9 +68,21 @@ export default function ChatPane() {
     setMemSuggestions([]);
     setMessages((m) => [...m, { role: "user", text: trimmed }]);
 
-    // Chat mode → the deharnessed assistant: free-form reply + offer to remember durable facts (the
+    // Auto mode classifies the message (planner vs assistant); Plan/Chat force the route.
+    let route: "plan" | "chat" = mode === "chat" ? "chat" : "plan";
+    if (mode === "auto") {
+      setChatBusy(true);
+      try {
+        route = await api.routeIntent(trimmed);
+      } catch {
+        route = "plan"; // classify failed → fall back to the planner (the established default)
+      }
+      setChatBusy(false);
+    }
+
+    // Chat route → the deharnessed assistant: free-form reply + offer to remember durable facts (the
     // "grows with you" loop — saved facts become grounding context for future chats).
-    if (mode === "chat") {
+    if (route === "chat") {
       setChatBusy(true);
       try {
         const reply = await api.assistantChat(trimmed, history);
@@ -157,18 +169,20 @@ export default function ChatPane() {
         <span className="text-sm font-medium flex-1">AI</span>
         {/* Plan = schema-harnessed calendar planner · Chat = deharnessed second-brain assistant. */}
         <div className="flex items-center rounded-lg bg-white/[0.06] p-0.5 text-xs">
-          <button
-            onClick={() => setMode("plan")}
-            className={mode === "plan" ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium" : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"}
-          >
-            Plan
-          </button>
-          <button
-            onClick={() => setMode("chat")}
-            className={mode === "chat" ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium" : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"}
-          >
-            Chat
-          </button>
+          {(["auto", "plan", "chat"] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              title={m === "auto" ? "Auto — pick Plan or Chat per message" : m === "plan" ? "Plan — calendar planner" : "Chat — second-brain assistant"}
+              className={
+                mode === m
+                  ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium"
+                  : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"
+              }
+            >
+              {m.charAt(0).toUpperCase() + m.slice(1)}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -177,10 +191,12 @@ export default function ChatPane() {
 
         {messages.length === 0 && llm?.reachable && (
           <div className="text-sm text-gray-400 space-y-3">
-            {mode === "plan" ? (
+            {mode === "chat" ? (
+              <p>Think out loud, ask questions, or capture a thought. I’ll remember what matters and get more useful over time.</p>
+            ) : mode === "plan" ? (
               <p>Describe what you’re working on in plain language and I’ll break it into tasks and schedule them.</p>
             ) : (
-              <p>Think out loud, ask questions, or capture a thought. I’ll remember what matters and get more useful over time.</p>
+              <p>Tell me what to schedule or just talk — I’ll figure out whether to plan it or chat. Use the toggle above to force one.</p>
             )}
           </div>
         )}
@@ -264,7 +280,7 @@ export default function ChatPane() {
               }
             }}
             rows={2}
-            placeholder={!llm?.reachable ? "Set up the AI above to start…" : mode === "plan" ? "Describe your projects and tasks…" : "Ask anything, or think out loud…"}
+            placeholder={!llm?.reachable ? "Set up the AI above to start…" : mode === "plan" ? "Describe your projects and tasks…" : mode === "chat" ? "Ask anything, or think out loud…" : "Plan something, or just ask…"}
             className="flex-1 resize-none rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-indigo-500/50 placeholder:text-gray-600"
           />
           <button
