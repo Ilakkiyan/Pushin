@@ -46,11 +46,10 @@
 
 :root {
   color-scheme: dark;
-  /* Neutral dark-charcoal ramp (no blue tinge). Page is the base; chrome/cards
-     sit slightly lighter (raised). */
-  --bg: #1a1a1a;
-  --surface: #202020;
-  --raised: #262626;
+  /* Brutalist charcoal ramp — darker base + wider stepping so panels read as distinct hard blocks. */
+  --bg: #121212;
+  --surface: #1c1c1c;
+  --raised: #282828;
   /* Premium decel curve (easeOutExpo) used for entrances + interactions. */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -126,6 +125,30 @@ body {
 .lucide {
   stroke-linecap: square;
   stroke-linejoin: miter;
+}
+
+/* ===== Brutalist amplifiers (global — ripple across every component) ========= */
+/* 1. Crisp, present hairlines instead of near-invisible ones, so panels/cards/inputs/buttons read
+      as hard *outlined* blocks (the strongest brutalist tell). Overrides Tailwind's faint utilities. */
+.border-white\/5 {
+  border-color: rgba(255, 255, 255, 0.16) !important;
+}
+.border-white\/10 {
+  border-color: rgba(255, 255, 255, 0.26) !important;
+}
+.border-white\/15 {
+  border-color: rgba(255, 255, 255, 0.34) !important;
+}
+/* 2. Hard, high-contrast keyboard focus — a stark outline, not a soft ring. */
+:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.9);
+  outline-offset: 1px;
+}
+/* 3. Content cards read as hard "stamped" blocks via a heavier 2px outline. (A neo-brutalist black
+      drop-shadow is invisible on a near-black charcoal base, so weight — not shadow — is the dark-mode
+      brutalist tell.) */
+.brutal-card {
+  border-width: 2px;
 }
 
 /* Thin scrollbars tuned to the slate UI */

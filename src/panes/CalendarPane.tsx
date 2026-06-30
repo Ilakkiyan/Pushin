@@ -350,7 +350,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                 {/* Selected-slot cursor (mouse/keyboard) */}
                 {cursor?.dayIdx === dayIdx && (
                   <div
-                    className="absolute left-0.5 right-0.5 z-30 pointer-events-none rounded-md ring-2 ring-white/70 bg-white/10"
+                    className="absolute left-0.5 right-0.5 z-30 pointer-events-none rounded-md ring-1 ring-white/45 bg-white/[0.07]"
                     style={{ top: topMin(cursor.minutes), height: height(SNAP) }}
                   />
                 )}

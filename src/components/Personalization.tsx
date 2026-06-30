@@ -152,7 +152,7 @@ export function AboutYou({
               onClick={() => toggle(a.key)}
               className={clsx(
                 "flex items-start border text-left transition",
-                large ? "gap-3 p-4" : "gap-2.5 p-2.5",
+                large ? "gap-3 p-4 brutal-card" : "gap-2.5 p-2.5",
                 on ? "border-white/30 bg-white/[0.07]" : "border-white/10 bg-white/[0.02] hover:bg-white/[0.04]",
               )}
             >
