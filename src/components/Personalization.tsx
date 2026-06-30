@@ -130,16 +130,18 @@ export function AboutYou({
   archetypes,
   aboutMe,
   onChange,
+  large = false,
 }: {
   archetypes: string[];
   aboutMe: string;
   onChange: (patch: Partial<{ archetypes: string[]; aboutMe: string }>) => void;
+  large?: boolean; // fatter cards for the full-screen setup wizard
 }) {
   const toggle = (key: string) =>
     onChange({ archetypes: archetypes.includes(key) ? archetypes.filter((a) => a !== key) : [...archetypes, key] });
   return (
-    <div className="space-y-3">
-      <div className="grid grid-cols-2 gap-2">
+    <div className={large ? "space-y-4" : "space-y-3"}>
+      <div className={clsx("grid grid-cols-2", large ? "gap-3" : "gap-2")}>
         {ARCHETYPES.map((a) => {
           const Icon = a.icon;
           const on = archetypes.includes(a.key);
@@ -149,14 +151,15 @@ export function AboutYou({
               type="button"
               onClick={() => toggle(a.key)}
               className={clsx(
-                "flex items-start gap-2.5 rounded-lg border p-2.5 text-left transition",
+                "flex items-start border text-left transition",
+                large ? "gap-3 p-4" : "gap-2.5 p-2.5",
                 on ? "border-white/30 bg-white/[0.07]" : "border-white/10 bg-white/[0.02] hover:bg-white/[0.04]",
               )}
             >
-              <Icon className={clsx("size-4 mt-0.5 shrink-0", on ? "text-gray-100" : "text-gray-500")} />
+              <Icon className={clsx("mt-0.5 shrink-0", large ? "size-5" : "size-4", on ? "text-gray-100" : "text-gray-500")} />
               <div className="min-w-0">
-                <div className={clsx("text-xs font-medium", on ? "text-gray-100" : "text-gray-300")}>{a.label}</div>
-                <div className="text-[11px] leading-snug text-gray-500">{a.blurb}</div>
+                <div className={clsx("font-medium", large ? "text-sm" : "text-xs", on ? "text-gray-100" : "text-gray-300")}>{a.label}</div>
+                <div className={clsx("leading-snug text-gray-500", large ? "text-xs" : "text-[11px]")}>{a.blurb}</div>
               </div>
             </button>
           );
@@ -165,9 +168,12 @@ export function AboutYou({
       <textarea
         value={aboutMe}
         onChange={(e) => onChange({ aboutMe: e.target.value })}
-        rows={3}
+        rows={large ? 4 : 3}
         placeholder="Anything that helps the AI understand you — your goals, what you're working on, how you like to work, what matters to you…"
-        className="w-full rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/25 resize-y placeholder:text-gray-600"
+        className={clsx(
+          "w-full resize-y border border-white/10 bg-white/5 px-3 py-2 outline-none focus:border-white/25 placeholder:text-gray-600",
+          large ? "text-base" : "text-sm",
+        )}
       />
     </div>
   );

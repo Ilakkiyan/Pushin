@@ -121,6 +121,13 @@ body {
   overflow: hidden;
 }
 
+/* Brutalist icons: square stroke caps + mitered joins so lucide's icons read sharp/technical instead
+   of soft + rounded — matching the sharp-corner aesthetic. (CSS overrides lucide's round defaults.) */
+.lucide {
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+}
+
 /* Thin scrollbars tuned to the slate UI */
 *::-webkit-scrollbar {
   width: 8px;
@@ -213,6 +220,41 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .welcome-in {
+    animation: none;
+  }
+}
+
+/* Setup wizard: each step slides in (from the right on Continue, the left on Back) — a seamless,
+   one-thing-at-a-time transition. */
+.step-in-right {
+  animation: stepInRight 360ms var(--ease-out) both;
+}
+.step-in-left {
+  animation: stepInLeft 360ms var(--ease-out) both;
+}
+@keyframes stepInRight {
+  from {
+    opacity: 0;
+    transform: translateX(30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes stepInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .step-in-right,
+  .step-in-left {
     animation: none;
   }
 }

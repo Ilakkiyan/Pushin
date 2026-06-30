@@ -9,7 +9,19 @@ const PALETTE = ["#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899
 /** A chip multiselect for an entity's labels (tasks/events/habits/pages/projects). Fetches the
  *  entity's current labels, lets you toggle existing labels or create one on the fly, and persists
  *  via `setEntityLabels`. `compact` shows just a small tag button until opened. */
-export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKind; entityId: number; compact?: boolean }) {
+export default function LabelPicker({
+  kind,
+  entityId,
+  compact,
+  revealOnHover,
+}: {
+  kind: LabelKind;
+  entityId: number;
+  compact?: boolean;
+  /** When there are no labels yet, keep the "add" button hidden until the parent `.group` is hovered
+   *  (and while the picker is open) — so unlabeled rows stay clean instead of showing a lone tag icon. */
+  revealOnHover?: boolean;
+}) {
   const labels = useStore((s) => s.labels);
   const quickLabel = useStore((s) => s.quickLabel);
   const setEntityLabels = useStore((s) => s.setEntityLabels);
@@ -86,7 +98,11 @@ export default function LabelPicker({ kind, entityId, compact }: { kind: LabelKi
       <button
         onClick={() => setOpen((v) => !v)}
         title="Add label"
-        className={clsx("inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] text-gray-400 hover:text-white hover:bg-white/10", compact && chips.length === 0 && "px-1")}
+        className={clsx(
+          "inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] text-gray-400 hover:text-white hover:bg-white/10",
+          compact && chips.length === 0 && "px-1",
+          revealOnHover && chips.length === 0 && !open && "opacity-0 group-hover:opacity-100 transition-opacity",
+        )}
       >
         <Tag className="size-3" />
         {!compact && chips.length === 0 && "Label"}

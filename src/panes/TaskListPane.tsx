@@ -31,59 +31,63 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
   const elapsed = focusing ? Math.max(0, Math.floor((now - parseLocal(active!.start).getTime()) / 1000)) : 0;
 
   return (
-    <div className="group flex items-center gap-2 px-3 py-2 hover:bg-white/[0.03] rounded-lg">
+    <div className="group flex items-start gap-2.5 px-3 py-2 hover:bg-white/[0.03] rounded-lg">
       <button
         aria-label={done ? "Mark not done" : "Mark done"}
         onClick={() => setTaskStatus(task.id, done ? "todo" : "done")}
         className={clsx(
-          "size-4 shrink-0 rounded border grid place-items-center",
+          "mt-0.5 size-4 shrink-0 rounded border grid place-items-center transition",
           done ? "bg-emerald-500 border-emerald-500" : "border-white/25 hover:border-white/50",
         )}
       >
         {done && <Check className="size-3 text-white" />}
       </button>
 
-      {project && <span className="size-2 rounded-full shrink-0" style={{ background: project.color }} />}
-
       <div className="min-w-0 flex-1">
-        <div className={clsx("text-sm truncate", done && "line-through text-gray-500")}>{task.title}</div>
-        <div className="flex items-center gap-2 text-[11px] text-gray-500">
+        {/* line 1: title · priority */}
+        <div className="flex items-center gap-2">
+          {project && <span className="size-2 rounded-full shrink-0" style={{ background: project.color }} title={project.name} />}
+          <span className={clsx("min-w-0 flex-1 truncate text-sm", done && "line-through text-gray-500")}>{task.title}</span>
+          <span className={clsx("shrink-0 rounded px-1.5 py-0.5 text-[10px]", pr.cls)}>{pr.label}</span>
+        </div>
+        {/* line 2: meta · labels */}
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
           <span>{humanMinutes(task.estimatedMinutes)}</span>
           {task.deadline && <span>· due {parseLocal(task.deadline).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
-        </div>
-        <div className="mt-0.5">
-          <LabelPicker kind="task" entityId={task.id} compact />
+          <LabelPicker kind="task" entityId={task.id} compact revealOnHover />
         </div>
       </div>
 
-      <span className={clsx("text-[10px] px-1.5 py-0.5 rounded shrink-0", pr.cls)}>{pr.label}</span>
-      {focusing ? (
-        <button onClick={onStop} title="Stop focus" className="flex items-center gap-1 text-[11px] text-emerald-300 shrink-0 tabular-nums">
-          <Square className="size-3 fill-current" />
-          {fmtElapsed(elapsed)}
-        </button>
-      ) : (
-        !done && (
-          <button onClick={() => onStart(task.id)} title="Start a focus session" className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-emerald-300 shrink-0">
-            <Play className="size-3.5" />
+      {/* right rail: focus timer (always when running) + hover actions */}
+      <div className="flex shrink-0 items-center gap-1.5 self-center text-gray-500">
+        {focusing ? (
+          <button onClick={onStop} title="Stop focus" className="flex items-center gap-1 text-[11px] text-emerald-300 tabular-nums">
+            <Square className="size-3 fill-current" />
+            {fmtElapsed(elapsed)}
           </button>
-        )
-      )}
-      <button
-        onClick={() => openEntityNote("task", task.id, task.title)}
-        title="Open notes for this task"
-        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-indigo-300 shrink-0"
-      >
-        <NotebookPen className="size-3.5" />
-      </button>
-      <button
-        aria-label="Delete task"
-        onClick={() => deleteTask(task.id)}
-        className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-rose-400 shrink-0"
-      >
-        <Trash2 className="size-3.5" />
-      </button>
+        ) : (
+          !done && (
+            <button onClick={() => onStart(task.id)} title="Start a focus session" className="opacity-0 group-hover:opacity-100 hover:text-emerald-300 transition-opacity">
+              <Play className="size-3.5" />
+            </button>
+          )
+        )}
+        <button
+          onClick={() => openEntityNote("task", task.id, task.title)}
+          title="Open notes for this task"
+          className="opacity-0 group-hover:opacity-100 hover:text-indigo-300 transition-opacity"
+        >
+          <NotebookPen className="size-3.5" />
+        </button>
+        <button
+          aria-label="Delete task"
+          onClick={() => deleteTask(task.id)}
+          className="opacity-0 group-hover:opacity-100 hover:text-rose-400 transition-opacity"
+        >
+          <Trash2 className="size-3.5" />
+        </button>
+      </div>
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { api, type Block, type CalEvent, type Label, type MeetingBrief } from ".
 import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
 import ViewToggle from "../components/ViewToggle";
 import CalendarLabelControls from "../components/CalendarLabelControls";
+import CalendarLegend from "../components/CalendarLegend";
 import LabelPicker from "../components/LabelPicker";
 import BriefingCard from "../components/BriefingCard";
 
@@ -273,14 +274,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
             : `${anchor.toLocaleDateString([], { month: "short", day: "numeric" })} – ${days[lastCol].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`}
         </span>
         <CalendarLabelControls />
-        {/* Legend is nice-to-have; hide it when the pane is too narrow (sidebar + chat aside squeeze it). */}
-        <div className="hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
-          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
-          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
-          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
-          <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-slate-400/40" /> reserved</span>
-          <span className="flex items-center gap-1"><Lock className="size-3" /> pinned</span>
-        </div>
+        <CalendarLegend />
       </div>
 
       <BriefingCard />
