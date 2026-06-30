@@ -1378,11 +1378,12 @@ pub async fn assistant_chat(state: State<'_, AppState>, message: String, history
         let conn = state.db.lock().unwrap();
         db::get_settings(&conn).map_err(err)?
     };
+    let profile = settings.profile_prompt(); // the "About you" setup profile, if filled in
     let system = format!(
         "You are Pushin, a private, on-device assistant and \"second brain\" for the user. Be helpful, \
 warm, and concise. Help them think things through, answer questions, and capture/organize their \
 thoughts. Everything stays on their device. Never invent facts about their life — if you don't know, \
-say so or ask.{context}"
+say so or ask.{profile}{context}"
     );
     let mut messages = vec![serde_json::json!({ "role": "system", "content": system })];
     // Keep the last ~10 turns for continuity without overrunning the context window.

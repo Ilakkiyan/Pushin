@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, FolderOpen, Github, Loader2, Moon, RefreshCw } from "lucide-react";
+import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, FolderOpen, Github, Loader2, Moon, RefreshCw, UserRound } from "lucide-react";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
@@ -9,7 +9,7 @@ import { useStore } from "../state/store";
 import { api, type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
 import { exportAllPages } from "../lib/vaultExport";
-import { CommitmentList, SleepFields } from "../components/Personalization";
+import { AboutYou, CommitmentList, SleepFields } from "../components/Personalization";
 import DevicesSync from "../components/DevicesSync";
 
 const REPO_URL = "https://github.com/Ilakkiyan/Pushin";
@@ -189,6 +189,15 @@ export default function SettingsPane() {
   return (
     <div className="h-full w-full overflow-y-auto">
       <div className="max-w-2xl mx-auto p-4 sm:p-6 space-y-8">
+        {/* About you — feeds the on-device AI's understanding of the user. */}
+        <section className="space-y-4">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><UserRound className="size-4 text-indigo-400" /> About you</h2>
+          <p className="text-[11px] text-gray-500">
+            Pick the archetypes that fit and add anything else — it's fed to the on-device AI so it understands you. Never leaves your device.
+          </p>
+          <AboutYou archetypes={form.archetypes ?? []} aboutMe={form.aboutMe ?? ""} onChange={update} />
+        </section>
+
         {/* Working hours */}
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Calendar className="size-4 text-indigo-400" /> Working hours</h2>

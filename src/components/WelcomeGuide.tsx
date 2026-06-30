@@ -2,7 +2,7 @@ import { useState } from "react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import type { Settings } from "../lib/ipc";
-import { CommitmentList, SleepFields } from "./Personalization";
+import { AboutYou, CommitmentList, SleepFields } from "./Personalization";
 
 /**
  * The new-user intro, shown after the opening animation when `settings.onboarded` is false. A calm,
@@ -63,6 +63,15 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
           </p>
 
           <div className="mt-9 space-y-8">
+            {/* About you — seeds the AI's understanding of the user from day one. */}
+            <section className="space-y-3">
+              <h2 className="text-sm font-medium text-gray-200">A bit about you</h2>
+              <p className="text-xs text-gray-500">
+                Helps the on-device AI understand you from the start — pick what fits and add anything else. Optional, and editable later.
+              </p>
+              <AboutYou archetypes={form.archetypes ?? []} aboutMe={form.aboutMe ?? ""} onChange={update} />
+            </section>
+
             {/* Working hours */}
             <section className="space-y-3">
               <h2 className="text-sm font-medium text-gray-200">When do you usually work?</h2>

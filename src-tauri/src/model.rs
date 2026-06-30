@@ -472,6 +472,49 @@ pub struct Settings {
     /// None = no file vault yet (vault stays SQLite-only). Device-local — paths differ per machine.
     #[serde(default)]
     pub vault_dir: Option<String>,
+    /// "About you" profile from setup: selected archetype keys + a free-form blurb. Fed into the AI's
+    /// system prompt so it understands the user from day one (and grows from there).
+    #[serde(default)]
+    pub archetypes: Vec<String>,
+    #[serde(default)]
+    pub about_me: String,
+}
+
+impl Settings {
+    /// A short user-profile blurb for the AI's system prompt (empty when nothing's filled in). Maps
+    /// archetype keys to readable labels and appends the free-form "about me" text.
+    pub fn profile_prompt(&self) -> String {
+        let labels: Vec<&str> = self
+            .archetypes
+            .iter()
+            .map(|k| match k.as_str() {
+                "builder" => "a builder/founder",
+                "student" => "a student",
+                "creator" => "a creator",
+                "operator" => "an operator/manager",
+                "freelancer" => "a freelancer",
+                "parent" => "a parent/caregiver",
+                _ => "",
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        let about = self.about_me.trim();
+        if labels.is_empty() && about.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("\n\nAbout the user");
+        if !labels.is_empty() {
+            s.push_str(&format!(" (they describe themselves as {})", labels.join(", ")));
+        }
+        s.push(':');
+        if about.is_empty() {
+            s.push('.');
+        } else {
+            s.push(' ');
+            s.push_str(about);
+        }
+        s
+    }
 }
 
 /// Keep in sync with `model_manager::EMBED_MODEL.id`.
@@ -505,6 +548,8 @@ impl Default for Settings {
             commitments: Vec::new(),
             embed_model: default_embed_model(),
             vault_dir: None,
+            archetypes: Vec::new(),
+            about_me: String::new(),
         }
     }
 }

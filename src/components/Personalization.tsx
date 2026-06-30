@@ -1,6 +1,6 @@
 // Shared editors for the user's personal schedule (sleep window + recurring routines/blocked
 // time). Used by both the first-run OnboardingModal and the Settings pane so the two stay in sync.
-import { Moon, Plus, Trash2 } from "lucide-react";
+import { Briefcase, GraduationCap, Heart, Moon, Palette, Plus, Rocket, Trash2, Users } from "lucide-react";
 import clsx from "clsx";
 import type { Commitment } from "../lib/ipc";
 
@@ -110,6 +110,65 @@ export function CommitmentList({ items, onChange }: { items: Commitment[]; onCha
       <button onClick={add} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
         <Plus className="size-3.5" /> Add routine / blocked time
       </button>
+    </div>
+  );
+}
+
+/** Selectable user archetypes (multi-select). Keys must match `Settings::profile_prompt` in Rust. */
+export const ARCHETYPES = [
+  { key: "builder", label: "Builder / Founder", icon: Rocket, blurb: "Shipping something — protects deep-work time." },
+  { key: "student", label: "Student", icon: GraduationCap, blurb: "Classes, study blocks, exam deadlines." },
+  { key: "creator", label: "Creator", icon: Palette, blurb: "Content or art — project-driven, flexible." },
+  { key: "operator", label: "Operator / Manager", icon: Users, blurb: "Lots of meetings, coordinating people." },
+  { key: "freelancer", label: "Freelancer", icon: Briefcase, blurb: "Multiple clients, varied work." },
+  { key: "parent", label: "Parent / Caregiver", icon: Heart, blurb: "Family routines and errands to weave in." },
+] as const;
+
+/** "About you": pick archetypes + a free-form blurb. Feeds the AI's system prompt so it understands the
+ *  user from day one. Shared by the WelcomeGuide (setup) and the Settings pane. */
+export function AboutYou({
+  archetypes,
+  aboutMe,
+  onChange,
+}: {
+  archetypes: string[];
+  aboutMe: string;
+  onChange: (patch: Partial<{ archetypes: string[]; aboutMe: string }>) => void;
+}) {
+  const toggle = (key: string) =>
+    onChange({ archetypes: archetypes.includes(key) ? archetypes.filter((a) => a !== key) : [...archetypes, key] });
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-2">
+        {ARCHETYPES.map((a) => {
+          const Icon = a.icon;
+          const on = archetypes.includes(a.key);
+          return (
+            <button
+              key={a.key}
+              type="button"
+              onClick={() => toggle(a.key)}
+              className={clsx(
+                "flex items-start gap-2.5 rounded-lg border p-2.5 text-left transition",
+                on ? "border-white/30 bg-white/[0.07]" : "border-white/10 bg-white/[0.02] hover:bg-white/[0.04]",
+              )}
+            >
+              <Icon className={clsx("size-4 mt-0.5 shrink-0", on ? "text-gray-100" : "text-gray-500")} />
+              <div className="min-w-0">
+                <div className={clsx("text-xs font-medium", on ? "text-gray-100" : "text-gray-300")}>{a.label}</div>
+                <div className="text-[11px] leading-snug text-gray-500">{a.blurb}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <textarea
+        value={aboutMe}
+        onChange={(e) => onChange({ aboutMe: e.target.value })}
+        rows={3}
+        placeholder="Anything that helps the AI understand you — your goals, what you're working on, how you like to work, what matters to you…"
+        className="w-full rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/25 resize-y placeholder:text-gray-600"
+      />
     </div>
   );
 }

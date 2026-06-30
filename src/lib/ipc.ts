@@ -34,6 +34,9 @@ export interface Settings {
   commitments: Commitment[];
   embedModel: string; // Hermes embedding model ("" = keyword-only recall)
   vaultDir?: string | null; // folder the vault is mirrored to as markdown files (null = SQLite-only)
+  // "About you" profile from setup — selected archetype keys + a free-form blurb, fed to the AI.
+  archetypes: string[];
+  aboutMe: string;
 }
 
 /** A `.md` change the Rust watcher saw on disk (two-way vault, files→DB). Emitted as `vault-changed`. */
