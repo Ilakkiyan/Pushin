@@ -130,8 +130,11 @@ export default function App() {
   // localStorage remembers the last version seen so it shows exactly once per release.
   useEffect(() => {
     if (!loaded || import.meta.env.MODE === "test") return;
-    const forced = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1";
-    if (forced) setWhatsNew(true); // dev/preview hook (works without a Tauri getVersion)
+    // Dev builds (and the ?whatsnew=1 hook) replay the full opening sequence — splash → loading →
+    // intro — on EVERY launch, so it can be iterated on. Production shows it once per version (below).
+    const forced =
+      import.meta.env.DEV || (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1");
+    if (forced) setWhatsNew(true);
     getVersion()
       .then((v) => {
         setAppVersion(v);

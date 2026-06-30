@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ForceGraph2D from "react-force-graph-2d";
 import { Network, Loader2, RefreshCw } from "lucide-react";
 import { useStore } from "../state/store";
@@ -36,13 +36,19 @@ export default function GraphPane() {
     return () => ro.disconnect();
   }, []);
 
-  // react-force-graph mutates node objects (x/y/velocity), so hand it fresh copies each load.
-  const data = graph
-    ? {
-        nodes: graph.nodes.map((n) => ({ ...n })) as GNode[],
-        links: graph.edges.map((e) => ({ source: e.source, target: e.target })),
-      }
-    : { nodes: [], links: [] };
+  // react-force-graph mutates node objects (x/y/velocity), so hand it fresh copies each load — but
+  // MEMOIZE on `graph` so unrelated re-renders (e.g. hover) don't hand it a new `graphData` object,
+  // which would restart the force simulation and replay the node entrance animation every time.
+  const data = useMemo(
+    () =>
+      graph
+        ? {
+            nodes: graph.nodes.map((n) => ({ ...n })) as GNode[],
+            links: graph.edges.map((e) => ({ source: e.source, target: e.target })),
+          }
+        : { nodes: [] as GNode[], links: [] as { source: number; target: number }[] },
+    [graph],
+  );
 
   const empty = !loading && data.nodes.length === 0;
 

@@ -561,11 +561,18 @@ function minutesBetweenBlock(b: Block) {
 
 function EventCard({ ev, top, height, color, onDelete, onOpen }: { ev: CalEvent; top: number; height: number; color: string | null; onDelete: () => void; onOpen: () => void }) {
   const isHabit = ev.kind === "habit";
+  const setView = useStore((s) => s.setView);
   return (
     <div
       onClick={(e) => {
         e.stopPropagation();
         if (!isHabit) onOpen(); // open the detail/label popover for real events (habits → HabitsPane)
+      }}
+      onDoubleClick={(e) => {
+        // Don't bubble to the column's dblclick (which opens the "Add busy time" dialog). A habit
+        // double-click jumps to the Habits page; real events already open their popover on click.
+        e.stopPropagation();
+        if (isHabit) setView("habits");
       }}
       className={clsx(
         "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
