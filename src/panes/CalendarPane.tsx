@@ -403,8 +403,10 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                       key={`b${b.id}`}
                       onClick={(e) => e.stopPropagation()}
                       onDoubleClick={(e) => {
+                        // Non-destructive: open the task's note. (Unpinning is the lock button below —
+                        // double-click used to unpin, which silently re-flowed the block to 9am.)
                         e.stopPropagation();
-                        if (b.locked) unlockBlock(b.id, b.start, b.end);
+                        if (t) openEntityNote("task", t.id, t.title);
                       }}
                       onPointerDown={(e) => {
                         e.stopPropagation();
@@ -423,8 +425,20 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                       title={t?.title}
                     >
                       <div className="flex items-center gap-1 font-medium text-gray-100 truncate">
-                        {b.locked && <Lock className="size-2.5 shrink-0" />}
-                        {t?.title ?? "Task"}
+                        {b.locked && (
+                          <button
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              unlockBlock(b.id, b.start, b.end);
+                            }}
+                            title="Pinned to this time — click to unpin and let Pushin reschedule it"
+                            className="shrink-0 text-gray-300 hover:text-white"
+                          >
+                            <Lock className="size-2.5" />
+                          </button>
+                        )}
+                        <span className="truncate">{t?.title ?? "Task"}</span>
                       </div>
                       <div className="text-gray-300/70">{fmtTime(parseLocal(b.start))}</div>
                     </div>

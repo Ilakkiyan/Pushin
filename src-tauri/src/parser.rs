@@ -510,6 +510,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
+    promote_timed_work_to_block(plan, user_text);
     route_recurring_to_habits(plan, user_text);
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
@@ -2124,6 +2125,108 @@ fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
             }
         }
     }
+}
+
+/// **Explicitly-timed work is a committed block, not a floating task.** "Work on X from A to B" (or
+/// "study X 2–4pm") names a specific slot, so the user is committing that time — it must become a
+/// fixed calendar block, never a task the auto-scheduler can drift to the start of the work day. The
+/// model is inconsistent here run-to-run: sometimes it emits the fixed event (correct — `store_plan`'s
+/// task↔event de-dup then drops the redundant task), but sometimes it emits only a floating task and —
+/// confused by a similarly-named existing event — even spuriously "edits" that event. When the message
+/// is a single, explicitly-ranged "work on X" with NO edit verb, a matching task, and NO timed event,
+/// promote the task to a fixed event at the range and drop any stray edit. Tightly gated (work phrase +
+/// exactly one clock range + exactly one task + no pre-existing timed event + no edit verb) so ordinary
+/// tasks ("spend Saturday cleaning the garage") and real edits ("move gym to 6pm") are untouched.
+fn promote_timed_work_to_block(plan: &mut ParsedPlan, text: &str) {
+    let lc = text.to_lowercase();
+    const WORK: &[&str] = &["work on", "working on", "study ", "studying", "spend ", "focus on", "do my ", "do the "];
+    if !WORK.iter().any(|p| lc.contains(p)) {
+        return;
+    }
+    // An edit verb means the user is changing an existing item — leave that to the edit path.
+    const EDIT: &[&str] =
+        &["move ", "reschedule", "rename", "push ", "shift ", "change ", "make it", "instead", "update ", "extend", "shorten", "cancel", "delete", "remove"];
+    if EDIT.iter().any(|p| lc.contains(p)) {
+        return;
+    }
+    // Exactly one explicit clock range.
+    let ranges = find_time_ranges(text);
+    if ranges.len() != 1 {
+        return;
+    }
+
+    // This is a pure timed-CREATE — no event edit the model invented (it gets confused by a
+    // similarly-named existing event) is legitimate.
+    plan.update_events.clear();
+
+    // Titles of timed blocks the model already produced this turn.
+    let timed_titles: Vec<String> = plan
+        .events
+        .iter()
+        .filter(|e| e.start_time.as_deref().and_then(parse_hm).is_some())
+        .map(|e| e.title.clone())
+        .collect();
+
+    if !timed_titles.is_empty() {
+        // The model already made the block. Drop the redundant "work on X" task it also emitted —
+        // store_plan's title-substring de-dup misses it when the titles diverge (event "Work on ACC HW"
+        // + task "Work on acc stuff"). Match on a shared significant word; a genuinely unrelated task
+        // ("call mom") shares none and survives.
+        for proj in &mut plan.projects {
+            proj.tasks.retain(|t| !timed_titles.iter().any(|et| shares_significant_word(&t.title, et)));
+        }
+        return;
+    }
+
+    // No timed event: the model produced only a floating task — promote the single task to a fixed
+    // block at the range so it can't drift to the start of the work day.
+    let mut titles = plan.projects.iter().flat_map(|p| p.tasks.iter()).map(|t| t.title.clone());
+    let (Some(title), None) = (titles.next(), titles.next()) else {
+        return;
+    };
+    let (start, end_raw) = ranges.into_iter().next().unwrap();
+    let promoted = ParsedEvent {
+        title,
+        day: day_phrase_including_slang(&lc),
+        date: None,
+        start_time: Some(start.format("%H:%M").to_string()),
+        end_time: Some(end_raw),
+        duration_minutes: None,
+        span_days: None,
+    };
+    plan.projects.clear();
+    plan.events.push(promoted);
+}
+
+/// True if two titles share a meaningful word (length ≥ 3, ignoring generic "work on …" filler) —
+/// used to spot the redundant task the model emits alongside an explicit work block even when their
+/// titles diverge ("Work on ACC HW" ↔ "Work on acc stuff" share "acc").
+fn shares_significant_word(a: &str, b: &str) -> bool {
+    fn words(s: &str) -> Vec<String> {
+        const STOP: &[&str] = &["work", "study", "spend", "focus", "the", "and", "for", "this", "that", "session", "time", "some", "get"];
+        s.to_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| w.len() >= 3 && !STOP.contains(w))
+            .map(|w| w.to_string())
+            .collect()
+    }
+    let wa = words(a);
+    words(b).iter().any(|w| wa.contains(w))
+}
+
+/// A day word in free text, tolerant of common shorthand ("tmr"/"tmrw" → tomorrow) that the strict
+/// `find_day_phrases` (used for deadlines) deliberately ignores. Returns the first match.
+fn day_phrase_including_slang(lc: &str) -> Option<String> {
+    for tok in lc.split(|c: char| !c.is_ascii_alphabetic()) {
+        let d = match tok {
+            "today" | "tdy" => "today",
+            "tomorrow" | "tmr" | "tmrw" | "tmw" | "tomo" => "tomorrow",
+            "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday" => tok,
+            _ => continue,
+        };
+        return Some(d.to_string());
+    }
+    None
 }
 
 /// Parse a time the model might write as "14:00", "2pm", "2:00 PM", "9", "14:00:00".
@@ -4144,5 +4247,98 @@ mod tests {
         assert_eq!(find_day_phrases("lunch today and dinner tomorrow"), vec!["today", "tomorrow"]);
         assert_eq!(find_day_phrases("move it on friday, friday works"), vec!["friday"]);
         assert!(find_day_phrases("make it 2 hours").is_empty());
+    }
+
+    fn up(target: &str) -> UpdateEvent {
+        UpdateEvent {
+            target: target.into(),
+            title: None,
+            day: None,
+            start_time: Some("12:00".into()),
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+            shift_minutes: None,
+        }
+    }
+
+    #[test]
+    fn promotes_timed_work_to_a_fixed_block() {
+        // "work on X from 12-1 tmr" mis-routed as a floating task + a spurious "Acc HW" edit → promote
+        // to a fixed 12–1 tomorrow block, dropping the task and the stray edit.
+        let task = ParsedTask { title: "Work on acc stuff".into(), ..Default::default() };
+        let proj = ParsedProject { name: "Acc HW".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { projects: vec![proj], update_events: vec![up("Acc HW")], ..Default::default() };
+        apply_recovery(&mut plan, "I'm gonna work on my acc stuff from 12 - 1 tmr", d());
+        assert_eq!(plan.events.len(), 1, "promoted to one fixed block");
+        assert_eq!(plan.events[0].title, "Work on acc stuff");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("12:00"));
+        assert_eq!(plan.events[0].day.as_deref(), Some("tomorrow"));
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "no floating task left");
+        assert!(plan.update_events.is_empty(), "spurious edit dropped");
+    }
+
+    #[test]
+    fn promoted_block_resolves_to_noon_through_1pm() {
+        // End-to-end via store_plan: lands at 12:00–13:00 (the PM-less "1" recovered), no floating task.
+        let conn = crate::db::test_conn();
+        let task = ParsedTask { title: "Work on acc stuff".into(), ..Default::default() };
+        let proj = ParsedProject { name: "Acc HW".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "work on my acc stuff from 12 - 1 tomorrow", d());
+        let out = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(out.created_event_ids.len(), 1);
+        assert!(out.created_task_ids.is_empty(), "no floating task scheduled");
+        let e = crate::db::list_events(&conn).unwrap().into_iter().find(|e| e.title.contains("acc stuff")).unwrap();
+        assert!(e.start.contains("T12:00:00"), "starts at noon: {}", e.start);
+        let (s, en) = (parse_dt(&e.start).unwrap(), parse_dt(&e.end).unwrap());
+        assert_eq!((en - s).num_minutes(), 60, "12–1pm = 60 min");
+    }
+
+    #[test]
+    fn promote_skips_without_a_clock_range() {
+        // A work phrase but no clock range → stays a task ("spend Saturday afternoon cleaning").
+        let task = ParsedTask { title: "Clean the garage".into(), ..Default::default() };
+        let proj = ParsedProject { name: "<NAME>".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "spend Saturday afternoon cleaning the garage", d());
+        assert!(plan.events.is_empty(), "no block fabricated");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "task survives");
+    }
+
+    #[test]
+    fn promote_skips_on_an_edit() {
+        // "move gym to 2-3" is an edit — the update survives, no block is fabricated.
+        let mut plan = ParsedPlan { update_events: vec![up("Gym")], ..Default::default() };
+        apply_recovery(&mut plan, "move my gym session to 2 - 3 pm", d());
+        assert!(plan.events.is_empty());
+        assert_eq!(plan.update_events.len(), 1, "the real edit is untouched");
+    }
+
+    #[test]
+    fn drops_redundant_work_task_when_block_already_made() {
+        // The model emits BOTH the block ("Work on ACC HW" 12–1) AND a diverging-title task
+        // ("Work on acc stuff") that the substring de-dup misses. The block wins; the task is dropped.
+        let mut event = ev("tomorrow", Some("12:00"), Some("13:00"));
+        event.title = "Work on ACC HW".into();
+        let task = ParsedTask { title: "Work on acc stuff".into(), ..Default::default() };
+        let proj = ParsedProject { name: "ACC HW".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { events: vec![event], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "I'm gonna work on my acc stuff from 12 - 1 tmr", d());
+        assert_eq!(plan.events.len(), 1, "the block stays");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "redundant task dropped");
+    }
+
+    #[test]
+    fn keeps_unrelated_task_alongside_a_work_block() {
+        // A work block + a genuinely unrelated task in one message: the unrelated task survives.
+        let mut event = ev("today", Some("14:00"), Some("16:00"));
+        event.title = "Work on essay".into();
+        let task = ParsedTask { title: "Call mom".into(), ..Default::default() };
+        let proj = ParsedProject { name: "<NAME>".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { events: vec![event], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "work on my essay from 2 - 4 and call mom", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "unrelated task kept");
     }
 }
