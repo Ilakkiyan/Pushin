@@ -56,11 +56,13 @@ export default function InferenceSetup() {
     try {
       await api.downloadModel(id);
       setPresent((p) => ({ ...p, [id]: true }));
-      // Make the freshly downloaded model the active one so "Start AI" uses it.
+      // Make the freshly downloaded model the active one so the server uses it.
       if (settings && settings.modelId !== id) {
         await saveSettings({ ...settings, modelId: id });
       }
-      setMsg("Model ready. Now click “Start the AI”.");
+      // Auto-start right away — no manual "Start the AI" click needed.
+      setMsg("Model ready — starting…");
+      await start();
     } catch (e) {
       setMsg(String(e));
     } finally {

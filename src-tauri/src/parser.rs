@@ -511,6 +511,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
     promote_timed_work_to_block(plan, user_text);
+    collapse_unrequested_decomposition(plan, user_text);
     route_recurring_to_habits(plan, user_text);
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
@@ -2212,6 +2213,73 @@ fn shares_significant_word(a: &str, b: &str) -> bool {
     }
     let wa = words(a);
     words(b).iter().any(|w| wa.contains(w))
+}
+
+/// **Don't over-decompose a single deliverable into a fabricated project.** "Get the MIT Hacks
+/// application done by Friday" is ONE thing the user named — but the model loves to explode it into a
+/// project of invented subtasks (+ deadline-marker events) the user never asked for. When the message
+/// is a single deliverable with NO breakdown/list cue, collapse the fabricated multi-task project into
+/// one task (named after the deliverable, keeping the deadline), drop the fabricated marker events, and
+/// ASK whether to break it down / how long it'll take — accuracy by asking, not guessing. Conservative:
+/// any enumeration or breakdown cue ("review ch.1, do tests, and …", "break into steps") keeps the
+/// model's decomposition untouched.
+fn collapse_unrequested_decomposition(plan: &mut ParsedPlan, text: &str) {
+    if user_requested_breakdown(text) {
+        return;
+    }
+    // One project the model built for a single named deliverable.
+    if plan.projects.len() != 1 || plan.projects[0].tasks.is_empty() || is_placeholder_title(&plan.projects[0].name) {
+        return;
+    }
+    let deliverable = plan.projects[0].name.trim().to_string();
+    let n_tasks = plan.projects[0].tasks.len();
+    // A fabricated deadline-MARKER event for the same deliverable ("Get MIT Hacks application done")
+    // — the model emits these even when it doesn't over-decompose. (A real event like "Meeting with
+    // Bob" has no marker word, so it's spared.)
+    let has_marker_event = plan.events.iter().any(|e| is_deadline_marker(&e.title, &deliverable));
+    // Only act when the model over-built: 2+ fabricated subtasks, OR a single task plus a marker event.
+    if n_tasks < 2 && !has_marker_event {
+        return;
+    }
+
+    if n_tasks >= 2 {
+        // Collapse the fabricated subtasks into one task named after the deliverable.
+        let deadline = plan.projects[0].tasks.iter().filter_map(|t| t.deadline.clone()).min();
+        let collapsed = ParsedTask {
+            title: deliverable.clone(),
+            notes: String::new(),
+            estimated_minutes: 60,
+            deadline,
+            priority: "medium".into(),
+            depends_on: Vec::new(),
+            chunkable: true,
+        };
+        plan.projects = vec![ParsedProject { name: "<NAME>".into(), tasks: vec![collapsed] }];
+    }
+    // Drop fabricated deadline-marker events, and ask instead of guessing — the follow-up the user
+    // wanted. (Survives `filter_clarifications`: it has a '?' and no created-event title words.)
+    plan.events.retain(|e| !is_deadline_marker(&e.title, &deliverable));
+    plan.clarifications.push("Want me to break this into steps, and roughly how long will it take?".to_string());
+}
+
+/// True when an event title reads as a deadline MARKER for `deliverable` (e.g. "Get MIT Hacks
+/// application done", "Essay deadline") rather than a real calendar event the user wanted.
+fn is_deadline_marker(event_title: &str, deliverable: &str) -> bool {
+    let lc = event_title.to_lowercase();
+    const MARK: &[&str] = &["done", "deadline", "complete", "finish", "submit", "due"];
+    (lc == deliverable.to_lowercase() || MARK.iter().any(|m| lc.contains(m))) && shares_significant_word(event_title, deliverable)
+}
+
+/// True when the user explicitly asked for a breakdown, or gave an enumerated list of items — so the
+/// model's multi-task decomposition is wanted, not fabricated. Conservative (any cue keeps it).
+fn user_requested_breakdown(text: &str) -> bool {
+    let lc = text.to_lowercase();
+    const KW: &[&str] = &["break", "step", "subtask", "sub-task", "outline", "checklist", "plan out", "to-do", "todo"];
+    if KW.iter().any(|k| lc.contains(k)) {
+        return true;
+    }
+    // An enumerated list: a comma, " and " joining clauses, or a numbered list.
+    lc.contains(',') || lc.contains(" and ") || lc.contains("1.") || lc.contains("1)")
 }
 
 /// A day word in free text, tolerant of common shorthand ("tmr"/"tmrw" → tomorrow) that the strict
@@ -4340,5 +4408,72 @@ mod tests {
         let mut plan = ParsedPlan { events: vec![event], projects: vec![proj], ..Default::default() };
         apply_recovery(&mut plan, "work on my essay from 2 - 4 and call mom", d());
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "unrelated task kept");
+    }
+
+    #[test]
+    fn collapses_unrequested_decomposition_and_asks() {
+        // "get mit hacks application done by friday" → ONE task + a follow-up question, not a 3-subtask
+        // project with fabricated deadline-marker events.
+        let mk = |t: &str| ParsedTask { title: t.into(), deadline: Some("2026-07-03T23:59:00".into()), ..Default::default() };
+        let proj = ParsedProject {
+            name: "MIT Hacks Application".into(),
+            tasks: vec![mk("Research and select projects"), mk("Write application essay"), mk("Prepare supplementary materials")],
+        };
+        let mut ev1 = ev("friday", Some("00:00"), None);
+        ev1.title = "Get MIT Hacks application done".into();
+        let mut plan = ParsedPlan { events: vec![ev1], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "i need to get mit hacks application done by friday", d());
+        let tasks: Vec<&ParsedTask> = plan.projects.iter().flat_map(|p| p.tasks.iter()).collect();
+        assert_eq!(tasks.len(), 1, "collapsed to a single task");
+        assert_eq!(tasks[0].title, "MIT Hacks Application");
+        assert!(tasks[0].deadline.is_some(), "kept the Friday deadline");
+        assert!(plan.events.is_empty(), "fabricated marker event dropped");
+        assert!(plan.clarifications.iter().any(|c| c.contains('?')), "asks a follow-up question");
+    }
+
+    #[test]
+    fn keeps_decomposition_when_user_listed_items() {
+        // An explicit enumerated list → the model's breakdown is wanted, untouched.
+        let mk = |t: &str| ParsedTask { title: t.into(), ..Default::default() };
+        let proj = ParsedProject { name: "Exam prep".into(), tasks: vec![mk("review chapters"), mk("do practice tests"), mk("make cheat sheet")] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "prep for my exam friday: review 4 chapters, do 2 practice tests, and make a cheat sheet", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 3, "the listed breakdown is kept");
+    }
+
+    #[test]
+    fn keeps_decomposition_when_breakdown_requested() {
+        let mk = |t: &str| ParsedTask { title: t.into(), ..Default::default() };
+        let proj = ParsedProject { name: "Move apartments".into(), tasks: vec![mk("pack boxes"), mk("hire movers")] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "break down moving apartments into steps", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 2, "explicit breakdown kept");
+    }
+
+    #[test]
+    fn drops_marker_event_and_asks_for_a_lone_deliverable() {
+        // The other variance: ONE task + a fabricated "… done" deadline-marker event. Keep the task,
+        // drop the marker, and ask the follow-up.
+        let task = ParsedTask { title: "Complete the application".into(), estimated_minutes: 360, deadline: Some("2026-07-03T23:59:00".into()), ..Default::default() };
+        let proj = ParsedProject { name: "MIT Hacks application".into(), tasks: vec![task] };
+        let mut ev1 = ev("friday", Some("12:00"), Some("13:00"));
+        ev1.title = "Get MIT Hacks application done".into();
+        let mut plan = ParsedPlan { events: vec![ev1], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "i need to get mit hacks application done by friday", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "the single task is kept");
+        assert!(plan.events.is_empty(), "fabricated marker event dropped");
+        assert!(plan.clarifications.iter().any(|c| c.contains('?')), "asks a follow-up question");
+    }
+
+    #[test]
+    fn spares_a_real_event_for_a_deliverable_task() {
+        // A real calendar event (no marker word, unrelated) is NOT dropped alongside a deliverable task.
+        let task = ParsedTask { title: "Prepare slides".into(), ..Default::default() };
+        let proj = ParsedProject { name: "Prepare slides".into(), tasks: vec![task] };
+        let mut ev1 = ev("friday", Some("14:00"), Some("15:00"));
+        ev1.title = "Meeting with Bob".into();
+        let mut plan = ParsedPlan { events: vec![ev1], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "i need to prepare slides for friday", d());
+        assert_eq!(plan.events.len(), 1, "the real meeting survives");
     }
 }
