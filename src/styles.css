@@ -139,10 +139,16 @@ body {
 .border-white\/15 {
   border-color: rgba(255, 255, 255, 0.34) !important;
 }
-/* 2. Hard, high-contrast keyboard focus — a stark outline, not a soft ring. */
+/* 2. Hard, high-contrast keyboard focus on interactive controls — but NOT text fields, which have
+      their own softer focus-within border (a stark white box around a big input reads as harsh). */
 :focus-visible {
   outline: 2px solid rgba(255, 255, 255, 0.9);
   outline-offset: 1px;
+}
+input:focus-visible,
+textarea:focus-visible,
+[contenteditable]:focus-visible {
+  outline: none;
 }
 /* 3. Content cards read as hard "stamped" blocks via a heavier 2px outline. (A neo-brutalist black
       drop-shadow is invisible on a near-black charcoal base, so weight — not shadow — is the dark-mode

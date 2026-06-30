@@ -28,8 +28,9 @@ import MobileShell from "./components/MobileShell";
 import { useIsMobile } from "./lib/useIsMobile";
 import { useHotkeys } from "./lib/useHotkeys";
 import { applyVaultChange } from "./lib/vaultImport";
-import type { VaultChange } from "./lib/ipc";
+import { api, type VaultChange } from "./lib/ipc";
 import { getVersion } from "@tauri-apps/api/app";
+import { Loader2 } from "lucide-react";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -78,11 +79,51 @@ export default function App() {
   // never flashes behind the (about-to-appear) "what's new" intro.
   const bootCover = splashDone && !versionChecked ? <div className="fixed inset-0 z-[55] bg-[var(--bg)]" /> : null;
 
+  // AI boot gate: after the opening logo, hold a loading screen until the on-device model is loaded
+  // into memory, so the app opens AI-ready instead of flashing a "Start the AI" card / failing the
+  // first prompt. Resolves on `llm.reachable` (server up = model loaded); skipped when no model is
+  // downloaded yet (first run → the setup card handles the download) and in tests.
+  const [aiBootDone, setAiBootDone] = useState(import.meta.env.MODE === "test");
+  const llmReachable = useStore((s) => s.llm?.reachable ?? false);
+  const activeModelId = useStore((s) => s.settings?.modelId);
+  const aiLoading =
+    splashDone && !aiBootDone ? (
+      <div className="fade-in fixed inset-0 z-[110] grid place-items-center bg-[#1f1f1f]">
+        <Loader2 className="size-7 animate-spin text-gray-500" />
+      </div>
+    ) : null;
+
   useHotkeys(); // global "g then key" navigation
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Resolve the AI boot gate (see `aiLoading`): ready once the server is reachable (model in memory);
+  // skip when no model is downloaded; safety timeout so a stuck/slow load never traps the loading screen.
+  useEffect(() => {
+    if (aiBootDone) return;
+    if (llmReachable) {
+      setAiBootDone(true);
+      return;
+    }
+    let cancelled = false;
+    api
+      .modelPresent(activeModelId ?? "")
+      .then((present) => {
+        if (!cancelled && !present) setAiBootDone(true);
+      })
+      .catch(() => {
+        if (!cancelled) setAiBootDone(true);
+      });
+    const t = setTimeout(() => {
+      if (!cancelled) setAiBootDone(true);
+    }, 35000);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [aiBootDone, llmReachable, activeModelId]);
 
   // Show the "what's new" intro once, on the first launch after the app version changes (i.e. an
   // update was installed + the app restarted). New users (not onboarded) and unit tests are skipped;
@@ -142,6 +183,7 @@ export default function App() {
     <div className="h-full flex flex-col">
       {splash}
       {bootCover}
+      {aiLoading}
       {guide}
       {welcome}
       {whatsNewEl}

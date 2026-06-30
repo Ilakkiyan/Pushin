@@ -2,32 +2,49 @@ import { useEffect, useRef, useState } from "react";
 import { Info, Lock } from "lucide-react";
 
 /** The calendar color legend, tucked behind a small info icon so the toolbar stays uncluttered.
- *  (Replaces the always-on inline legend row that crowded the calendar header.) */
+ *  The popover is positioned `fixed` off the button so it escapes the toolbar's `overflow-hidden`
+ *  (which otherwise clips it behind the calendar grid). */
 export default function CalendarLegend() {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  const popRef = useRef<HTMLDivElement | null>(null);
+  const [pos, setPos] = useState<{ top: number; right: number }>({ top: 0, right: 0 });
 
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (!btnRef.current?.contains(t) && !popRef.current?.contains(t)) setOpen(false);
     };
     window.addEventListener("mousedown", onDown);
     return () => window.removeEventListener("mousedown", onDown);
   }, [open]);
 
+  const toggle = () => {
+    if (!open && btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect();
+      setPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) });
+    }
+    setOpen((v) => !v);
+  };
+
   return (
-    <div ref={ref} className="relative shrink-0">
+    <>
       <button
-        onClick={() => setOpen((v) => !v)}
+        ref={btnRef}
+        onClick={toggle}
         title="What the colors mean"
         aria-label="Legend"
-        className="p-1.5 rounded-md text-gray-500 hover:text-white hover:bg-white/10 transition"
+        className="shrink-0 rounded-md p-1.5 text-gray-500 transition hover:bg-white/10 hover:text-white"
       >
         <Info className="size-3.5" />
       </button>
       {open && (
-        <div className="pop-in absolute right-0 top-full z-50 mt-1 w-44 border border-white/10 bg-[var(--raised)] p-2.5 shadow-xl">
+        <div
+          ref={popRef}
+          style={{ top: pos.top, right: pos.right }}
+          className="pop-in fixed z-[100] w-44 border border-white/10 bg-[var(--raised)] p-2.5 shadow-xl"
+        >
           <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-500">Legend</div>
           <div className="flex flex-col gap-1.5 text-[11px] text-gray-300">
             <span className="flex items-center gap-2"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
@@ -38,6 +55,6 @@ export default function CalendarLegend() {
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }

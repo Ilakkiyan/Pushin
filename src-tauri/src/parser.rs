@@ -512,6 +512,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_event_fields(plan, user_text, today);
     promote_timed_work_to_block(plan, user_text);
     collapse_unrequested_decomposition(plan, user_text);
+    drop_unrequested_prep_tasks(plan, user_text);
     route_recurring_to_habits(plan, user_text);
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
@@ -2280,6 +2281,25 @@ fn user_requested_breakdown(text: &str) -> bool {
     }
     // An enumerated list: a comma, " and " joining clauses, or a numbered list.
     lc.contains(',') || lc.contains(" and ") || lc.contains("1.") || lc.contains("1)")
+}
+
+/// **Don't fabricate "Prepare for X" busywork.** Just mentioning an activity ("I have a temple visit
+/// Friday") makes the model spawn a "Prepare for Temple visit" prep task the user never asked for. When
+/// the message doesn't actually ask to prepare/prep/get-ready, drop those tasks — the activity itself
+/// (and any clarifying question about its time) is enough; the user can ask for prep explicitly.
+fn drop_unrequested_prep_tasks(plan: &mut ParsedPlan, text: &str) {
+    let lc = text.to_lowercase();
+    if lc.contains("prepare") || lc.contains("prep ") || lc.contains("get ready") || lc.contains("ready for") || lc.contains("plan for") {
+        return; // the user genuinely asked to prepare — keep it
+    }
+    fn is_prep_for(title: &str) -> bool {
+        let t = title.trim().to_lowercase();
+        t.starts_with("prepare for") || t.starts_with("prep for") || t.starts_with("get ready for") || t.starts_with("prepare myself")
+    }
+    for proj in &mut plan.projects {
+        proj.tasks.retain(|t| !is_prep_for(&t.title));
+    }
+    plan.projects.retain(|p| !p.tasks.is_empty());
 }
 
 /// A day word in free text, tolerant of common shorthand ("tmr"/"tmrw" → tomorrow) that the strict
@@ -4475,5 +4495,25 @@ mod tests {
         let mut plan = ParsedPlan { events: vec![ev1], projects: vec![proj], ..Default::default() };
         apply_recovery(&mut plan, "i need to prepare slides for friday", d());
         assert_eq!(plan.events.len(), 1, "the real meeting survives");
+    }
+
+    #[test]
+    fn drops_fabricated_prepare_for_task() {
+        // Just mentioning an activity → the model spawns a "Prepare for Temple visit" task. The user
+        // never said "prepare", so it's dropped.
+        let task = ParsedTask { title: "Prepare for Temple visit".into(), ..Default::default() };
+        let proj = ParsedProject { name: "Temple visit".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "im going to the temple this saturday for pretty much the entire day", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "fabricated prep task dropped");
+    }
+
+    #[test]
+    fn keeps_prep_task_when_user_asked_to_prepare() {
+        let task = ParsedTask { title: "Prepare for the exam".into(), ..Default::default() };
+        let proj = ParsedProject { name: "Exam".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "help me prepare for the exam", d());
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "explicit prep kept");
     }
 }
