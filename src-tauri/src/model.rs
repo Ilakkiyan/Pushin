@@ -110,6 +110,10 @@ pub struct Habit {
     pub duration_minutes: i64,
     pub archived: bool,
     pub created_at: String,
+    /// Learned preferred time-of-day in minutes since midnight (set by dragging the habit on the
+    /// calendar). `None` = no preference → the scheduler best-fits it into any free gap.
+    #[serde(default)]
+    pub preferred_minute: Option<i64>,
 }
 
 fn default_interval_days() -> i64 {

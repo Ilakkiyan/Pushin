@@ -38,7 +38,7 @@ export default function WhatsNew({ version, onDone }: { version?: string; onDone
   const ctaDelay = FIRST_CARD + FEATURES.length * STEP + 120;
 
   return (
-    <div className="fixed inset-0 z-[60] flex flex-col items-center justify-center overflow-y-auto bg-[var(--bg)] px-6 py-10">
+    <div data-tauri-drag-region className="fixed inset-0 z-[60] flex flex-col items-center justify-center overflow-y-auto bg-[var(--bg)] px-6 py-10">
       <div className="w-full max-w-lg">
         <div className="welcome-in text-center" style={{ animationDelay: `${TITLE_DELAY}ms` }}>
           <h1 className="text-3xl font-light tracking-tight text-gray-100">

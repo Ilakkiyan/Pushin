@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
 import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
@@ -31,7 +31,8 @@ function snap(min: number, step = 15) {
 }
 
 interface DragState {
-  blockId: number;
+  kind: "block" | "habit";
+  id: number; // task-block id, or habit-event id
   startClientY: number;
   origStart: Date;
   durationMin: number;
@@ -45,6 +46,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   const blocks = useStore((s) => s.blocks);
   const moveBlock = useStore((s) => s.moveBlock);
   const unlockBlock = useStore((s) => s.unlockBlock);
+  const moveHabit = useStore((s) => s.moveHabit);
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
   const openDaily = useStore((s) => s.openDaily);
@@ -162,7 +164,8 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           base.setHours(0, 0, 0, 0);
           const newStart = addMinutes(base, startMin);
           const newEnd = addMinutes(newStart, d.durationMin);
-          moveBlock(d.blockId, toLocalIso(newStart), toLocalIso(newEnd));
+          if (d.kind === "habit") moveHabit(d.id, toLocalIso(newStart));
+          else moveBlock(d.id, toLocalIso(newStart), toLocalIso(newEnd));
         }
         return null;
       });
@@ -173,7 +176,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [drag, moveBlock]);
+  }, [drag, moveBlock, moveHabit]);
 
   const top = (d: Date) => ((minutesFromMidnight(d) - TOP_MIN) / 60) * PX_PER_HOUR;
   const height = (mins: number) => Math.max(16, (mins / 60) * PX_PER_HOUR);
@@ -387,6 +390,11 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                     color={colorByLabel ? primaryLabelColor(eventLabels[ev.id]) : null}
                     onDelete={() => deleteEvent(ev.id)}
                     onOpen={() => setDetail(ev)}
+                    onDragStart={(e) => {
+                      e.stopPropagation();
+                      setDrag({ kind: "habit", id: ev.id, startClientY: e.clientY, origStart: parseLocal(ev.start), durationMin: minutesBetweenEv(ev), deltaMin: 0 });
+                    }}
+                    dragDy={drag?.kind === "habit" && drag.id === ev.id ? (drag.deltaMin / 60) * PX_PER_HOUR : 0}
                   />
                 ))}
 
@@ -395,7 +403,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                   const t = taskById.get(b.taskId);
                   const project = t?.projectId != null ? projectById.get(t.projectId) : undefined;
                   const dur = minutesBetweenBlock(b);
-                  const isDragging = drag?.blockId === b.id;
+                  const isDragging = drag?.kind === "block" && drag.id === b.id;
                   const dy = isDragging ? (drag!.deltaMin / 60) * PX_PER_HOUR : 0;
                   const color = (colorByLabel ? primaryLabelColor(taskLabels[b.taskId]) : null) ?? project?.color ?? "#6366f1";
                   return (
@@ -410,7 +418,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                       }}
                       onPointerDown={(e) => {
                         e.stopPropagation();
-                        setDrag({ blockId: b.id, startClientY: e.clientY, origStart: parseLocal(b.start), durationMin: dur, deltaMin: 0 });
+                        setDrag({ kind: "block", id: b.id, startClientY: e.clientY, origStart: parseLocal(b.start), durationMin: dur, deltaMin: 0 });
                       }}
                       className={clsx(
                         "absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden cursor-grab active:cursor-grabbing z-10 border",
@@ -559,7 +567,25 @@ function minutesBetweenBlock(b: Block) {
   return Math.round((parseLocal(b.end).getTime() - parseLocal(b.start).getTime()) / 60000);
 }
 
-function EventCard({ ev, top, height, color, onDelete, onOpen }: { ev: CalEvent; top: number; height: number; color: string | null; onDelete: () => void; onOpen: () => void }) {
+function EventCard({
+  ev,
+  top,
+  height,
+  color,
+  onDelete,
+  onOpen,
+  onDragStart,
+  dragDy = 0,
+}: {
+  ev: CalEvent;
+  top: number;
+  height: number;
+  color: string | null;
+  onDelete: () => void;
+  onOpen: () => void;
+  onDragStart?: (e: RPointerEvent<HTMLDivElement>) => void; // habits only — drag to move + learn the time
+  dragDy?: number;
+}) {
   const isHabit = ev.kind === "habit";
   const setView = useStore((s) => s.setView);
   return (
@@ -574,13 +600,15 @@ function EventCard({ ev, top, height, color, onDelete, onOpen }: { ev: CalEvent;
         e.stopPropagation();
         if (isHabit) setView("habits");
       }}
+      onPointerDown={isHabit ? onDragStart : undefined}
       className={clsx(
         "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
         !isHabit && "cursor-pointer",
+        isHabit && "cursor-grab active:cursor-grabbing",
         !color && (isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100"),
       )}
-      style={{ top, height, ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
-      title={ev.title}
+      style={{ top: top + dragDy, height, ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
+      title={isHabit ? `${ev.title} — drag to set your preferred time` : ev.title}
     >
       <div className="flex items-center gap-1">
         <span className="truncate flex-1">{ev.title}</span>

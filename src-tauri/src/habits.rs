@@ -276,6 +276,7 @@ mod tests {
             duration_minutes: 30,
             archived: false,
             created_at: format!("{created}T08:00:00"),
+            preferred_minute: None,
         }
     }
     fn weekly(created: &str, days: &[u8]) -> Habit {
@@ -294,6 +295,7 @@ mod tests {
         duration_minutes: 30,
         archived: false,
         created_at: "2025-01-01T08:00:00".into(),
+        preferred_minute: None,
     };
 
     fn days(today: NaiveDate, offsets: &[i64]) -> HashSet<NaiveDate> {

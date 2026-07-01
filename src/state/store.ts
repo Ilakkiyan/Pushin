@@ -132,6 +132,7 @@ interface State {
   deleteEvent: (id: number) => Promise<void>;
   moveBlock: (id: number, start: string, end: string) => Promise<void>;
   unlockBlock: (id: number, start: string, end: string) => Promise<void>;
+  moveHabit: (eventId: number, newStart: string) => Promise<void>;
   reschedule: () => Promise<void>;
   saveSettings: (s: Settings) => Promise<void>;
   createBooking: (eventTypeId: number, name: string, email: string, start: string, end: string) => Promise<void>;
@@ -295,6 +296,7 @@ export const useStore = create<State>((set, get) => {
     deleteEvent: (id) => mutate(() => api.deleteEvent(id)),
     moveBlock: (id, start, end) => mutate(() => api.lockBlock(id, true, start, end)),
     unlockBlock: (id, start, end) => mutate(() => api.lockBlock(id, false, start, end)),
+    moveHabit: (eventId, newStart) => mutate(() => api.moveHabit(eventId, newStart)),
     reschedule: () => mutate(() => api.reschedule()),
     createBooking: (eventTypeId, name, email, start, end) =>
       mutate(() => api.createBooking(eventTypeId, name, email, start, end)),

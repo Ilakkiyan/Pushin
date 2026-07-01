@@ -30,7 +30,7 @@ export default function WelcomeBack({ onEnter }: { onEnter: (text?: string) => v
   const hasAgenda = !!briefing && (briefing.events.length > 0 || briefing.dueTasks.length > 0);
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[var(--bg)] px-6 welcome-in">
+    <div data-tauri-drag-region className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[var(--bg)] px-6 welcome-in">
       <div className="w-full max-w-xl">
         <div className="wordmark mb-12 text-center text-xl text-gray-400/80" style={{ letterSpacing: "0.34em" }}>
           Pushin

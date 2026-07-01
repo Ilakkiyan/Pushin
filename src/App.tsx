@@ -88,7 +88,7 @@ export default function App() {
   const activeModelId = useStore((s) => s.settings?.modelId);
   const aiLoading =
     splashDone && !aiBootDone ? (
-      <div className="fade-in fixed inset-0 z-[110] grid place-items-center bg-[#1f1f1f]">
+      <div data-tauri-drag-region className="fade-in fixed inset-0 z-[110] grid place-items-center bg-[#1f1f1f]">
         <Loader2 className="size-7 animate-spin text-gray-500" />
       </div>
     ) : null;

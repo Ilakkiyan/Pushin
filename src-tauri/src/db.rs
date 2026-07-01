@@ -22,6 +22,7 @@ const MIGRATION_0012: &str = include_str!("../migrations/0012_context_index.sql"
 const MIGRATION_0013: &str = include_str!("../migrations/0013_people.sql");
 const MIGRATION_0014: &str = include_str!("../migrations/0014_focus_sessions.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_vault_files.sql");
+const MIGRATION_0017: &str = include_str!("../migrations/0017_habit_preferred_time.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -101,6 +102,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // Two-way markdown vault: notes.rel_path (page → file mapping).
         conn.execute_batch(MIGRATION_0016)?;
         conn.pragma_update(None, "user_version", 16)?;
+    }
+    if version < 17 {
+        // A habit's learned preferred time-of-day (drag a habit on the calendar to teach it).
+        conn.execute_batch(MIGRATION_0017)?;
+        conn.pragma_update(None, "user_version", 17)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -598,6 +604,7 @@ fn row_to_habit(r: &Row) -> rusqlite::Result<Habit> {
         duration_minutes: r.get("duration_minutes")?,
         archived: r.get::<_, i64>("archived")? != 0,
         created_at: r.get("created_at")?,
+        preferred_minute: r.get::<_, Option<i64>>("preferred_minute").unwrap_or(None),
     })
 }
 
@@ -623,6 +630,12 @@ pub fn update_habit(conn: &Connection, id: i64, name: &str, color: &str, cadence
         "UPDATE habits SET name = ?2, color = ?3, cadence = ?4, days = ?5, interval_days = ?6, duration_minutes = ?7 WHERE id = ?1",
         params![id, name, color, cadence, days_to_csv(days), interval_days.max(1), duration_minutes],
     )?;
+    Ok(())
+}
+
+/// Set (or clear) a habit's learned preferred time-of-day, in minutes since midnight.
+pub fn set_habit_preferred_minute(conn: &Connection, id: i64, minute: Option<i64>) -> Result<()> {
+    conn.execute("UPDATE habits SET preferred_minute = ?2 WHERE id = ?1", params![id, minute])?;
     Ok(())
 }
 

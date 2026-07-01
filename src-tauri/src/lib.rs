@@ -128,6 +128,7 @@ pub fn run() {
             commands::delete_habit,
             commands::schedule_habit,
             commands::set_habit_scheduled,
+            commands::move_habit,
             commands::hermes_add_note,
             commands::hermes_recall,
             commands::ensure_embeddings,

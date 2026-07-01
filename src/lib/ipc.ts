@@ -440,6 +440,8 @@ export const api = {
   toggleHabit: (id: number, day: string | null) => invoke<HabitStats[]>("toggle_habit", { id, day }),
   deleteHabit: (id: number) => invoke<HabitStats[]>("delete_habit", { id }),
   scheduleHabit: (id: number, day: string | null) => invoke<ScheduleResult>("schedule_habit", { id, day }),
+  // Drag a habit block on the calendar → move this occurrence, learn its preferred time, re-place future ones.
+  moveHabit: (eventId: number, newStart: string) => invoke<ScheduleResult>("move_habit", { eventId, newStart }),
 
   // Hermes (memory layer): save a durable fact + semantic recall over the vault.
   hermesAddNote: (content: string) => invoke<void>("hermes_add_note", { content }),

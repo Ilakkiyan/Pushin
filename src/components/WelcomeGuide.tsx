@@ -113,7 +113,7 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-[var(--bg)] welcome-in">
+    <div data-tauri-drag-region className="fixed inset-0 z-50 flex flex-col bg-[var(--bg)] welcome-in">
       {/* header: wordmark · progress · skip */}
       <div className="flex shrink-0 items-center justify-between px-8 pt-8">
         <div className="wordmark text-sm text-gray-500" style={{ letterSpacing: "0.3em" }}>
