@@ -11,6 +11,10 @@ Examples:
 
 Pushin sends the request to the local model, stores the structured result in SQLite, then re-runs the scheduler.
 
+## Follow-up questions
+
+When a request is vague — a big deliverable with no duration, or something Pushin would otherwise have to guess at — it **asks a follow-up** ("how long?", "want me to break it into steps?") instead of fabricating tasks, subtasks, or busywork. Clear requests ("dentist Friday 2pm") are scheduled straight away.
+
 ## Memory and Labels
 
 Pushin can recall relevant vault notes while planning. If it notices a durable fact or a likely label, it offers a confirmation chip before saving anything.

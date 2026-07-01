@@ -59,7 +59,9 @@ Rust core
 - `commands.rs` — the IPC surface. **Never hold the DB `Mutex<Connection>` across an `.await`** (async commands must stay `Send`); use short scoped lock blocks.
 - `model.rs` — `Settings`, `Event`, `Block`, `Task`, `GoogleAccount`, plus `Person`, `FocusSession`,
   `EntityKind`/`ContextItem` (Context Engine), `Briefing`, `MeetingBrief`/`AttendeeBrief`, etc.
-- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0015_sync`). `0008`
+- `db.rs` — all SQL. Migrations are `user_version`-gated (`0001_init` … `0017`; `0016` adds
+  `notes.rel_path` for the two-way file vault, `0017` adds **`habits.preferred_minute`** — the learned
+  habit time-of-day, sync-safe since 0015's change-capture reads columns dynamically). `0008`
   evolves `notes` into vault pages + adds `page_links`; `0009` adds `daily_date`, `entity_links`
   (page ↔ task/event), an `inbox` flag; `0010` adds `labels` + polymorphic `entity_labels`; `0011`
   makes booking public (slug/share_token/enabled + booking `event_id`); `0012` adds **`entity_index`**
@@ -192,6 +194,24 @@ Rust core
     turn — but **only when that event has an explicit user start time** (a real block), so a
     duration-only "study ~3h" task survives. Gated on `plan.events[].start_time`; unit-tested in
     `parser`/`db` + the `dedup` llm_eval category.
+
+13. **Fabrication guards (v0.6.5, `apply_recovery`, all deterministic + unit-tested).** Even the 7B
+    run-to-run fabricates. Three tightly-gated recovery passes fix the common failures — **judge each
+    against the live model, they're conservative on purpose:**
+    - `promote_timed_work_to_block` — "work on X **from A–B**" (a work phrase + exactly one clock range,
+      no edit verb) must become ONE fixed block: promote a lone floating task to a block at the range, or
+      drop the redundant sibling task the model also emits (matched by a shared significant word, so
+      "Work on ACC HW" ↔ "Work on acc stuff" dedupe even though titles diverge), and clear any spurious
+      event edit. Kills the "task drifts to 9am" + "spuriously edited a similarly-named event" failures.
+    - `collapse_unrequested_decomposition` — a single deliverable with NO list/breakdown cue ("get the
+      MIT Hacks application done by Friday") must not explode into a fabricated multi-subtask project:
+      collapse 2+ subtasks to one task (keep the deadline), drop fabricated "… done"/deadline **marker
+      events** (`is_deadline_marker`, spares a real "Meeting with Bob"), and **ask a follow-up** ("break
+      into steps? how long?"). Any comma / " and " / breakdown keyword keeps the model's decomposition.
+    - `drop_unrequested_prep_tasks` — mentioning an activity ("going to the temple Saturday") shouldn't
+      spawn a "Prepare for Temple visit" task; dropped unless the user actually said prepare/prep/get-ready.
+    The follow-up clarifications survive `filter_clarifications` (they have a '?' and no created-event
+    title words). This is the "ask, don't guess" behavior the user asked for.
 
 ## Google Calendar sync (`calendar/google.rs`)
 - **OAuth2 + PKCE via system browser + loopback `TcpListener`** (Desktop client → no redirect URI to
@@ -455,7 +475,34 @@ always sees the right slice of the user's data. Full plan: `CONTEXT_ENGINE_PLAN.
 - `bin/llama-server` (+ dylibs) — auto-downloaded llama.cpp engine
 - `pushin.db` — SQLite (tasks, events, blocks, settings, Google tokens)
 
-## Current status (released **v0.6.2**; tagged on GitHub, `release.yml` builds installers for all platforms)
+## Current status (released **v0.6.5**; tagged on GitHub, `release.yml` builds installers for all platforms)
+- **NEW in v0.6.5 (planning accuracy + boot + draggable habits + polish):**
+  - **Planning accuracy (deterministic parser-recovery guards, `parser.rs::apply_recovery`):** the AI now
+    **asks follow-up questions instead of fabricating**. `promote_timed_work_to_block` ("work on X from
+    A–B" → exactly one fixed block, never a 9am-drifting task; drops the redundant sibling task even when
+    titles diverge), `collapse_unrequested_decomposition` (a lone deliverable isn't exploded into a
+    fabricated multi-subtask project — collapse to one task, drop fake "… done" deadline-marker events, and
+    ask how to break it down), and `drop_unrequested_prep_tasks` (no fabricated "Prepare for X" busywork
+    unless the user said prepare). All conservative/gated + unit-tested; live-verified on the 7B.
+  - **AI-ready at boot:** the **opening splash doubles as the loading screen** — `OpeningAnimation` takes a
+    `ready` prop and HOLDS (spinner) until the on-device model is loaded into memory, so the app never
+    flashes the calendar or a "Start the AI" card before the AI is up (the model check runs while the
+    splash is up). Inference **auto-starts** after a download (`InferenceSetup`). New **hardware→model
+    recommendation** (`model_manager::recommend_model` — dep-free per-OS RAM probe + the CUDA GPU probe →
+    3B/7B/14B suggestion + a "For your machine" badge in the setup card).
+  - **Draggable habits + learned time (migration `0017`, `habits.preferred_minute`):** drag a habit block
+    on the calendar to move that occurrence; `move_habit` records the preferred time-of-day, which
+    `place_habit_on_day` honors (a SOFT preference) for FUTURE scheduling — **without** disturbing
+    occurrences already on the calendar. Double-click a habit → Habits page (no longer the busy-time dialog).
+  - **Re-plan stability (`schedule_service::reschedule_inner`):** adding/changing a task keeps existing
+    unlocked future blocks put — they're handed to the scheduler as extra "locked" intervals (so new work
+    plans around them + dependency timing still holds), then re-emitted — instead of re-packing the whole
+    calendar. Unit-tested; **no scheduler-internals change** (its tests are untouched).
+  - **Polish:** brutalist **pushpin app icon** (regenerated all sizes via `tauri icon`); harder charcoal +
+    2px-outline styling; opening screens are a **draggable window** (`data-tauri-drag-region`); graph nodes
+    stop replaying their entrance animation (memoized `graphData`); legend popover `fixed`-positioned z-fix;
+    focus outline scoped off text inputs; thinner calendar selection ring; dev replays the full opening
+    sequence each launch (`import.meta.env.DEV`).
 - **Working — shell + UX (v0.6.x):** full **grey-minimalist charcoal redesign** (`@theme` accent remap +
   Saira wide **wordmark**), **opening animation** → returning-user **WelcomeBack** / new-user
   **WelcomeGuide**, a **"What's new"** post-update intro (shown once per version bump), premium-but-fast
