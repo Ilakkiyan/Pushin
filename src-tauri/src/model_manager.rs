@@ -250,6 +250,61 @@ fn prefer_cuda() -> bool {
     cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
+/// A hardware-based model recommendation for the setup card.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRecommendation {
+    pub model_id: String,
+    pub reason: String,
+    pub ram_gb: Option<f64>,
+    pub has_gpu: bool,
+}
+
+/// Best-effort total physical RAM in GB — dep-free, shelling out per-OS like the GPU probe (keeps the
+/// build lean + cross-compile-safe). `None` when undeterminable (or on mobile, which is companion-only).
+fn total_ram_gb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+        let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        return Some(kb / 1024.0 / 1024.0);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+        let bytes: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        return Some(bytes / 1_073_741_824.0);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let out = cmd.output().ok()?;
+        let bytes: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        return Some(bytes / 1_073_741_824.0);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Recommend a model for this machine from its RAM (and whether a CUDA GPU is present) — the model
+/// must fit comfortably in RAM. Falls back to the balanced 7B when RAM can't be read.
+pub fn recommend_model() -> ModelRecommendation {
+    let ram = total_ram_gb();
+    let gpu = prefer_cuda();
+    let (model, why): (&ModelInfo, String) = match ram {
+        Some(g) if g >= 15.0 => (&MODELS[2], format!("{g:.0} GB RAM comfortably fits the 14B")),
+        Some(g) if g >= 8.0 => (&MODELS[1], format!("{g:.0} GB RAM is a good match for the 7B")),
+        Some(g) => (&MODELS[0], format!("{g:.0} GB RAM — the light 3B is the safe pick")),
+        None => (&MODELS[1], "a balanced default".to_string()),
+    };
+    let reason = if gpu { format!("{why}, plus a GPU for acceleration") } else { why };
+    ModelRecommendation { model_id: model.id.to_string(), reason, ram_gb: ram, has_gpu: gpu }
+}
+
 /// CUDA release-asset substrings for this platform (None where there's no prebuilt CUDA engine).
 /// cu12.4 over cu13 on purpose: it runs on more drivers and handles Blackwell (sm_120) via PTX JIT,
 /// whereas cu13 needs a very recent driver (>=580). Linux CUDA prebuilt naming is unsettled → CPU there.

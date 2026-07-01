@@ -780,6 +780,12 @@ pub fn model_present(app: AppHandle, id: String) -> bool {
     model_manager::is_model_present(&app, &id)
 }
 
+/// Recommend a model based on the machine's RAM + GPU (shown in the setup card).
+#[tauri::command]
+pub fn recommend_model() -> model_manager::ModelRecommendation {
+    model_manager::recommend_model()
+}
+
 #[tauri::command]
 pub async fn download_model(app: AppHandle, state: State<'_, AppState>, id: String, sha256: Option<String>) -> Result<String, String> {
     let client = state.http.clone();

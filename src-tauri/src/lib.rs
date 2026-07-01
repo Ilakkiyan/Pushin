@@ -184,6 +184,7 @@ pub fn run() {
             commands::llm_status,
             commands::list_models,
             commands::model_present,
+            commands::recommend_model,
             commands::download_model,
             commands::ensure_inference,
             commands::sync_status,

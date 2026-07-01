@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Cpu, Download, Loader2, Plug, ShieldCheck } from "lucide-react";
+import { Check, Cpu, Download, Loader2, Plug, ShieldCheck, Sparkles } from "lucide-react";
 import clsx from "clsx";
-import { api } from "../lib/ipc";
+import { api, type ModelRecommendation } from "../lib/ipc";
 import { useStore } from "../state/store";
 
 interface Progress {
@@ -20,6 +20,12 @@ export default function InferenceSetup() {
   const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [downloading, setDownloading] = useState<string | null>(null);
   const [present, setPresent] = useState<Record<string, boolean>>({});
+  const [rec, setRec] = useState<ModelRecommendation | null>(null);
+
+  // Recommend a model from the machine's RAM + GPU (best-effort; hidden if it can't be read).
+  useEffect(() => {
+    api.recommendModel().then(setRec).catch(() => {});
+  }, []);
 
   const models = llm?.models ?? [];
 
@@ -102,6 +108,13 @@ export default function InferenceSetup() {
         <ShieldCheck className="size-3.5 text-emerald-400" /> Offline &amp; private · server: {llm?.baseUrl}
       </div>
 
+      {rec && (
+        <div className="flex items-start gap-2 rounded-lg border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1.5 text-[11px] text-indigo-200/90">
+          <Sparkles className="mt-0.5 size-3.5 shrink-0 text-indigo-300" />
+          <span>Suggested for your machine — {rec.reason}.</span>
+        </div>
+      )}
+
       <div className="space-y-2">
         {models.map((m) => {
           const p = progress[m.id];
@@ -116,6 +129,11 @@ export default function InferenceSetup() {
                   <div className="text-sm flex items-center gap-2">
                     {m.name}
                     {isPresent && isActive && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">active</span>}
+                    {rec?.modelId === m.id && (
+                      <span className="inline-flex items-center gap-1 rounded bg-indigo-500/20 px-1.5 py-0.5 text-[10px] text-indigo-300">
+                        <Sparkles className="size-2.5" /> For your machine
+                      </span>
+                    )}
                   </div>
                   <div className="text-[11px] text-gray-500">~{Math.round(m.sizeMb / 10) / 100} GB · {m.note}</div>
                 </div>

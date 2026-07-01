@@ -235,6 +235,13 @@ export interface LlmStatus {
   models: ModelInfo[];
 }
 
+export interface ModelRecommendation {
+  modelId: string;
+  reason: string; // e.g. "16 GB RAM is a good match for the 7B, plus a GPU for acceleration"
+  ramGb: number | null;
+  hasGpu: boolean;
+}
+
 export interface BookingSlot {
   start: string;
   end: string;
@@ -517,6 +524,7 @@ export const api = {
   llmStatus: () => invoke<LlmStatus>("llm_status"),
   listModels: () => invoke<ModelInfo[]>("list_models"),
   modelPresent: (id: string) => invoke<boolean>("model_present", { id }),
+  recommendModel: () => invoke<ModelRecommendation>("recommend_model"),
   downloadModel: (id: string, sha256?: string) => invoke<string>("download_model", { id, sha256: sha256 ?? null }),
   ensureInference: () => invoke<string>("ensure_inference"),
   // Hermes: auto-download the embedding model + start the embeddings server (idempotent).
