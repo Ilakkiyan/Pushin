@@ -204,6 +204,13 @@ textarea:focus-visible,
 .splash--out .splash__mark {
   animation: splashOut 420ms cubic-bezier(0.4, 0, 1, 1) both;
 }
+/* Loading spinner shown on the splash while it waits for the on-device model to load. */
+.splash__loading {
+  position: absolute;
+  bottom: 16%;
+  color: rgba(255, 255, 255, 0.35);
+  animation: fadeIn 400ms var(--ease-out) both;
+}
 @keyframes splashIn {
   0% {
     opacity: 0;

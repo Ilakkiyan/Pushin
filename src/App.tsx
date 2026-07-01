@@ -30,7 +30,6 @@ import { useHotkeys } from "./lib/useHotkeys";
 import { applyVaultChange } from "./lib/vaultImport";
 import { api, type VaultChange } from "./lib/ipc";
 import { getVersion } from "@tauri-apps/api/app";
-import { Loader2 } from "lucide-react";
 
 export default function App() {
   const loaded = useStore((s) => s.loaded);
@@ -41,7 +40,14 @@ export default function App() {
   const onboarded = useStore((s) => s.settings?.onboarded ?? true);
   const isMobile = useIsMobile();
   const [splashDone, setSplashDone] = useState(false);
-  const splash = splashDone ? null : <OpeningAnimation onDone={() => setSplashDone(true)} />;
+  // AI boot gate: the opening splash doubles as the loading screen — it holds (showing a spinner) until
+  // the on-device model is loaded into memory, so the app never flashes before the AI is ready. Resolves
+  // immediately when no model is downloaded yet (first run → the setup card) and in tests. Model checks
+  // run while the splash is up (the effect below).
+  const [aiBootDone, setAiBootDone] = useState(import.meta.env.MODE === "test");
+  const llmReachable = useStore((s) => s.llm?.reachable ?? false);
+  const activeModelId = useStore((s) => s.settings?.modelId);
+  const splash = splashDone ? null : <OpeningAnimation ready={aiBootDone} onDone={() => setSplashDone(true)} />;
   // The returning-user "welcome back" landing shows after the splash until the user enters the app.
   // Skipped in unit tests; `?enter=1` skips it for inner-app screenshots.
   const [entered, setEntered] = useState(() => {
@@ -78,20 +84,6 @@ export default function App() {
   // Cover the brief window between the splash clearing and the version check resolving, so the app
   // never flashes behind the (about-to-appear) "what's new" intro.
   const bootCover = splashDone && !versionChecked ? <div className="fixed inset-0 z-[55] bg-[var(--bg)]" /> : null;
-
-  // AI boot gate: after the opening logo, hold a loading screen until the on-device model is loaded
-  // into memory, so the app opens AI-ready instead of flashing a "Start the AI" card / failing the
-  // first prompt. Resolves on `llm.reachable` (server up = model loaded); skipped when no model is
-  // downloaded yet (first run → the setup card handles the download) and in tests.
-  const [aiBootDone, setAiBootDone] = useState(import.meta.env.MODE === "test");
-  const llmReachable = useStore((s) => s.llm?.reachable ?? false);
-  const activeModelId = useStore((s) => s.settings?.modelId);
-  const aiLoading =
-    splashDone && !aiBootDone ? (
-      <div data-tauri-drag-region className="fade-in fixed inset-0 z-[110] grid place-items-center bg-[#1f1f1f]">
-        <Loader2 className="size-7 animate-spin text-gray-500" />
-      </div>
-    ) : null;
 
   useHotkeys(); // global "g then key" navigation
 
@@ -186,7 +178,6 @@ export default function App() {
     <div className="h-full flex flex-col">
       {splash}
       {bootCover}
-      {aiLoading}
       {guide}
       {welcome}
       {whatsNewEl}
