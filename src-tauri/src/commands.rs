@@ -212,6 +212,23 @@ pub async fn plan_tasks(
 
     let mut conn = state.db.lock().unwrap();
     let mut outcome = parser::store_plan(&conn, &settings, &parsed).map_err(err)?;
+    // A habit the user just described in chat should land ON the calendar, not merely sit in the Habits
+    // list. Auto-schedule each newly-created habit across the planning horizon before re-planning tasks.
+    if !outcome.created_habit_names.is_empty() {
+        let now = Local::now().naive_local();
+        let horizon = settings.horizon_days.max(1);
+        let habits = db::list_habits(&conn).map_err(err)?;
+        for name in &outcome.created_habit_names {
+            if let Some(habit) = habits.iter().find(|h| &h.name == name) {
+                for off in 0..horizon {
+                    let day = now.date() + Duration::days(off);
+                    if habits::is_due(habit, day) {
+                        let _ = place_habit_on_day(&conn, habit, day, now); // best-effort; skip full days
+                    }
+                }
+            }
+        }
+    }
     reschedule_inner(&mut conn, &settings).map_err(err)?;
     outcome.recalled_notes = recalled;
     Ok(outcome)
@@ -1456,6 +1473,12 @@ pub async fn route_intent(state: State<'_, AppState>, message: String) -> Result
     if message.is_empty() {
         return Ok("chat".into());
     }
+    // Deterministic override: a message that references WHEN (a day/clock time) AND expresses intent to
+    // DO/schedule something clearly belongs to the planner — so the (chat-biased) classifier can't send
+    // "I'm going to temple on Saturday" to conversation. Only ever forces PLAN, so genuine chat is safe.
+    if has_scheduling_cue(&message) {
+        return Ok("plan".into());
+    }
     let settings = {
         let conn = state.db.lock().unwrap();
         db::get_settings(&conn).map_err(err)?
@@ -1478,6 +1501,43 @@ or anything else, answer \"chat\". When unsure, prefer \"chat\".";
         .await
         .map_err(err)?;
     Ok(if raw["intent"].as_str() == Some("plan") { "plan".to_string() } else { "chat".to_string() })
+}
+
+/// A message that references WHEN (a day or clock time) AND expresses intent to DO/schedule something
+/// — a cheap, high-precision signal it's a planning request. Used to override the chat-biased router.
+fn has_scheduling_cue(msg: &str) -> bool {
+    let lc = msg.to_lowercase();
+    const WHEN: &[&str] = &[
+        "today", "tonight", "tomorrow", "tmr", "tmrw", "this weekend", "next week", "this week", "monday", "tuesday",
+        "wednesday", "thursday", "friday", "saturday", "sunday", "o'clock", "noon", "midnight",
+    ];
+    const DO: &[&str] = &[
+        "going to", "i have", "i've got", "ive got", "i need to", "i want to", "i'll", "i will", "schedule", "add ",
+        "remind me", "book ", "meeting", "appointment", "deadline", "due ", "every day", "every week", "daily", "weekly",
+    ];
+    let has_when = WHEN.iter().any(|w| lc.contains(w)) || has_clock_time(&lc);
+    let has_do = DO.iter().any(|w| lc.contains(w));
+    has_when && has_do
+}
+
+/// A clock time in free text: "3pm", "3 pm", "10:30".
+fn has_clock_time(lc: &str) -> bool {
+    let b = lc.as_bytes();
+    for i in 0..b.len() {
+        if b[i].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j] == b' ' {
+                j += 1;
+            }
+            if lc[j..].starts_with("pm") || lc[j..].starts_with("am") {
+                return true;
+            }
+            if i + 2 < b.len() && b[i + 1] == b':' && b[i + 2].is_ascii_digit() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Keyword auto-label suggestions for an entity: existing labels whose name appears in the entity's

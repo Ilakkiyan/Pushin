@@ -516,6 +516,29 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     route_recurring_to_habits(plan, user_text);
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
+    suppress_clarifications_when_proceeding(plan, user_text);
+}
+
+/// **Don't pester once the user says go.** A short, clearly-affirmative reply ("schedule it", "just do
+/// it", "yes", "go ahead") means proceed — drop any lingering model clarifications so the AI acts
+/// instead of asking yet another question. (`store_plan`'s own "I couldn't place X" clarifications come
+/// through a separate channel and still surface.)
+fn suppress_clarifications_when_proceeding(plan: &mut ParsedPlan, text: &str) {
+    if plan.clarifications.is_empty() {
+        return;
+    }
+    let lc = text.trim().to_lowercase();
+    let words: Vec<String> = lc.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect();
+    if words.len() > 6 {
+        return; // a longer message is providing detail, not just saying "go"
+    }
+    // Multi-word "proceed" phrases (substring is safe here).
+    const GO_PHRASES: &[&str] = &["schedule it", "schedule them", "just do it", "do it", "go ahead", "sounds good", "make it happen", "add it", "add them", "plan it"];
+    // Single-word affirmatives — matched as whole WORDS so "ok" doesn't fire inside "book".
+    const GO_WORDS: &[&str] = &["yes", "yep", "yeah", "yup", "sure", "ok", "okay"];
+    if GO_PHRASES.iter().any(|g| lc.contains(g)) || words.iter().any(|w| GO_WORDS.contains(&w.as_str())) {
+        plan.clarifications.clear();
+    }
 }
 
 /// **Few-shot leakage guard.** The static prompt examples include a "Blog → Pick platform / Write
@@ -2739,6 +2762,17 @@ fn asks_placed_property(c_lc: &str) -> bool {
         || c_lc.contains("length")
         || c_lc.contains("this event")
         || c_lc.contains("the event")
+        // Vague "what should I do" follow-ups — once items are on the calendar, re-asking these is noise
+        // (fat-list #2: it kept asking "what would you like me to do with the events?" after scheduling
+        // them). Kept generic (no event name) so a real "what time is the dentist?" for an UNtouched
+        // event still gets through. The "schedule it" → "what times?" loop is caught upstream by the
+        // affirmative suppressor in `apply_recovery`.
+        || c_lc.contains("what would you like me to do")
+        || c_lc.contains("should i schedule")
+        || c_lc.contains("want me to schedule")
+        || c_lc.contains("like me to schedule")
+        || c_lc.contains("do with the events")
+        || c_lc.contains("do with these")
 }
 
 /// A question quibbling over the recurrence we already resolved by making it a daily habit
@@ -3019,7 +3053,14 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
             continue;
         }
         match resolve_event(now, ev) {
-            Some((start, end)) => {
+            Some((mut start, mut end)) => {
+                // No past scheduling: if a timed event resolved to a moment already gone (the model
+                // mis-dated it — e.g. "today 1pm" when it's already the evening), bump it to the next
+                // day at the same time so it lands somewhere the user can actually act on it.
+                while start < now {
+                    start += Duration::days(1);
+                    end += Duration::days(1);
+                }
                 let (s, e) = (fmt_dt(start), fmt_dt(end));
                 let id = crate::db::insert_event(conn, &ev.title, &s, &e, "fixed")?;
                 created_event_ids.push(id);
@@ -4515,5 +4556,23 @@ mod tests {
         let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
         apply_recovery(&mut plan, "help me prepare for the exam", d());
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "explicit prep kept");
+    }
+
+    #[test]
+    fn affirmative_reply_clears_clarifications() {
+        let mut plan = ParsedPlan { clarifications: vec!["What time?".into()], ..Default::default() };
+        apply_recovery(&mut plan, "uh schedule it", d());
+        assert!(plan.clarifications.is_empty(), "an affirmative reply → stop asking");
+        let mut plan2 = ParsedPlan { clarifications: vec!["Which day?".into()], ..Default::default() };
+        apply_recovery(&mut plan2, "yes", d());
+        assert!(plan2.clarifications.is_empty());
+    }
+
+    #[test]
+    fn normal_request_keeps_its_clarification() {
+        // "book a table" contains "ok" inside "book" — it must NOT read as an affirmative "ok".
+        let mut plan = ParsedPlan { clarifications: vec!["What time for the table?".into()], ..Default::default() };
+        apply_recovery(&mut plan, "book a table", d());
+        assert_eq!(plan.clarifications.len(), 1, "not an affirmative; the clarification is kept");
     }
 }
