@@ -120,6 +120,16 @@ fn default_interval_days() -> i64 {
     1
 }
 
+/// An AI-tracked memory fact (from the chat "Remember this?" chip). Kept out of the user's vault tree
+/// and surfaced in Settings ▸ AI Memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Memory {
+    pub id: i64,
+    pub content: String,
+    pub created_at: String,
+}
+
 /// One day in a habit's history (for the consistency heatmap). `day` is "YYYY-MM-DD".
 /// `due` = the habit was expected that day (per its cadence); `done` = it was completed.
 #[derive(Debug, Clone, Serialize, Deserialize)]

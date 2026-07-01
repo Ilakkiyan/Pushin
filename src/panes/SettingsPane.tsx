@@ -10,6 +10,7 @@ import { api, type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
 import { exportAllPages } from "../lib/vaultExport";
 import { AboutYou, CommitmentList, SleepFields } from "../components/Personalization";
+import AiMemory from "../components/AiMemory";
 import DevicesSync from "../components/DevicesSync";
 
 const REPO_URL = "https://github.com/Ilakkiyan/Pushin";
@@ -197,6 +198,8 @@ export default function SettingsPane() {
           </p>
           <AboutYou archetypes={form.archetypes ?? []} aboutMe={form.aboutMe ?? ""} onChange={update} />
         </section>
+
+        <AiMemory />
 
         {/* Working hours */}
         <section className="space-y-4">

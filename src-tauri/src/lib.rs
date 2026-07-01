@@ -131,6 +131,8 @@ pub fn run() {
             commands::move_habit,
             commands::hermes_add_note,
             commands::hermes_recall,
+            commands::list_memories,
+            commands::delete_memory,
             commands::ensure_embeddings,
             commands::list_pages,
             commands::get_page,

@@ -23,6 +23,7 @@ const MIGRATION_0013: &str = include_str!("../migrations/0013_people.sql");
 const MIGRATION_0014: &str = include_str!("../migrations/0014_focus_sessions.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_vault_files.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_habit_preferred_time.sql");
+const MIGRATION_0018: &str = include_str!("../migrations/0018_note_origin.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -107,6 +108,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // A habit's learned preferred time-of-day (drag a habit on the calendar to teach it).
         conn.execute_batch(MIGRATION_0017)?;
         conn.pragma_update(None, "user_version", 17)?;
+    }
+    if version < 18 {
+        // notes.origin — separates AI memory facts from user vault pages.
+        conn.execute_batch(MIGRATION_0018)?;
+        conn.pragma_update(None, "user_version", 18)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -820,6 +826,33 @@ pub fn insert_note(conn: &Connection, content: &str, embedding: Option<&[u8]>, m
     Ok(conn.last_insert_rowid())
 }
 
+/// Save a durable AI-memory fact — like `insert_note` but tagged `origin='memory'`, so it stays OUT of
+/// the user's vault tree (shown in Settings ▸ AI Memory instead) while still feeding on-device recall.
+pub fn insert_memory(conn: &Connection, content: &str, embedding: Option<&[u8]>, model: Option<&str>) -> Result<i64> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO notes(content, embedding, embedding_model, origin, created_at, updated_at)
+         VALUES(?1, ?2, ?3, 'memory', ?4, ?4)",
+        params![content, embedding, model, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// AI-memory facts (origin='memory'), newest first — for the Settings ▸ AI Memory list.
+pub fn list_memories(conn: &Connection) -> Result<Vec<crate::model::Memory>> {
+    let mut stmt = conn.prepare("SELECT id, content, created_at FROM notes WHERE origin = 'memory' ORDER BY created_at DESC")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(crate::model::Memory { id: r.get("id")?, content: r.get("content")?, created_at: r.get("created_at")? })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Delete an AI-memory fact — guarded to `origin='memory'` so a stray id can't nuke a real vault page.
+pub fn delete_memory(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM notes WHERE id = ?1 AND origin = 'memory'", params![id])?;
+    Ok(())
+}
+
 pub fn delete_note(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
@@ -1202,7 +1235,7 @@ pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
-         FROM notes WHERE archived = 0 ORDER BY sort_order, created_at",
+         FROM notes WHERE archived = 0 AND (origin IS NULL OR origin != 'memory') ORDER BY sort_order, created_at",
     )?;
     let rows = stmt.query_map([], |r| {
         let indexed: bool = r.get::<_, i64>("indexed")? != 0;

@@ -882,8 +882,24 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
         hermes::embed_text(&state.http, &base, &model, &content).await.ok().map(|v| hermes::vec_to_blob(&v))
     };
     let conn = state.db.lock().unwrap();
-    db::insert_note(&conn, &content, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
+    // Stored as a MEMORY (origin='memory'), not a user vault page — it stays out of the vault tree and
+    // shows in Settings ▸ AI Memory, but still feeds recall.
+    db::insert_memory(&conn, &content, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
     Ok(())
+}
+
+/// The AI-tracked memory facts (from the chat "Remember this?" chip), newest first — for Settings.
+#[tauri::command]
+pub fn list_memories(state: State<AppState>) -> Result<Vec<crate::model::Memory>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_memories(&conn).map_err(err)
+}
+
+/// Forget an AI-tracked memory fact.
+#[tauri::command]
+pub fn delete_memory(state: State<AppState>, id: i64) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    db::delete_memory(&conn, id).map_err(err)
 }
 
 /// Recall the notes most relevant to `query` (shared by the recall command, the planner's auto-recall,

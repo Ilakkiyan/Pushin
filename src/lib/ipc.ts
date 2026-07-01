@@ -242,6 +242,12 @@ export interface ModelRecommendation {
   hasGpu: boolean;
 }
 
+export interface Memory {
+  id: number;
+  content: string;
+  createdAt: string;
+}
+
 export interface BookingSlot {
   start: string;
   end: string;
@@ -453,6 +459,9 @@ export const api = {
   // Hermes (memory layer): save a durable fact + semantic recall over the vault.
   hermesAddNote: (content: string) => invoke<void>("hermes_add_note", { content }),
   hermesRecall: (query: string, k?: number) => invoke<RecallResult>("hermes_recall", { query, k: k ?? null }),
+  // AI memory facts (private backend store, shown in Settings ▸ AI Memory — not in the vault tree).
+  listMemories: () => invoke<Memory[]>("list_memories"),
+  deleteMemory: (id: number) => invoke<void>("delete_memory", { id }),
 
   // Vault pages (Notion-style documents + Obsidian-style links/graph)
   listPages: () => invoke<Page[]>("list_pages"),
