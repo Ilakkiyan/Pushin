@@ -8,6 +8,10 @@ export default defineConfig({
   lastUpdated: true,
   head: [
     ["link", { rel: "icon", href: "/Pushin/pushin-icon.png" }],
+    // The wide "Saira" wordmark that matches the app masthead.
+    ["link", { rel: "preconnect", href: "https://fonts.googleapis.com" }],
+    ["link", { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" }],
+    ["link", { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=Saira:wght@500;600;700&display=swap" }],
     ["meta", { property: "og:type", content: "website" }],
     ["meta", { property: "og:title", content: "Pushin Docs" }],
     ["meta", { property: "og:description", content: "Local-first AI planning, calendar, and notes documentation." }],

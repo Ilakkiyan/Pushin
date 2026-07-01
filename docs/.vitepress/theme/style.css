@@ -1,26 +1,101 @@
+/* ============================================================================
+   Pushin docs — themed to match the app: brutalist grey-charcoal.
+   Monochrome grey accents (no purple/blue), charcoal surfaces, SHARP corners, a
+   wide uppercase wordmark, and hard outlined blocks. Mirrors src/styles.css.
+   ============================================================================ */
 :root {
-  --vp-c-brand-1: #8b5cf6;
-  --vp-c-brand-2: #7c3aed;
-  --vp-c-brand-3: #6d28d9;
-  --vp-c-bg: #0b0d12;
-  --vp-c-bg-alt: #10131a;
-  --vp-c-bg-soft: #151923;
-  --vp-c-border: rgba(255, 255, 255, 0.11);
-  --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(120deg, #a78bfa, #22d3ee 45%, #34d399);
-  --vp-home-hero-image-background-image: radial-gradient(circle, rgba(139, 92, 246, 0.28), transparent 68%);
-  --vp-home-hero-image-filter: blur(38px);
+  /* Charcoal ramp — from the app (--bg #121212 / --surface #1c1c1c / --raised #282828). */
+  --vp-c-bg: #121212;
+  --vp-c-bg-alt: #171717;
+  --vp-c-bg-soft: #1c1c1c;
+  --vp-c-bg-elv: #1c1c1c;
+
+  /* Monochrome grey accent — links + active states read light, never coloured. */
+  --vp-c-brand-1: #e8e8e8;
+  --vp-c-brand-2: #bcbcbc;
+  --vp-c-brand-3: #8a8a8a;
+  --vp-c-brand-soft: rgba(255, 255, 255, 0.08);
+  --vp-c-brand-softer: rgba(255, 255, 255, 0.05);
+
+  /* Crisp hard borders (brutalist outlines). */
+  --vp-c-border: rgba(255, 255, 255, 0.18);
+  --vp-c-divider: rgba(255, 255, 255, 0.1);
+  --vp-c-gutter: #0c0c0c;
+
+  /* Hero wordmark — solid light, no gradient. */
+  --vp-home-hero-name-color: #f5f6f8;
+  --vp-home-hero-name-background: transparent;
+  --vp-home-hero-image-background-image: radial-gradient(circle, rgba(255, 255, 255, 0.05), transparent 70%);
+  --vp-home-hero-image-filter: blur(46px);
+
+  /* Primary buttons — white on dark, like the app's primary action. */
+  --vp-button-brand-border: transparent;
+  --vp-button-brand-text: #111111;
+  --vp-button-brand-bg: #f2f2f2;
+  --vp-button-brand-hover-border: transparent;
+  --vp-button-brand-hover-text: #000000;
+  --vp-button-brand-hover-bg: #ffffff;
+  --vp-button-brand-active-bg: #dedede;
+
+  --vp-code-block-bg: #171717;
 }
 
-.VPImage.logo {
-  border-radius: 8px;
+/* SHARP CORNERS — zero the radius on every surface (brutalist). */
+.VPButton,
+.VPFeature,
+.custom-block,
+.vp-doc div[class*="language-"],
+.vp-code-group,
+.VPHome .image img,
+.VPImage.logo,
+.DocSearch-Button,
+.VPNavBarSearch .DocSearch-Button,
+.vp-doc table,
+.vp-doc img,
+input,
+button,
+kbd {
+  border-radius: 0 !important;
 }
 
+/* The wide PUSHIN wordmark — Saira, uppercase, tracked (mirrors the app masthead). */
+.VPNavBarTitle .title,
+.VPHero .name {
+  font-family: "Saira", ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.VPNavBarTitle .title {
+  letter-spacing: 0.14em;
+}
+.VPHero .name {
+  letter-spacing: 0.16em;
+  font-stretch: 125%;
+}
+
+/* Hero image + feature cards read as hard outlined blocks with a blur-less offset shadow. */
 .VPHome .image img {
-  border-radius: 22px;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 8px 8px 0 rgba(0, 0, 0, 0.55);
+}
+.VPFeature {
+  border: 1px solid var(--vp-c-border);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.VPFeature:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+  background: rgba(255, 255, 255, 0.02);
 }
 
+/* Links: brutalist underline on hover. */
+.vp-doc a {
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+/* Tip block accent → grey. */
 .custom-block.tip {
-  border-color: rgba(52, 211, 153, 0.35);
+  border-color: rgba(255, 255, 255, 0.22);
 }
