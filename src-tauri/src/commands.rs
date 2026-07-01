@@ -570,14 +570,14 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
-/// Drag a habit block on the calendar: move THIS occurrence to `new_start`, learn it as the habit's
-/// preferred time-of-day, re-place its future occurrences there, and re-plan. The "AI learns what time
-/// you like to do each habit" — by watching where you drag it.
+/// Drag a habit block on the calendar: move THIS occurrence to `new_start` and learn it as the habit's
+/// preferred time-of-day, so FUTURE scheduling lands there — WITHOUT disturbing occurrences already on
+/// the calendar (new days get placed at the preferred time via `place_habit_on_day`). The "AI learns
+/// what time you like each habit" by watching where you drag it, non-destructively.
 #[tauri::command]
 pub fn move_habit(state: State<AppState>, event_id: i64, new_start: String) -> Result<ScheduleResult, String> {
     let mut conn = state.db.lock().unwrap();
     let settings = db::get_settings(&conn).map_err(err)?;
-    let now = Local::now().naive_local();
 
     let ev = db::list_events(&conn)
         .map_err(err)?
@@ -592,26 +592,11 @@ pub fn move_habit(state: State<AppState>, event_id: i64, new_start: String) -> R
         .ok_or_else(|| "habit not found".to_string())?;
     let end = start + Duration::minutes(habit.duration_minutes.max(1));
 
-    // Move this occurrence + learn the preferred time-of-day.
+    // Move just this occurrence + record the learned preferred time. Existing future occurrences stay
+    // exactly where they are; the preference only steers scheduling of days not yet placed.
     db::update_event(&conn, event_id, &ev.title, &scheduler::fmt_dt(start), &scheduler::fmt_dt(end)).map_err(err)?;
     let minute = start.hour() as i64 * 60 + start.minute() as i64;
     db::set_habit_preferred_minute(&conn, habit.id, Some(minute)).map_err(err)?;
-
-    // Re-place its FUTURE occurrences (after today) at the new preferred time.
-    let today = now.date();
-    for e in db::list_events(&conn).map_err(err)? {
-        if e.kind == "habit" && e.title == habit.name && e.id != event_id && scheduler::parse_dt(&e.start).map(|d| d.date() > today).unwrap_or(false) {
-            db::delete_event(&conn, e.id).map_err(err)?;
-        }
-    }
-    let updated = db::list_habits(&conn).map_err(err)?.into_iter().find(|h| h.id == habit.id).unwrap_or(habit);
-    let horizon = settings.horizon_days.max(1);
-    for off in 1..horizon {
-        let day = today + Duration::days(off);
-        if habits::is_due(&updated, day) {
-            place_habit_on_day(&conn, &updated, day, now).map_err(err)?;
-        }
-    }
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
