@@ -69,6 +69,18 @@ pub const MODELS: &[ModelInfo] = &[
         size_mb: 1841,
         note: "On-device fine-tune (Arch-Function-3B + Pushin SFT). Beats the vanilla 3B base on the eval battery at 3B size. Local build — place the .gguf in models/ manually; not yet hosted for download.",
     },
+    // Power tier: same fine-tune recipe on Arch-Function-Chat-7B (Qwen2.5-Coder-7B, function-calling +
+    // multi-turn chat). Scores ~93% on the eval battery — breaks the 3B's ~89% capacity ceiling — and the
+    // Chat base gives a richer deharnessed assistant for the dual-mode Chat pane. ~4.5 GB Q4, needs ~6 GB
+    // RAM. Locally produced (url empty; gated on file presence) — wire a real HF url to distribute.
+    ModelInfo {
+        id: "pushin-arch7b-chat-tuned-q4_k_m",
+        name: "Pushin 7B (tuned, experimental)",
+        filename: "pushin-arch7b-chat-tuned-q4_k_m.gguf",
+        url: "",
+        size_mb: 4470,
+        note: "On-device fine-tune (Arch-Function-Chat-7B + Pushin SFT): ~93% on the eval battery — breaks the 3B's ~89% ceiling — with richer dual-mode chat. Needs ~6 GB RAM. Local build; not yet hosted for download.",
+    },
 ];
 
 /// The dedicated embedding model for Hermes (semantic memory recall). Auto-downloaded and served
