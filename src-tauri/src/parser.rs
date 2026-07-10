@@ -3470,6 +3470,14 @@ mod tests {
     }
 
     #[test]
+    fn compute_end_probe_overnight() {
+        // Probe: is the overnight range actually broken, or does the model emit bad times?
+        let start = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(23, 0, 0).unwrap();
+        let end = compute_end(start, Some("1am"));
+        assert_eq!((end - start).num_minutes(), 120, "11pm→1am should be 120 min");
+    }
+
+    #[test]
     fn daily_window_span_expands_per_day() {
         let now = NaiveDate::from_ymd_opt(2026, 6, 9).unwrap().and_hms_opt(12, 0, 0).unwrap();
         // "robotics competition, 3 days, 8am–5pm" → three dated 8–5 days, not one all-day block.
