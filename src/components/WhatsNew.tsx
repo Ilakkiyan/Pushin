@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarClock, FolderOpen, Keyboard, Sparkles } from "lucide-react";
+import { ArrowRight, Cpu, FolderOpen, MessagesSquare, Sparkles } from "lucide-react";
 
 /**
  * The post-update "What's new" intro, shown once after the app updates + restarts (App.tsx detects a
@@ -10,18 +10,18 @@ import { ArrowRight, CalendarClock, FolderOpen, Keyboard, Sparkles } from "lucid
 const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
   {
     icon: Sparkles,
-    title: "A fresh look",
-    body: "A calmer, minimalist charcoal interface, a wide new wordmark, and a smoother opening.",
+    title: "Smarter, more reliable AI",
+    body: "A new model, fine-tuned for Pushin, turns your words into tasks and events far more accurately — and it still runs 100% on your device.",
   },
   {
-    icon: Keyboard,
-    title: "Keyboard-first",
-    body: "Press g then a key to jump anywhere — Calendar, Vault, Tasks… ⌘K opens the palette for the rest.",
+    icon: Cpu,
+    title: "Pick your power",
+    body: "A light model that runs on almost any machine, or the new, most-accurate 7B for complex plans — switch anytime in Settings.",
   },
   {
-    icon: CalendarClock,
-    title: "A faster calendar",
-    body: "Arrow-select any time slot, double-click to create, and ⌘T spins up a linked note for an event.",
+    icon: MessagesSquare,
+    title: "A better second brain",
+    body: "Chat mode is more thoughtful and conversational — ask it to think things through with you, all privately on-device.",
   },
   {
     icon: FolderOpen,

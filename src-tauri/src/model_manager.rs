@@ -56,30 +56,27 @@ pub const MODELS: &[ModelInfo] = &[
         size_mb: 8990,
         note: "Highest accuracy for a strong machine; needs ~12 GB RAM and is the slowest.",
     },
-    // Experimental on-device fine-tune. Student base = Arch-Function-3B (Qwen2.5-Coder-3B, function-
-    // calling-hardened); QLoRA SFT on Pushin's union single-call path. On the eval battery it beats the
-    // vanilla 3B base by ~+10–14 pts and edges the 7B/14B, at 3B size/speed. Locally produced — no
-    // public host yet, so `url` is empty and the .gguf must be present in models/ (is_model_present
-    // gates on file existence, so it's selectable once placed; wire a real HF url here to distribute).
+    // On-device fine-tune. Student base = Arch-Function-3B (Qwen2.5-Coder-3B, function-calling-hardened);
+    // QLoRA SFT on Pushin's union single-call path. On the eval battery it beats the vanilla 3B base by
+    // ~+10–14 pts (89% union), at 3B size/speed — the light, mobile-friendly default. GGUF hosted on HF.
     ModelInfo {
         id: "pushin-arch3b-tuned-q4_k_m",
-        name: "Pushin 3B (tuned, experimental)",
+        name: "Pushin 3B (tuned)",
         filename: "pushin-arch3b-tuned-q4_k_m.gguf",
-        url: "",
+        url: "https://huggingface.co/LuckyKS/pushin-arch3b-tuned-GGUF/resolve/main/pushin-arch3b-tuned-q4_k_m.gguf",
         size_mb: 1841,
-        note: "On-device fine-tune (Arch-Function-3B + Pushin SFT). Beats the vanilla 3B base on the eval battery at 3B size. Local build — place the .gguf in models/ manually; not yet hosted for download.",
+        note: "Pushin's own on-device model — tuned to read your plans far more reliably than the base 3B, at the same light size. Fast, runs on most machines, private.",
     },
     // Power tier: same fine-tune recipe on Arch-Function-Chat-7B (Qwen2.5-Coder-7B, function-calling +
-    // multi-turn chat). Scores ~93% on the eval battery — breaks the 3B's ~89% capacity ceiling — and the
-    // Chat base gives a richer deharnessed assistant for the dual-mode Chat pane. ~4.5 GB Q4, needs ~6 GB
-    // RAM. Locally produced (url empty; gated on file presence) — wire a real HF url to distribute.
+    // multi-turn chat). ~93% on the eval battery — breaks the 3B's ~89% capacity ceiling — and the Chat
+    // base gives a richer deharnessed assistant for the dual-mode Chat pane. ~4.4 GB Q4, ~6 GB RAM.
     ModelInfo {
         id: "pushin-arch7b-chat-tuned-q4_k_m",
-        name: "Pushin 7B (tuned, experimental)",
+        name: "Pushin 7B (tuned, recommended)",
         filename: "pushin-arch7b-chat-tuned-q4_k_m.gguf",
-        url: "",
+        url: "https://huggingface.co/LuckyKS/pushin-arch7b-chat-tuned-GGUF/resolve/main/pushin-arch7b-chat-tuned-q4_k_m.gguf",
         size_mb: 4470,
-        note: "On-device fine-tune (Arch-Function-Chat-7B + Pushin SFT): ~93% on the eval battery — breaks the 3B's ~89% ceiling — with richer dual-mode chat. Needs ~6 GB RAM. Local build; not yet hosted for download.",
+        note: "The most accurate on-device model — Pushin's tuned 7B reads complex, multi-step plans best and holds a richer conversation. Needs ~6 GB RAM.",
     },
 ];
 
