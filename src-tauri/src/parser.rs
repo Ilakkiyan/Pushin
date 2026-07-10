@@ -510,6 +510,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
+    merge_split_event_fragments(plan);
     promote_timed_work_to_block(plan, user_text);
     collapse_unrequested_decomposition(plan, user_text);
     drop_unrequested_prep_tasks(plan, user_text);
@@ -517,6 +518,77 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
     suppress_clarifications_when_proceeding(plan, user_text);
+}
+
+/// **Split-event / fabrication guard.** The fine-tuned student sometimes chops ONE event into several:
+/// it splits a trailing prepositional phrase into its own event ("Lunch at Chipotle with Sam 12:30–1:15"
+/// → `["Lunch", "at Chipotle with Sam"]`, with the end time landing on the fragment) or fabricates a
+/// placeholder second title ("Movie night 11pm–1am" → `["Movie night", "Unknown Movie Title"]`). Drop the
+/// spurious event — a title that is a leading-preposition fragment (`at`/`with`/`near`/`@…`) or a fabricated
+/// placeholder (`Unknown…`/`Untitled`/`TBD`) — folding any time it carries back into the preceding real
+/// event so the single event keeps its full range. Only fires when a real preceding event exists, so
+/// genuine back-to-back events ("standup 9–9:15, design review 11–12, 1:1 3–3:30") are left intact. The
+/// base model doesn't split like this (16/16 hard-event); the SFT introduced the bias, so this also helps
+/// any future student. Deterministic + unit-tested, per the recovery-layer philosophy.
+fn merge_split_event_fragments(plan: &mut ParsedPlan) {
+    if plan.events.len() < 2 {
+        return; // never touch a sole event — the split needs a real sibling to fold into
+    }
+    // A title that reads as a phrase split off the previous event, not a standalone event name.
+    fn is_fragment(title: &str) -> bool {
+        let t = title.trim();
+        if t.starts_with('@') {
+            return true; // "@ the office"
+        }
+        let first = t.split(|c: char| !c.is_ascii_alphanumeric()).find(|w| !w.is_empty()).unwrap_or("").to_lowercase();
+        // Conservative set: words that almost never OPEN a real event title but do open a split phrase.
+        matches!(first.as_str(), "at" | "with" | "near" | "w")
+    }
+    // A placeholder title the model invents to satisfy the schema when it over-splits.
+    fn is_fabricated(title: &str) -> bool {
+        let l = title.trim().to_lowercase();
+        l.contains("unknown") || l.contains("untitled") || matches!(l.as_str(), "tbd" | "n/a" | "event" | "title" | "untitled event")
+    }
+
+    // A fabricated sub-event the model appends to a real one, derived from its title with a separator:
+    // "Team Sync" → also "Team Sync - Break Time"; "Movie Night" → "Movie Night: Part 2".
+    fn is_derivative_of(child: &str, parent: &str) -> bool {
+        let (c, p) = (child.trim().to_lowercase(), parent.trim().to_lowercase());
+        c != p && !p.is_empty() && (c.starts_with(&format!("{p} -")) || c.starts_with(&format!("{p}:")) || c.starts_with(&format!("{p} (")))
+    }
+
+    // Derivative detection is order-independent: an event is spurious if ANY *other* event's title is
+    // its base ("Team Sync" is the base of "Team Sync - Confirm Time and Location"), regardless of which
+    // came first — the model doesn't emit them in a fixed order. Only the longer (derivative) matches, so
+    // the base is never dropped. A base existing elsewhere is itself the safety, so a derivative is
+    // dropped even at position 0 (unlike a fragment/placeholder, which needs a preceding real sibling).
+    let all_titles: Vec<String> = plan.events.iter().map(|e| e.title.clone()).collect();
+    let mut kept: Vec<ParsedEvent> = Vec::with_capacity(plan.events.len());
+    for (idx, ev) in std::mem::take(&mut plan.events).into_iter().enumerate() {
+        let derivative = all_titles.iter().enumerate().any(|(j, other)| j != idx && is_derivative_of(&ev.title, other));
+        let spurious = derivative || ((is_fragment(&ev.title) || is_fabricated(&ev.title)) && !kept.is_empty());
+        if spurious {
+            // Fold time the fragment carries into the preceding real event where the real one lacks it.
+            if let Some(prev) = kept.last_mut() {
+                if prev.start_time.is_none() && ev.start_time.is_some() {
+                    prev.start_time = ev.start_time.clone();
+                }
+                if prev.end_time.is_none() && ev.end_time.is_some() {
+                    prev.end_time = ev.end_time.clone();
+                }
+                if prev.duration_minutes.is_none() && ev.duration_minutes.is_some() {
+                    prev.duration_minutes = ev.duration_minutes;
+                }
+                if prev.day.is_none() && ev.day.is_some() {
+                    prev.day = ev.day.clone();
+                }
+            }
+            // the spurious fragment/placeholder itself is dropped (not pushed)
+        } else {
+            kept.push(ev);
+        }
+    }
+    plan.events = kept;
 }
 
 /// **Don't pester once the user says go.** A short, clearly-affirmative reply ("schedule it", "just do
@@ -4469,6 +4541,88 @@ mod tests {
         let mut plan = ParsedPlan { events: vec![event], projects: vec![proj], ..Default::default() };
         apply_recovery(&mut plan, "work on my essay from 2 - 4 and call mom", d());
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "unrelated task kept");
+    }
+
+    #[test]
+    fn merges_split_prepositional_event_fragment() {
+        // "Lunch at Chipotle with Sam 12:30 to 1:15" — the student split it into two events with the end
+        // time landing on the fragment. Fold to ONE "Lunch" 12:30–13:15; drop "at Chipotle with Sam".
+        let mut lunch = ev("tomorrow", Some("12:30"), None);
+        lunch.title = "Lunch".into();
+        let mut frag = ev("tomorrow", Some("12:30"), Some("13:15"));
+        frag.title = "at Chipotle with Sam".into();
+        let mut plan = ParsedPlan { events: vec![lunch, frag], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "one lunch event");
+        assert_eq!(plan.events[0].title, "Lunch");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("12:30"));
+        assert_eq!(plan.events[0].end_time.as_deref(), Some("13:15"), "end time folded from the fragment");
+    }
+
+    #[test]
+    fn drops_fabricated_placeholder_event() {
+        // "Movie night tonight 11pm to 1am" → ["Movie night", "Unknown Movie Title"]; drop the fabrication.
+        let mut movie = ev("today", Some("23:00"), Some("01:00"));
+        movie.title = "Movie night".into();
+        let mut fab = ev("today", None, None);
+        fab.title = "Unknown Movie Title".into();
+        let mut plan = ParsedPlan { events: vec![movie, fab], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "fabricated title dropped");
+        assert_eq!(plan.events[0].title, "Movie night");
+    }
+
+    #[test]
+    fn drops_derivative_appended_subevent() {
+        // "Team sync at noon for 45 min" → ["Team Sync", "Team Sync - Break Time"]; drop the derivative.
+        let mut sync = ev("tomorrow", Some("12:00"), None);
+        sync.title = "Team Sync".into();
+        sync.duration_minutes = Some(45);
+        let mut derived = ev("tomorrow", Some("12:00"), None);
+        derived.title = "Team Sync - Break Time".into();
+        let mut plan = ParsedPlan { events: vec![sync, derived], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "derivative sub-event dropped");
+        assert_eq!(plan.events[0].title, "Team Sync");
+        assert_eq!(plan.events[0].duration_minutes, Some(45), "real event's duration intact");
+    }
+
+    #[test]
+    fn drops_derivative_even_when_it_comes_first() {
+        // Order-independent: the derivative "Team Sync - Confirm Time and Location" may be emitted BEFORE
+        // its base "Team Sync". Still drop the derivative, keep the base, regardless of order.
+        let mut derived = ev("tomorrow", Some("12:00"), None);
+        derived.title = "Team Sync - Confirm Time and Location".into();
+        let mut sync = ev("tomorrow", Some("12:00"), None);
+        sync.title = "Team Sync".into();
+        let mut plan = ParsedPlan { events: vec![derived, sync], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "derivative dropped even when it comes first");
+        assert_eq!(plan.events[0].title, "Team Sync", "the base survives");
+    }
+
+    #[test]
+    fn keeps_genuine_back_to_back_events() {
+        // "standup 9-9:15, design review 11-12, 1:1 3-3:30" — three real events, none a fragment. Keep all.
+        let mut a = ev("tomorrow", Some("09:00"), Some("09:15"));
+        a.title = "standup".into();
+        let mut b = ev("tomorrow", Some("11:00"), Some("12:00"));
+        b.title = "design review".into();
+        let mut c = ev("tomorrow", Some("15:00"), Some("15:30"));
+        c.title = "1:1 meeting".into();
+        let mut plan = ParsedPlan { events: vec![a, b, c], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 3, "genuine separate events untouched");
+    }
+
+    #[test]
+    fn never_drops_a_sole_fragment_event() {
+        // A lone event whose title happens to read like a fragment must survive (nothing to fold into).
+        let mut only = ev("today", Some("12:00"), Some("13:00"));
+        only.title = "at the dentist".into();
+        let mut plan = ParsedPlan { events: vec![only], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "sole event kept even if title looks like a fragment");
     }
 
     #[test]

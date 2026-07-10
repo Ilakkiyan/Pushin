@@ -56,6 +56,19 @@ pub const MODELS: &[ModelInfo] = &[
         size_mb: 8990,
         note: "Highest accuracy for a strong machine; needs ~12 GB RAM and is the slowest.",
     },
+    // Experimental on-device fine-tune. Student base = Arch-Function-3B (Qwen2.5-Coder-3B, function-
+    // calling-hardened); QLoRA SFT on Pushin's union single-call path. On the eval battery it beats the
+    // vanilla 3B base by ~+10–14 pts and edges the 7B/14B, at 3B size/speed. Locally produced — no
+    // public host yet, so `url` is empty and the .gguf must be present in models/ (is_model_present
+    // gates on file existence, so it's selectable once placed; wire a real HF url here to distribute).
+    ModelInfo {
+        id: "pushin-arch3b-tuned-q4_k_m",
+        name: "Pushin 3B (tuned, experimental)",
+        filename: "pushin-arch3b-tuned-q4_k_m.gguf",
+        url: "",
+        size_mb: 1841,
+        note: "On-device fine-tune (Arch-Function-3B + Pushin SFT). Beats the vanilla 3B base on the eval battery at 3B size. Local build — place the .gguf in models/ manually; not yet hosted for download.",
+    },
 ];
 
 /// The dedicated embedding model for Hermes (semantic memory recall). Auto-downloaded and served
