@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Pushin parser fine-tune — Stage 5 of finetune/PLAN.md (QLoRA SFT on Qwen2.5-3B).
+"""Pushin parser fine-tune — Stage 5 of finetune/PLAN.md (QLoRA SFT on a small Qwen2.5-family base).
 
 Trains the small default model to emit Pushin's schema JSON directly from the single-call union
 format the datagen labels use, so training and inference match.
+
+Experiment #1 (2026-07): default base is now **Arch-Function-3B** (katanemo) — Qwen2.5-Coder-3B
+further-tuned for function calling. Same Qwen2 arch / 151936 vocab / ChatML (<|im_start|>/<|im_end|>,
+eos <|im_end|>) as the old vanilla-Qwen2.5-3B base, and with no `tools=` passed its chat template
+renders byte-identically to our locked format — so this is a drop-in base swap that isolates the one
+variable our three prior finetunes never moved: starting from a format-hardened base vs a general one.
 
 Uses a **plain manual training loop** rather than trl's SFTTrainer: on this bleeding-edge stack
 (Unsloth 2026.6 + transformers 5 + trl 0.23/0.24) trl's trainer + Unsloth's trainer patches don't
@@ -33,7 +39,10 @@ from transformers import get_linear_schedule_with_warmup
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="finetune/data/dataset.jsonl", help="ChatML SFT JSONL from datagen")
-    ap.add_argument("--model", default="unsloth/Qwen2.5-3B-Instruct-bnb-4bit", help="4-bit base to specialize")
+    ap.add_argument("--model", default="katanemo/Arch-Function-3B",
+                    help="base to specialize. Default = Arch-Function-3B (full-precision; Unsloth 4-bits it "
+                         "on the fly via load_in_4bit). For the old vanilla baseline pass "
+                         "unsloth/Qwen2.5-3B-Instruct-bnb-4bit")
     ap.add_argument("--max-seq", type=int, default=4096, help="must cover system prompt + calendar + turn")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--max-steps", type=int, default=0, help=">0 caps optimizer steps (smoke); skips merge/export")

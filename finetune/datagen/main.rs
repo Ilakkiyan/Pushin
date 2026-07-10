@@ -221,7 +221,7 @@ async fn main() {
         let mut any_ok = false;
         let mut reject_dbg: Option<(Value, Option<PlanOutcome>)> = None;
 
-        if let Ok(plan) = parser::plan(&client, &settings, &current, &history, &t.prompt).await {
+        if let Ok(plan) = parser::plan(&client, &settings, &current, &history, &t.prompt, &[]).await {
             any_ok = true;
             let (pass, outcome) = validate(&t.seed, &settings, &plan, &*t.check, &format!("{i}r"));
             let label = plan_to_label(&plan);

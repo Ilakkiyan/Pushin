@@ -150,6 +150,20 @@ const HABIT_ACTS: &[&str] = &[
     "do yoga", "take my vitamins", "review my goals", "walk the dog", "practice Spanish",
 ];
 const HABIT_TAILS: &[&str] = &["every day", "every morning", "every night", "daily", "each evening", "every night before bed", "first thing each morning"];
+// Social events that naturally carry a LOCATION and/or ATTENDEE phrase — the pattern the fine-tune
+// over-split ("Lunch at Chipotle with Sam" → two events). Trained as ONE event so the student stops.
+const SOCIAL_ACTS: &[&str] = &["Lunch", "Dinner", "Coffee", "Brunch", "Breakfast", "Drinks", "Catch-up", "Happy hour"];
+const PLACES: &[&str] = &["Chipotle", "the cafe", "Blue Bottle", "Nobu", "downtown", "Olive Garden", "the food court", "Shake Shack", "the diner", "the sushi place", "Sweetgreen", "the taco truck"];
+const GUESTS: &[&str] = &["Sam", "Alex", "mom", "Jordan", "Priya", "Dana", "Chris", "my sister", "the team", "my mentor", "Raj"];
+// (start disp, sh, sm, end disp, eh, em, minutes)
+const SOCIAL_RANGES: &[(&str, u32, u32, &str, u32, u32, i64)] = &[
+    ("12:30pm", 12, 30, "1:15pm", 13, 15, 45),
+    ("6pm", 18, 0, "7:30pm", 19, 30, 90),
+    ("noon", 12, 0, "1pm", 13, 0, 60),
+    ("7pm", 19, 0, "8pm", 20, 0, 60),
+    ("11:30am", 11, 30, "12:30pm", 12, 30, 60),
+    ("5pm", 17, 0, "6pm", 18, 0, 60),
+];
 
 // ---------------- phrasing helpers ----------------
 fn phrase_event(r: &mut Rng, act: &str, day: &str, time: &str) -> String {
@@ -256,6 +270,32 @@ pub fn all() -> Vec<Template> {
         let prompt = format!("{} {durs}.", phrase_event(&mut r, &act, day, ts).trim_end_matches('.'));
         out.push(Template {
             category: "event-duration",
+            prompt,
+            seed: vec![],
+            history: vec![],
+            check: Box::new(move |o, c| {
+                o.created_event_titles.len() == 1
+                    && only_event(c).map(|e| start_hm(&e) == Some((h, m)) && minutes(&e) == Some(dur)).unwrap_or(false)
+            }),
+        });
+    }
+
+    // 3b) Single social event with a LOCATION and/or ATTENDEE phrase + a range — must stay ONE event,
+    //     never split on "at <place> with <person>" (the hard-event regression the fine-tune introduced).
+    for _ in 0..150 {
+        let meal = *r.pick(SOCIAL_ACTS);
+        let loc = *r.pick(PLACES);
+        let person = *r.pick(GUESTS);
+        let day = *r.pick(DAYS);
+        let (t1, h, m, t2, _eh, _em, dur) = *r.pick(SOCIAL_RANGES);
+        let prompt = match r.below(4) {
+            0 => format!("{meal} at {loc} with {person} {day} from {t1} to {t2}."),
+            1 => format!("{meal} with {person} at {loc} {day} {t1} to {t2}."),
+            2 => format!("{meal} at {loc} {day} {t1}-{t2}."),
+            _ => format!("Grab {meal} with {person} {day} at {loc}, {t1} to {t2}."),
+        };
+        out.push(Template {
+            category: "event-place-attendee",
             prompt,
             seed: vec![],
             history: vec![],
