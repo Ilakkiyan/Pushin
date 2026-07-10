@@ -125,6 +125,32 @@ fn build_row(messages: &Value, raw: &Value, category: &str) -> String {
     serde_json::to_string(&json!({ "messages": arr, "category": category })).unwrap_or_default()
 }
 
+/// Experiment #2: rewrite a templated prompt into a realistic, human-typed phrasing via a strong teacher,
+/// preserving every scheduling fact so the template's known-truth `check` still validates the label.
+/// Direct OpenAI-compatible chat call (prose, not schema-constrained). Returns None on any failure →
+/// caller falls back to the original template prompt.
+async fn paraphrase_prompt(client: &reqwest::Client, base: &str, model: &str, original: &str) -> Option<String> {
+    let system = "You rewrite a scheduling request the way a real person casually types it to their \
+calendar assistant. Keep EVERY fact identical: the same activities, people, places, exact day words, and \
+exact times/durations — never add, drop, merge, or split anything. Vary the wording naturally \
+(contractions, filler like \"gotta\"/\"need to\", different sentence order, maybe one tiny typo). Output \
+ONLY the rewritten message on one line — no quotes, no preamble, no explanation.";
+    let body = json!({
+        "model": model,
+        "temperature": 0.8,
+        "max_tokens": 200,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": original},
+        ]
+    });
+    let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+    let v: Value = client.post(&url).json(&body).send().await.ok()?.json().await.ok()?;
+    let text = v["choices"][0]["message"]["content"].as_str()?;
+    let line = text.trim().lines().find(|l| !l.trim().is_empty())?.trim().trim_matches('"').trim().to_string();
+    (!line.is_empty() && line.len() <= 300).then_some(line)
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -143,6 +169,13 @@ async fn main() {
     let model = arg(&args, "--teacher-model")
         .or_else(|| std::env::var("PUSHIN_TEACHER_MODEL").ok())
         .unwrap_or_else(|| "qwen2.5-14b-instruct-q4_k_m".into());
+    // Experiment #2: realistic-prompt mode. A strong teacher rewrites each templated prompt into a
+    // human-typed phrasing (all scheduling facts preserved) so the template's known-truth check still
+    // validates the label — a paraphrase that corrupts a fact just fails reject-sampling. Defaults to
+    // the same teacher url/model; point --paraphrase-url/model at the 30B-A3B for the best realism.
+    let paraphrase = args.iter().any(|a| a == "--paraphrase");
+    let pp_base = arg(&args, "--paraphrase-url").or_else(|| std::env::var("PUSHIN_PARAPHRASE_URL").ok()).unwrap_or_else(|| base.clone());
+    let pp_model = arg(&args, "--paraphrase-model").or_else(|| std::env::var("PUSHIN_PARAPHRASE_MODEL").ok()).unwrap_or_else(|| model.clone());
 
     let all = templates::all();
     let templates: Vec<templates::Template> = all
@@ -212,7 +245,12 @@ async fn main() {
             ev
         };
         let history: Vec<ChatTurn> = t.history.iter().map(|(r, c)| ChatTurn { role: r.clone(), content: c.clone() }).collect();
-        let messages = parser::union_messages(&settings, &current, &history, &t.prompt);
+        let prompt_text = if paraphrase {
+            paraphrase_prompt(&client, &pp_base, &pp_model, &t.prompt).await.unwrap_or_else(|| t.prompt.clone())
+        } else {
+            t.prompt.clone()
+        };
+        let messages = parser::union_messages(&settings, &current, &history, &prompt_text);
 
         // Best-of-two teachers: the ROUTER routes tasks/removes/titles correctly; the single UNION
         // call handles date/time edge cases the router fumbles (overnight splits, relative/ordinal
@@ -221,7 +259,7 @@ async fn main() {
         let mut any_ok = false;
         let mut reject_dbg: Option<(Value, Option<PlanOutcome>)> = None;
 
-        if let Ok(plan) = parser::plan(&client, &settings, &current, &history, &t.prompt, &[]).await {
+        if let Ok(plan) = parser::plan(&client, &settings, &current, &history, &prompt_text, &[]).await {
             any_ok = true;
             let (pass, outcome) = validate(&t.seed, &settings, &plan, &*t.check, &format!("{i}r"));
             let label = plan_to_label(&plan);
@@ -232,7 +270,7 @@ async fn main() {
             }
         }
         if chosen.is_none() {
-            if let Ok((_, _raw, plan)) = parser::union_label(&client, &settings, &current, &history, &t.prompt).await {
+            if let Ok((_, _raw, plan)) = parser::union_label(&client, &settings, &current, &history, &prompt_text).await {
                 any_ok = true;
                 let (pass, outcome) = validate(&t.seed, &settings, &plan, &*t.check, &format!("{i}u"));
                 let label = plan_to_label(&plan);
