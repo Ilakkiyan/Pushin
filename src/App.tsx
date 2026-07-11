@@ -37,7 +37,12 @@ export default function App() {
   const calMode = useStore((s) => s.calMode);
   const chatMode = useStore((s) => s.chatMode);
   const load = useStore((s) => s.load);
+  // TESTING ONLY (this machine): replay the full new-user opening flow — splash → guided intro — on EVERY
+  // launch. Uses a session state (NOT an `onboarded` override) so completing/skipping the guide still
+  // dismisses it. Set to `false` (or delete this + the `replayGuide` usage below) to restore normal behavior.
+  const FORCE_OPENING_FLOW = false;
   const onboarded = useStore((s) => s.settings?.onboarded ?? true);
+  const [replayGuide, setReplayGuide] = useState(FORCE_OPENING_FLOW);
   const isMobile = useIsMobile();
   const [splashDone, setSplashDone] = useState(false);
   // AI boot gate: the opening splash doubles as the loading screen — it holds (showing a spinner) until
@@ -62,9 +67,12 @@ export default function App() {
   const [versionChecked, setVersionChecked] = useState(import.meta.env.MODE === "test");
   // New users get the guided intro; returning users get the welcome-back landing. Both sit over the
   // (already-mounted) shell and clear once the user is in. The guide flips `onboarded` on save.
-  const guide = !onboarded ? <WelcomeGuide onDone={() => setEntered(true)} /> : null;
+  const guide =
+    !onboarded || replayGuide ? (
+      <WelcomeGuide onDone={() => { setReplayGuide(false); setEntered(true); }} />
+    ) : null;
   const welcome =
-    onboarded && !entered && !whatsNew ? (
+    !guide && onboarded && !entered && !whatsNew ? (
       <WelcomeBack
         onEnter={(t) => {
           if (t) {
@@ -76,9 +84,10 @@ export default function App() {
       />
     ) : null;
   // After an update + restart an existing user gets the "what's new" intro instead of the welcome-back
-  // landing; dismissing it drops them straight into the app.
+  // landing; dismissing it drops them straight into the app. It always sits AFTER the opening flow — while
+  // the guided intro is up (`guide`), it's held back so it can't paint over the opening flow.
   const whatsNewEl =
-    splashDone && whatsNew ? (
+    !guide && splashDone && whatsNew ? (
       <WhatsNew version={appVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
     ) : null;
   // Cover the brief window between the splash clearing and the version check resolving, so the app

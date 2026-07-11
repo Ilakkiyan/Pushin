@@ -26,6 +26,7 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
   const saveSettings = useStore((s) => s.saveSettings);
   const [form, setForm] = useState<Settings>(() => ({
     ...settings,
+    workDays: settings.workDays ?? [1, 2, 3, 4, 5],
     sleepEnabled: true,
     sleepStart: settings.sleepStart || "23:00",
     sleepEnd: settings.sleepEnd || "07:00",
@@ -115,7 +116,7 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
   return (
     <div data-tauri-drag-region className="fixed inset-0 z-50 flex flex-col bg-[var(--bg)] welcome-in">
       {/* header: wordmark · progress · skip */}
-      <div className="flex shrink-0 items-center justify-between px-8 pt-8">
+      <div data-tauri-drag-region className="flex shrink-0 items-center justify-between px-8 pt-8">
         <div className="wordmark text-sm text-gray-500" style={{ letterSpacing: "0.3em" }}>
           Pushin
         </div>
@@ -133,18 +134,18 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
       </div>
 
       {/* one fat, centered step — slides in on change */}
-      <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-8">
-        <div key={step} className={clsx("w-full max-w-2xl py-12", dir > 0 ? "step-in-right" : "step-in-left")}>
-          <div className="text-xs uppercase tracking-widest text-gray-600">Step {step + 1} of {steps.length}</div>
-          <h1 className="mt-3 text-4xl font-light tracking-tight text-gray-100">{current.title}</h1>
-          {current.subtitle && <p className="mt-3 text-base leading-relaxed text-gray-500">{current.subtitle}</p>}
+      <div data-tauri-drag-region className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-8">
+        <div key={step} data-tauri-drag-region className={clsx("w-full max-w-2xl py-12", dir > 0 ? "step-in-right" : "step-in-left")}>
+          <div data-tauri-drag-region className="text-xs uppercase tracking-widest text-gray-600">Step {step + 1} of {steps.length}</div>
+          <h1 data-tauri-drag-region className="mt-3 text-4xl font-light tracking-tight text-gray-100">{current.title}</h1>
+          {current.subtitle && <p data-tauri-drag-region className="mt-3 text-base leading-relaxed text-gray-500">{current.subtitle}</p>}
           <div className="mt-10">{current.body}</div>
         </div>
       </div>
 
       {/* nav */}
-      <div className="shrink-0 px-8 pb-10">
-        <div className="mx-auto flex w-full max-w-2xl items-center justify-between">
+      <div data-tauri-drag-region className="shrink-0 px-8 pb-10">
+        <div data-tauri-drag-region className="mx-auto flex w-full max-w-2xl items-center justify-between">
           <button
             onClick={() => go(step - 1)}
             className={clsx("px-4 py-2.5 text-sm transition", step === 0 ? "pointer-events-none opacity-0" : "text-gray-400 hover:text-gray-200")}
