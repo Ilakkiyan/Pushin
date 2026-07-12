@@ -563,7 +563,14 @@ fn merge_split_event_fragments(plan: &mut ParsedPlan) {
     // A placeholder title the model invents to satisfy the schema when it over-splits.
     fn is_fabricated(title: &str) -> bool {
         let l = title.trim().to_lowercase();
-        l.contains("unknown") || l.contains("untitled") || matches!(l.as_str(), "tbd" | "n/a" | "event" | "title" | "untitled event")
+        // Hedging parentheticals mark a SPECULATIVE event the model tacks onto a real one it was told
+        // to create ("Block 12-2 for a working session" → ["Working Session", "Break Time (if needed)"]).
+        // The user asked for one block, never a conditional extra — drop it.
+        let hedged = l.contains("(if needed)") || l.contains("(optional)") || l.contains("(if time")
+            || l.contains("(tentative)") || l.contains("(as needed)") || l.contains("(if necessary)");
+        hedged
+            || l.contains("unknown") || l.contains("untitled")
+            || matches!(l.as_str(), "tbd" | "n/a" | "event" | "title" | "untitled event")
     }
 
     // A fabricated sub-event the model appends to a real one, derived from its title with a separator:
@@ -1990,10 +1997,12 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
                 ev.end_time = Some(end_raw);
             }
         } else if let Some(d) = duration {
-            // A bare "2 hour meeting at 3pm": fill length only if the model gave no end.
-            if ev.duration_minutes.is_none() && unset(&ev.end_time) {
-                ev.duration_minutes = Some(d);
-            }
+            // An explicit length in the text ("quick 15 minute call", "2 hour meeting at 3pm") is
+            // authoritative — override the model's guess (it defaults to 60 and routinely ignores a
+            // stated short length). Clear the model's end so the stated duration takes effect. Safe:
+            // this branch is single_create + no text range, so there's nothing to mis-assign.
+            ev.duration_minutes = Some(d);
+            ev.end_time = None;
         }
     } else if single_update {
         let up = &mut plan.update_events[0];
@@ -4531,6 +4540,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_short_duration_overrides_model_default() {
+        // "Quick 15 minute call at 3pm" — the model defaults the length to 60 and ignores the stated
+        // 15 min; the explicit text duration must win (event ends 15 min after the 3pm start).
+        let conn = crate::db::test_conn();
+        let mut call = ev("today", Some("15:00"), Some("16:00")); // model's bogus 60-min end
+        call.title = "Call with the bank".into();
+        let mut plan = ParsedPlan { events: vec![call], ..Default::default() };
+        apply_recovery(&mut plan, "Quick 15 minute call with the bank at 3pm today.", d());
+        let out = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(out.created_event_ids.len(), 1);
+        let e = crate::db::list_events(&conn).unwrap().into_iter().find(|e| e.title.to_lowercase().contains("call")).unwrap();
+        assert!(e.start.contains("T15:00:00"), "starts 3pm: {}", e.start);
+        let (s, en) = (parse_dt(&e.start).unwrap(), parse_dt(&e.end).unwrap());
+        assert_eq!((en - s).num_minutes(), 15, "stated 15 min wins over the model's 60-min default");
+    }
+
+    #[test]
     fn promote_skips_without_a_clock_range() {
         // A work phrase but no clock range → stays a task ("spend Saturday afternoon cleaning").
         let task = ParsedTask { title: "Clean the garage".into(), ..Default::default() };
@@ -4603,6 +4629,20 @@ mod tests {
         merge_split_event_fragments(&mut plan);
         assert_eq!(plan.events.len(), 1, "fabricated title dropped");
         assert_eq!(plan.events[0].title, "Movie night");
+    }
+
+    #[test]
+    fn drops_hedged_speculative_event() {
+        // "Block 12-2 for a working session" → ["Working Session", "Break Time (if needed)"]; the model
+        // invents a conditional extra the user never asked for — drop it, keep the real block.
+        let mut work = ev("today", Some("12:00"), Some("14:00"));
+        work.title = "Working Session".into();
+        let mut br = ev("today", None, None);
+        br.title = "Break Time (if needed)".into();
+        let mut plan = ParsedPlan { events: vec![work, br], ..Default::default() };
+        merge_split_event_fragments(&mut plan);
+        assert_eq!(plan.events.len(), 1, "hedged speculative event dropped");
+        assert_eq!(plan.events[0].title, "Working Session");
     }
 
     #[test]
