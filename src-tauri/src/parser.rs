@@ -2554,9 +2554,17 @@ fn parse_hm(s: &str) -> Option<NaiveTime> {
     let pm = lower.contains("pm");
     let am = lower.contains("am");
     let digits: String = lower.chars().filter(|c| c.is_ascii_digit() || *c == ':').collect();
-    let mut it = digits.split(':');
-    let mut h: u32 = it.next()?.parse().ok()?;
-    let m: u32 = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let (mut h, m): (u32, u32) = if digits.contains(':') {
+        let mut it = digits.split(':');
+        (it.next()?.parse().ok()?, it.next().unwrap_or("0").parse().unwrap_or(0))
+    } else if digits.len() == 3 || digits.len() == 4 {
+        // Compact 24h times the model emits without a colon: "930" → 9:30, "0900" → 9:00,
+        // "1030" → 10:30, "1400" → 14:00. Previously these parsed as hour=1030 → invalid → dropped.
+        let cut = digits.len() - 2;
+        (digits[..cut].parse().ok()?, digits[cut..].parse().ok()?)
+    } else {
+        (digits.parse().ok()?, 0)
+    };
     if pm && h < 12 {
         h += 12;
     }
@@ -4718,6 +4726,21 @@ mod tests {
         };
         assert_eq!(dur("lunch"), Some(120), "lunch 12-2 = 2h");
         assert_eq!(dur("party"), Some(240), "party 6-10 = 4h");
+    }
+
+    #[test]
+    fn parse_hm_reads_compact_24h_times() {
+        // "Block 0900-1030" — the model emits a compact colon-less end ("1030"); it must read as 10:30
+        // (was parsed as hour=1030 → invalid → dropped → 60-min default).
+        assert_eq!(parse_hm("0900"), NaiveTime::from_hms_opt(9, 0, 0));
+        assert_eq!(parse_hm("1030"), NaiveTime::from_hms_opt(10, 30, 0));
+        assert_eq!(parse_hm("1400"), NaiveTime::from_hms_opt(14, 0, 0));
+        assert_eq!(parse_hm("930"), NaiveTime::from_hms_opt(9, 30, 0));
+        // normal forms still work
+        assert_eq!(parse_hm("9:30"), NaiveTime::from_hms_opt(9, 30, 0));
+        assert_eq!(parse_hm("2pm"), NaiveTime::from_hms_opt(14, 0, 0));
+        assert_eq!(parse_hm("14:00:00"), NaiveTime::from_hms_opt(14, 0, 0));
+        assert_eq!(parse_hm("9999"), None, "invalid compact rejected");
     }
 
     #[test]
