@@ -15,7 +15,7 @@
 
 mod templates;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
@@ -151,6 +151,68 @@ ONLY the rewritten message on one line — no quotes, no preamble, no explanatio
     (!line.is_empty() && line.len() <= 300).then_some(line)
 }
 
+/// Normalize a prompt for leakage comparison: lowercase, keep only alphanumerics, single-space words.
+fn normalize_prompt(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true; // trim leading
+    for ch in s.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// The held-out battery's prompts (parsed from `src-tauri/tests/llm_eval.rs`), normalized. Used to
+/// DENY any templated candidate that matches — the eval battery must NEVER appear in training data
+/// (see GUARDS_TO_99_PLAN.md A1). Self-maintaining: always reflects the current battery.
+fn load_eval_prompts() -> HashSet<String> {
+    let src = ["src-tauri/tests/llm_eval.rs", "tests/llm_eval.rs", "../src-tauri/tests/llm_eval.rs"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let mut set = HashSet::new();
+    for chunk in src.split("prompt:").skip(1) {
+        // Extract the first double-quoted string literal on this `prompt:` line (bail at newline).
+        let mut chars = chunk.chars();
+        let mut opened = false;
+        for c in chars.by_ref() {
+            if c == '"' {
+                opened = true;
+                break;
+            }
+            if c == '\n' {
+                break;
+            }
+        }
+        if !opened {
+            continue;
+        }
+        let (mut s, mut esc) = (String::new(), false);
+        for c in chars {
+            if esc {
+                s.push(if c == 'n' { ' ' } else { c });
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                break;
+            } else {
+                s.push(c);
+            }
+        }
+        let n = normalize_prompt(&s);
+        if !n.is_empty() {
+            set.insert(n);
+        }
+    }
+    set
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -178,9 +240,19 @@ async fn main() {
     let pp_model = arg(&args, "--paraphrase-model").or_else(|| std::env::var("PUSHIN_PARAPHRASE_MODEL").ok()).unwrap_or_else(|| model.clone());
 
     let all = templates::all();
+    // Anti-leakage (GUARDS_TO_99_PLAN.md A1): never train on a prompt that appears in the held-out
+    // battery. Drop any templated candidate whose normalized text matches an `llm_eval.rs` prompt.
+    let eval_prompts = load_eval_prompts();
+    let leaked_dropped = all.iter().filter(|t| eval_prompts.contains(&normalize_prompt(&t.prompt))).count();
+    if eval_prompts.is_empty() {
+        eprintln!("⚠️  Anti-leakage: couldn't read llm_eval.rs — eval denylist is EMPTY. Run from the project root so the battery can be excluded from training.");
+    } else {
+        println!("Anti-leakage: {} battery prompts loaded; {leaked_dropped} templated candidate(s) denied (would have leaked into training).", eval_prompts.len());
+    }
     let templates: Vec<templates::Template> = all
         .into_iter()
         .filter(|t| only.as_deref().map(|c| t.category == c).unwrap_or(true))
+        .filter(|t| !eval_prompts.contains(&normalize_prompt(&t.prompt)))
         .take(limit)
         .collect();
 
