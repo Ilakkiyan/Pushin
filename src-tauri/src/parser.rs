@@ -504,6 +504,69 @@ pub async fn route_eval(
 /// validation, task/event field recovery (days, durations, spans, deadlines), and habit routing.
 /// Shared by `plan` (the router pipeline) and the datagen `union_label` path so a training label is
 /// recovered exactly the way inference will recover the student's output.
+/// Earliest char position in `lc_text` (already lowercased) of any significant word from `title`
+/// (len ≥ 3, not a generic connector). `usize::MAX` if none — used to order multi-event creates by
+/// where each event is actually mentioned in the text, so ranges pair to the right event.
+fn title_position(lc_text: &str, title: &str) -> usize {
+    title
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !matches!(*w, "the" | "and" | "with" | "for" | "from"))
+        .filter_map(|w| lc_text.find(w))
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+/// A title for a trip the model dropped — the destination after "in/at/to" (first capitalized word),
+/// else a generic "Trip".
+fn trip_title(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        let lead = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if matches!(lead.as_str(), "in" | "at" | "to") {
+            if let Some(next) = words.get(i + 1) {
+                let n = next.trim_matches(|c: char| !c.is_alphanumeric());
+                if n.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                    return n.to_string();
+                }
+            }
+        }
+    }
+    "Trip".to_string()
+}
+
+/// The model sometimes emits NOTHING for a plainly-stated multi-day trip ("From 6/12 I'll be staying
+/// in Vietnam for two weeks") — an absolute date + a multi-week span it struggles to express as
+/// start/end times. When the plan is otherwise empty but the text clearly carries an explicit M/D date
+/// AND a multi-day span, Rust (which owns date/span math anyway) synthesizes the one all-day multi-day
+/// event the user described. Tightly gated: nothing else was produced, real date + span ≥ 2 days.
+fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
+    let empty = plan.events.is_empty()
+        && plan.update_events.is_empty()
+        && plan.remove_events.is_empty()
+        && plan.habits.is_empty()
+        && plan.projects.iter().all(|p| p.tasks.is_empty());
+    if !empty {
+        return;
+    }
+    let (Some(date), Some(span)) = (find_explicit_date(text, today), find_span_days(text)) else {
+        return;
+    };
+    if span < 2 {
+        return;
+    }
+    plan.events.push(ParsedEvent {
+        title: trip_title(text),
+        day: None,
+        date: Some(date.format("%Y-%m-%d").to_string()),
+        start_time: None,
+        end_time: None,
+        duration_minutes: None,
+        span_days: Some(span),
+    });
+    plan.clarifications.clear(); // we created the event the model asked about — no need to also ask
+}
+
 pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
     // PUSHIN_PLAN_DEBUG=1 → dump the RAW model plan (pre-recovery) so we can see exactly what the
     // model emitted vs. what recovery does to it. Diagnostic only; no effect when unset.
@@ -533,6 +596,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     route_recurring_to_habits(plan, user_text);
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
+    synthesize_dropped_trip(plan, user_text, today);
     suppress_clarifications_when_proceeding(plan, user_text);
 }
 
@@ -1960,18 +2024,33 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
         }
     }
 
-    // Multiple events, each with its OWN range in reading order ("lunch 12-2 and a party 6-10")
-    // → assign ranges to events positionally. The single-target logic below bails on multiple
-    // events, so without this each collapses to the 60-min default. Gated to equal counts (and no
-    // edits/removes) so a stray time can't shift the mapping.
+    // Multiple events, each with its OWN range ("lunch 12-2 and a graduation party 6-10") → assign
+    // ranges to events positionally. The model routinely lists the events OUT of text order and
+    // half-fills the times (one event gets a start with no end, the other an end with no start), so a
+    // naive zip by array index cross-assigns the ranges (→ 8h blocks). Pair by where each event's
+    // TITLE appears in the text, then FILL ONLY the unset side (preserving the model's correct partials,
+    // e.g. a real 6pm start). Gated: equal counts ≥2, no edits/removes, and an UNAMBIGUOUS ordering
+    // (distinct title positions) so a rename can't scramble the mapping.
     let all_ranges = find_time_ranges(user_text);
     if plan.update_events.is_empty() && plan.remove_events.is_empty() && plan.events.len() >= 2 && plan.events.len() == all_ranges.len() {
-        for (ev, (start_norm, end_raw)) in plan.events.iter_mut().zip(all_ranges.iter()) {
-            if unset(&ev.start_time) {
-                ev.start_time = Some(start_norm.format("%H:%M").to_string());
-            }
-            if unset(&ev.end_time) {
-                ev.end_time = Some(end_raw.clone());
+        let lc_text = user_text.to_lowercase();
+        let mut order: Vec<(usize, usize)> =
+            plan.events.iter().enumerate().map(|(i, e)| (title_position(&lc_text, &e.title), i)).collect();
+        order.sort_by_key(|(pos, _)| *pos);
+        let distinct = {
+            let mut ps: Vec<usize> = order.iter().map(|(p, _)| *p).collect();
+            ps.dedup();
+            ps.len() == order.len()
+        };
+        if distinct {
+            for ((_, ev_idx), (start_norm, end_raw)) in order.iter().zip(all_ranges.iter()) {
+                let ev = &mut plan.events[*ev_idx];
+                if unset(&ev.start_time) {
+                    ev.start_time = Some(start_norm.format("%H:%M").to_string());
+                }
+                if unset(&ev.end_time) {
+                    ev.end_time = Some(end_raw.clone());
+                }
             }
         }
     }
@@ -2280,8 +2359,31 @@ fn promote_timed_work_to_block(plan: &mut ParsedPlan, text: &str) {
     if EDIT.iter().any(|p| lc.contains(p)) {
         return;
     }
-    // Exactly one explicit clock range.
     let ranges = find_time_ranges(text);
+
+    // Vague part-of-day chore with NO clock time ("spend Saturday afternoon cleaning the garage"):
+    // the model fabricates a clock time and files it as a fixed event, but the user gave only a rough
+    // window — it's really a flexible task. Demote the lone created event to a task. Gated hard: work
+    // verb (already matched above) + a part-of-day word + NO digit anywhere (so any time the model set
+    // is certainly invented) + a single plain create with no tasks/edits/removes.
+    const PART_OF_DAY: &[&str] = &["morning", "afternoon", "evening", "night", "weekend"];
+    if ranges.is_empty()
+        && !text.chars().any(|c| c.is_ascii_digit())
+        && PART_OF_DAY.iter().any(|w| lc.contains(w))
+        && plan.events.len() == 1
+        && plan.update_events.is_empty()
+        && plan.remove_events.is_empty()
+        && plan.projects.iter().all(|p| p.tasks.is_empty())
+    {
+        let title = plan.events.remove(0).title;
+        match plan.projects.first_mut() {
+            Some(p) => p.tasks.push(ParsedTask { title, ..Default::default() }),
+            None => plan.projects.push(ParsedProject { name: title.clone(), tasks: vec![ParsedTask { title, ..Default::default() }] }),
+        }
+        return;
+    }
+
+    // Exactly one explicit clock range.
     if ranges.len() != 1 {
         return;
     }
@@ -4565,6 +4667,57 @@ mod tests {
         apply_recovery(&mut plan, "spend Saturday afternoon cleaning the garage", d());
         assert!(plan.events.is_empty(), "no block fabricated");
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "task survives");
+    }
+
+    #[test]
+    fn vague_part_of_day_chore_event_demotes_to_task() {
+        // The model instead FILES the chore as a fixed event with an invented time ("spend Saturday
+        // afternoon cleaning" → event at 14:30). No clock time was given → demote to a flexible task.
+        let mut e = ev("saturday", Some("14:30"), Some("15:30"));
+        e.title = "Clean Out Garage".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "Spend Saturday afternoon cleaning out the garage.", d());
+        assert!(plan.events.is_empty(), "fabricated-time event removed");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "became one task");
+        assert!(plan.projects[0].tasks[0].title.to_lowercase().contains("garage"), "keeps the chore title");
+    }
+
+    #[test]
+    fn synthesizes_multi_day_trip_the_model_dropped() {
+        // "From 6/12 I'll be staying in Vietnam for two weeks" — the model emits nothing; Rust owns the
+        // date + span, so recover the one all-day multi-day event.
+        let conn = crate::db::test_conn();
+        let mut plan = ParsedPlan::default();
+        apply_recovery(&mut plan, "From 6/12 I'll be staying in Vietnam for two weeks.", d());
+        assert_eq!(plan.events.len(), 1, "trip event synthesized");
+        assert!(plan.events[0].title.to_lowercase().contains("vietnam"), "destination title");
+        let out = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(out.created_event_ids.len(), 1);
+        let e = crate::db::list_events(&conn).unwrap().into_iter().next().unwrap();
+        assert!(e.start.contains("T00:00:00"), "all-day start: {}", e.start);
+        let (s, en) = (parse_dt(&e.start).unwrap(), parse_dt(&e.end).unwrap());
+        assert!((en - s).num_days() >= 13, "spans ~2 weeks: {} days", (en - s).num_days());
+    }
+
+    #[test]
+    fn multi_event_ranges_pair_by_text_position() {
+        // The model lists the events OUT of text order and half-fills each: party gets a real 6pm
+        // start but no end; lunch gets an end but no start. Naive array-order pairing cross-assigns the
+        // ranges into 8h blocks. Position pairing must give lunch 12-2 (2h) and party 6-10 (4h).
+        let mut party = ev("friday", Some("18:00"), None);
+        party.title = "Graduation Party".into();
+        let mut lunch = ev("friday", None, Some("2"));
+        lunch.title = "Lunch with Mom".into();
+        let mut plan = ParsedPlan { events: vec![party, lunch], ..Default::default() };
+        apply_recovery(&mut plan, "Lunch with mom Friday 12-2 and a graduation party from 6-10.", d());
+        let conn = crate::db::test_conn();
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let evs = crate::db::list_events(&conn).unwrap();
+        let dur = |needle: &str| {
+            evs.iter().find(|e| e.title.to_lowercase().contains(needle)).map(|e| (parse_dt(&e.end).unwrap() - parse_dt(&e.start).unwrap()).num_minutes())
+        };
+        assert_eq!(dur("lunch"), Some(120), "lunch 12-2 = 2h");
+        assert_eq!(dur("party"), Some(240), "party 6-10 = 4h");
     }
 
     #[test]
