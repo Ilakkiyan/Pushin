@@ -1025,6 +1025,16 @@ async fn llm_eval() {
                 o.created_event_titles, o.updated_event_titles, o.removed_event_titles, o.created_task_ids.len(), o.created_habit_names, o.clarifications
             );
         }
+        // PUSHIN_EVAL_DEBUG=1 → dump the resolved times/deadlines so root-causing a ✗ doesn't need a rebuild.
+        if std::env::var("PUSHIN_EVAL_DEBUG").is_ok() {
+            for ev in db::list_events(&conn).unwrap_or_default() {
+                let mins = parse(&ev.start).zip(parse(&ev.end)).map(|(s, e)| (e - s).num_minutes()).unwrap_or(-1);
+                println!("        DBG event {:?}  {} → {}  ({}m)", ev.title, ev.start, ev.end, mins);
+            }
+            for t in db::list_tasks(&conn).unwrap_or_default() {
+                println!("        DBG task  {:?}  deadline={:?} est={}m prio={}", t.title, t.deadline, t.estimated_minutes, t.priority);
+            }
+        }
 
         let e = by_cat.entry(case.category).or_default();
         e.0 += passed;

@@ -505,6 +505,22 @@ pub async fn route_eval(
 /// Shared by `plan` (the router pipeline) and the datagen `union_label` path so a training label is
 /// recovered exactly the way inference will recover the student's output.
 pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
+    // PUSHIN_PLAN_DEBUG=1 → dump the RAW model plan (pre-recovery) so we can see exactly what the
+    // model emitted vs. what recovery does to it. Diagnostic only; no effect when unset.
+    if std::env::var("PUSHIN_PLAN_DEBUG").is_ok() {
+        println!("        RAW user={user_text:?}");
+        for e in &plan.events {
+            println!("          RAW event {:?} day={:?} start={:?} end={:?} dur={:?} span={:?}", e.title, e.day, e.start_time, e.end_time, e.duration_minutes, e.span_days);
+        }
+        for u in &plan.update_events {
+            println!("          RAW update match={:?} start={:?} end={:?} dur={:?}", u.target, u.start_time, u.end_time, u.duration_minutes);
+        }
+        for p in &plan.projects {
+            for t in &p.tasks {
+                println!("          RAW task {:?} deadline={:?}", t.title, t.deadline);
+            }
+        }
+    }
     unescape_plan(plan);
     resolve_task_deadlines(plan);
     backfill_task_fields(plan, user_text, today);
@@ -2175,7 +2191,16 @@ fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
     if total == 0 {
         return;
     }
-    let task_only = plan.events.is_empty() && plan.update_events.is_empty();
+    // A spurious "update the <day> event" — the model sometimes misroutes a deadline day-word as a
+    // phantom event edit ("prep for exam Friday: …" → updateEvent match="Friday"). It matches no real
+    // event and is dropped later, so it must NOT count as a real edit that suppresses task-deadline
+    // inference below. Only an update whose entire target IS a bare day word is treated as spurious.
+    let real_updates = plan
+        .update_events
+        .iter()
+        .filter(|u| resolve_day(today, u.target.trim()).is_none())
+        .count();
+    let task_only = plan.events.is_empty() && real_updates == 0;
     let mut deadlines = find_deadline_dates(text, today);
     // Fallback: in a message that's purely about tasks, a lone day word is the deadline
     // ("prep for my exam friday: review chapters…" → due Friday). Gated to task-only + exactly
@@ -4662,6 +4687,31 @@ mod tests {
         let mut plan = ParsedPlan { projects: vec![proj], ..Default::default() };
         apply_recovery(&mut plan, "prep for my exam friday: review 4 chapters, do 2 practice tests, and make a cheat sheet", d());
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 3, "the listed breakdown is kept");
+    }
+
+    #[test]
+    fn lone_day_deadline_survives_a_spurious_day_word_update() {
+        // The tuned model sometimes misroutes the deadline day as a phantom event edit
+        // (updateEvent match="Friday"). That must not suppress the "lone day word → deadline for
+        // every task" fallback — all three tasks should still inherit the Friday deadline.
+        let mk = |t: &str| ParsedTask { title: t.into(), ..Default::default() };
+        let proj = ParsedProject { name: "Exam prep".into(), tasks: vec![mk("review chapters"), mk("do practice tests"), mk("make cheat sheet")] };
+        let spurious = UpdateEvent {
+            target: "Friday".into(),
+            title: None,
+            day: None,
+            start_time: Some("17:59".into()),
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+            shift_minutes: None,
+        };
+        let mut plan = ParsedPlan { projects: vec![proj], update_events: vec![spurious], ..Default::default() };
+        apply_recovery(&mut plan, "prep for my exam friday: review 4 chapters, do 2 practice tests, and make a cheat sheet", d());
+        let deadlines: Vec<_> = plan.projects.iter().flat_map(|p| &p.tasks).map(|t| t.deadline.clone()).collect();
+        assert_eq!(deadlines.len(), 3, "all three tasks kept");
+        assert!(deadlines.iter().all(|dl| dl.is_some()), "every task inherits the Friday deadline: {deadlines:?}");
     }
 
     #[test]
