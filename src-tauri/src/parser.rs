@@ -421,6 +421,54 @@ Events already on the calendar (reference these to change or remove them):\n\
 /// **router pipeline (`route_intents` + `extract_by_intents`) is kept as a fallback** for the rare
 /// case the union call fails outright. The deterministic recovery layer (`apply_recovery`) and
 /// `store_plan` operate on the assembled `ParsedPlan` either way. Holds no DB lock.
+/// Split a long, rambling, multi-intent message into single-intent clauses so each can be extracted on
+/// its own — small models reliably drop intents when several are packed into one message ("dentist at
+/// 2, and move my standup… also remind me to call mom" → only the dentist survives a single call).
+/// CONSERVATIVE by design: only fires on genuinely long, multi-clause messages (≥18 words AND a strong
+/// multi-clause signal), and never splits a bare " and " ("lunch with mom and dad") — short multi-item
+/// messages parse fine in one call and are left untouched. Returns `[whole]` when it shouldn't chunk.
+fn split_intents(text: &str) -> Vec<String> {
+    let words = text.split_whitespace().count();
+    let lc = text.to_lowercase();
+    let sentences = text.matches(". ").count() + text.matches("! ").count() + text.matches("? ").count();
+    let has_signal = lc.contains(" also ") || sentences >= 2 || lc.matches(" and ").count() >= 2 || lc.contains(", and ");
+    if words < 18 || !has_signal {
+        return vec![text.to_string()];
+    }
+    let mut s = text.to_string();
+    for sep in [". ", "! ", "? ", "; ", " also ", " Also ", ", and ", " and then ", " then "] {
+        s = s.replace(sep, "\u{1}");
+    }
+    let chunks: Vec<String> = s
+        .split('\u{1}')
+        .map(|c| c.trim().trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';').trim().to_string())
+        .filter(|c| c.split_whitespace().count() >= 2 && c.chars().any(|ch| ch.is_alphabetic()))
+        .collect();
+    if chunks.len() >= 2 {
+        chunks
+    } else {
+        vec![text.to_string()]
+    }
+}
+
+/// Merge a per-clause raw plan into the accumulator, skipping obvious duplicates.
+fn merge_raw_plans(dst: &mut ParsedPlan, src: ParsedPlan) {
+    for e in src.events {
+        if !dst.events.iter().any(|d| d.title.eq_ignore_ascii_case(&e.title) && d.start_time == e.start_time) {
+            dst.events.push(e);
+        }
+    }
+    dst.update_events.extend(src.update_events);
+    dst.remove_events.extend(src.remove_events);
+    for h in src.habits {
+        if !dst.habits.iter().any(|d| d.name.eq_ignore_ascii_case(&h.name)) {
+            dst.habits.push(h);
+        }
+    }
+    dst.projects.extend(src.projects);
+    dst.clarifications.extend(src.clarifications);
+}
+
 pub async fn plan(
     client: &reqwest::Client,
     settings: &Settings,
@@ -435,14 +483,37 @@ pub async fn plan(
     // deterministic recovery layer was tuned against. The router pipeline is retained as a fallback
     // for the rare case the union call fails outright (network/HTTP error or unparseable JSON), so a
     // clear request never silently does nothing.
-    let mut parsed = match union_extract(client, settings, current_events, history, user_text, memory).await {
-        Ok(p) => p,
-        Err(_) => match route_intents(client, settings, current_events, history, user_text).await {
-            Ok(intents) if !intents.is_empty() => {
-                extract_by_intents(client, settings, current_events, history, user_text, &intents).await.unwrap_or_default()
+    // Long, rambling, multi-intent messages: extract each clause on its own (small models drop intents
+    // when several are packed together) and merge. Falls back to whole-message extraction if chunking
+    // yields nothing. Short/simple messages skip this entirely (`split_intents` returns `[whole]`).
+    let chunks = split_intents(user_text);
+    let mut parsed = if chunks.len() > 1 {
+        let mut merged = ParsedPlan::default();
+        for chunk in &chunks {
+            if let Ok(p) = union_extract(client, settings, current_events, history, chunk, memory).await {
+                merge_raw_plans(&mut merged, p);
             }
-            _ => ParsedPlan::default(),
-        },
+        }
+        let empty = merged.events.is_empty()
+            && merged.update_events.is_empty()
+            && merged.remove_events.is_empty()
+            && merged.habits.is_empty()
+            && merged.projects.iter().all(|p| p.tasks.is_empty());
+        if empty {
+            union_extract(client, settings, current_events, history, user_text, memory).await.unwrap_or_default()
+        } else {
+            merged
+        }
+    } else {
+        match union_extract(client, settings, current_events, history, user_text, memory).await {
+            Ok(p) => p,
+            Err(_) => match route_intents(client, settings, current_events, history, user_text).await {
+                Ok(intents) if !intents.is_empty() => {
+                    extract_by_intents(client, settings, current_events, history, user_text, &intents).await.unwrap_or_default()
+                }
+                _ => ParsedPlan::default(),
+            },
+        }
     };
 
     apply_recovery(&mut parsed, user_text, Local::now().naive_local().date());
@@ -4858,6 +4929,19 @@ mod tests {
         };
         apply_recovery(&mut plan, "team retro every other tuesday at 4", d());
         assert_eq!(plan.habits.len(), 1, "duplicate habit dropped");
+    }
+
+    #[test]
+    fn split_intents_chunks_only_rambling_multi_intent() {
+        // Short multi-item messages parse fine in one call — NOT chunked (guards against over-splitting).
+        assert_eq!(split_intents("add gym at 6 and lunch at 12").len(), 1);
+        assert_eq!(split_intents("dinner with mom and dad at 7").len(), 1, "bare 'and' inside one intent never splits");
+        // Long, rambling, multi-intent → split into single-intent clauses.
+        let r = split_intents("ok so monday i've got the dentist at 2, and honestly i should move my standup which is usually 9 to 9:30. also remind me to call my mom at some point");
+        assert!(r.len() >= 3, "rambling message split into clauses: {r:?}");
+        assert!(r.iter().any(|c| c.contains("dentist")));
+        assert!(r.iter().any(|c| c.contains("standup")));
+        assert!(r.iter().any(|c| c.contains("mom")));
     }
 
     #[test]
