@@ -549,7 +549,8 @@ fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) 
     if !empty {
         return;
     }
-    let (Some(date), Some(span)) = (find_explicit_date(text, today), find_span_days(text)) else {
+    let date = find_explicit_date(text, today).or_else(|| find_day_of_month(text, today));
+    let (Some(date), Some(span)) = (date, find_span_days(text)) else {
         return;
     };
     if span < 2 {
@@ -565,6 +566,67 @@ fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) 
         span_days: Some(span),
     });
     plan.clarifications.clear(); // we created the event the model asked about — no need to also ask
+}
+
+/// The model sometimes DUPLICATES what it just created — a second event at the same start time
+/// ("quick 5 min sync with raj at 3:15" → "Sync with Raj" 3:15 AND "Quick Sync" 3:15) or a second
+/// habit for one routine ("every other tuesday retro" → "Team Retro" + "Retro Day"). Drop the later
+/// duplicate: an event sharing a start time AND a significant title word with an earlier one, or a
+/// habit sharing a significant word. Runs early so the survivor still picks up duration/day recovery.
+fn dedup_same_time_and_habits(plan: &mut ParsedPlan) {
+    let mut kept: Vec<ParsedEvent> = Vec::with_capacity(plan.events.len());
+    for ev in std::mem::take(&mut plan.events) {
+        let t = ev.start_time.as_deref().and_then(parse_hm);
+        // Compare PARSED start times ("3:15pm" == "15:15"), not raw strings; a shared significant title
+        // word confirms it's the same thing duplicated, not two distinct events that happen to coincide.
+        let dup = t.is_some() && kept.iter().any(|k| k.start_time.as_deref().and_then(parse_hm) == t && shares_significant_word(&k.title, &ev.title));
+        if !dup {
+            kept.push(ev);
+        }
+    }
+    plan.events = kept;
+
+    let mut kh: Vec<ParsedHabit> = Vec::with_capacity(plan.habits.len());
+    for h in std::mem::take(&mut plan.habits) {
+        if !kh.iter().any(|k| shares_significant_word(&k.name, &h.name)) {
+            kh.push(h);
+        }
+    }
+    plan.habits = kh;
+}
+
+/// The model invents a wild end time for an event it was given no length for ("dentist at 2" →
+/// 14:00–21:30). When an event's model start→end gap is implausibly long (> 6h) and NO explicit range
+/// in the text justifies a block that long (and it isn't all-day / duration-stated), clear the end so
+/// it falls back to the sane 60-min default.
+fn clamp_absurd_event_durations(plan: &mut ParsedPlan, text: &str) {
+    if find_duration_minutes(text).is_some() || find_all_day(text) {
+        return; // the user stated a length / all-day — trust it
+    }
+    let dummy = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let range_durs: Vec<i64> = find_time_ranges(text)
+        .iter()
+        .map(|(s, e)| {
+            let start = dummy.and_time(*s);
+            (compute_end(start, Some(e)) - start).num_minutes()
+        })
+        .collect();
+    for ev in &mut plan.events {
+        if ev.span_days.is_some() {
+            continue;
+        }
+        // Compute the real duration via compute_end so PM-less/overnight ends ("2" → 14:00) aren't
+        // mistaken for absurd gaps — mirrors how range durations are measured above.
+        let (Some(s), true) = (ev.start_time.as_deref().and_then(parse_hm), ev.end_time.as_deref().and_then(parse_hm).is_some()) else {
+            continue;
+        };
+        let start = dummy.and_time(s);
+        let mins = (compute_end(start, ev.end_time.as_deref()) - start).num_minutes();
+        let justified = range_durs.iter().any(|d| (d - mins).abs() <= 15);
+        if mins > 360 && !justified {
+            ev.end_time = None; // → default 60m in resolve_event
+        }
+    }
 }
 
 pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
@@ -589,11 +651,13 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
     backfill_event_fields(plan, user_text, today);
+    clamp_absurd_event_durations(plan, user_text);
     merge_split_event_fragments(plan);
     promote_timed_work_to_block(plan, user_text);
     collapse_unrequested_decomposition(plan, user_text);
     drop_unrequested_prep_tasks(plan, user_text);
     route_recurring_to_habits(plan, user_text);
+    dedup_same_time_and_habits(plan); // after backfill fills starts + route_recurring adds habits
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
     synthesize_dropped_trip(plan, user_text, today);
@@ -1712,6 +1776,9 @@ fn word_number(w: &str) -> Option<i64> {
 /// all-day multi-day events (trips), which the model can't express as start/end times.
 fn find_span_days(text: &str) -> Option<i64> {
     let lower = text.to_lowercase();
+    if lower.contains("fortnight") {
+        return Some(14);
+    }
     let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
     for w in toks.windows(2) {
         let count = w[0].parse::<i64>().ok().or_else(|| word_number(w[0]));
@@ -4741,6 +4808,65 @@ mod tests {
         assert_eq!(parse_hm("2pm"), NaiveTime::from_hms_opt(14, 0, 0));
         assert_eq!(parse_hm("14:00:00"), NaiveTime::from_hms_opt(14, 0, 0));
         assert_eq!(parse_hm("9999"), None, "invalid compact rejected");
+    }
+
+    #[test]
+    fn clamps_absurd_fabricated_duration() {
+        // "dentist at 2" — the model invents a 7.5h end (14:00→21:30). No stated length → 60-min default.
+        let mut e = ev("today", Some("14:00"), Some("21:30"));
+        e.title = "Dentist".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "monday i've got the dentist at 2", d());
+        let conn = crate::db::test_conn();
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let ev = crate::db::list_events(&conn).unwrap().into_iter().next().unwrap();
+        let mins = (parse_dt(&ev.end).unwrap() - parse_dt(&ev.start).unwrap()).num_minutes();
+        assert_eq!(mins, 60, "absurd 7.5h clamped to 60m default, got {mins}");
+    }
+
+    #[test]
+    fn absurd_clamp_spares_a_real_long_range() {
+        // A genuinely long block the user stated as a range ("9 to 5 workshop" = 8h) is NOT clamped.
+        let mut e = ev("today", Some("09:00"), Some("17:00"));
+        e.title = "Workshop".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "all-hands workshop 9 to 5 today", d());
+        let conn = crate::db::test_conn();
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let ev = crate::db::list_events(&conn).unwrap().into_iter().next().unwrap();
+        let mins = (parse_dt(&ev.end).unwrap() - parse_dt(&ev.start).unwrap()).num_minutes();
+        assert_eq!(mins, 480, "stated 8h range preserved, got {mins}");
+    }
+
+    #[test]
+    fn dedups_same_time_duplicate_event() {
+        // "quick 5 min sync with raj at 3:15" → model duplicates: "Sync with Raj" + "Quick Sync" at 15:15.
+        let mut a = ev("tomorrow", Some("15:15"), Some("16:15"));
+        a.title = "Sync with Raj".into();
+        let mut b = ev("tomorrow", Some("15:15"), Some("15:20"));
+        b.title = "Quick Sync".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "quick 5 min sync with raj at quarter past 3 tomorrow", d());
+        assert_eq!(plan.events.len(), 1, "same-time duplicate dropped");
+    }
+
+    #[test]
+    fn dedups_duplicate_habit() {
+        let mut plan = ParsedPlan {
+            habits: vec![ParsedHabit { name: "Team Retro".into(), ..Default::default() }, ParsedHabit { name: "Retro Day".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        apply_recovery(&mut plan, "team retro every other tuesday at 4", d());
+        assert_eq!(plan.habits.len(), 1, "duplicate habit dropped");
+    }
+
+    #[test]
+    fn synthesizes_trip_from_fortnight_and_day_of_month() {
+        // "off the grid from the 20th for a fortnight" — "the 20th" (day-of-month) + "fortnight" (14d).
+        let mut plan = ParsedPlan::default();
+        apply_recovery(&mut plan, "i'm off the grid from the 20th for a fortnight", d());
+        assert_eq!(plan.events.len(), 1, "trip synthesized");
+        assert_eq!(plan.events[0].span_days, Some(14), "fortnight = 14 days");
     }
 
     #[test]
