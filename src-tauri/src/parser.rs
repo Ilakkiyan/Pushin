@@ -639,6 +639,37 @@ fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) 
     plan.clarifications.clear(); // we created the event the model asked about — no need to also ask
 }
 
+/// A pure cancellation must never CREATE the thing being cancelled ("cancel all my meetings friday" →
+/// the model made a "Meeting" event). When the message is dominantly a removal (a cancel/delete verb
+/// and NO create verb), reclassify any created events as removals by title. Chunking isolates a
+/// "cancel …" clause from an "add …" clause, so per-chunk this stays a pure removal.
+fn remove_verb_creates_become_removes(plan: &mut ParsedPlan, text: &str) {
+    // (a) An event whose TITLE begins with a cancellation verb ("Cancel Meetings Friday") is always a
+    // mis-routed removal — reclassify it, stripping the verb for the match needle. Catches the case
+    // even when a "cancel …" clause shares a chunk with an "add …" clause.
+    let mut i = 0;
+    while i < plan.events.len() {
+        let l = plan.events[i].title.trim().to_lowercase();
+        if l.starts_with("cancel ") || l.starts_with("delete ") || l.starts_with("remove ") || l.starts_with("get rid of ") {
+            let e = plan.events.remove(i);
+            let needle = e.title.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+            plan.remove_events.push(if needle.trim().is_empty() { e.title } else { needle });
+        } else {
+            i += 1;
+        }
+    }
+    // (b) A dominantly-removal message (a cancel/delete verb and NO create verb): any created event is
+    // a mis-route. Chunking isolates a "cancel …" clause from an "add …" clause, so per-chunk it holds.
+    let lc = text.to_lowercase();
+    const REMOVE: &[&str] = &["cancel", "delete", "get rid of", "remove "];
+    const ADD: &[&str] = &["add ", "schedule ", "create ", "put ", "book ", "set up", "new ", "move ", "reschedule"];
+    if REMOVE.iter().any(|r| lc.contains(r)) && !ADD.iter().any(|a| lc.contains(a)) {
+        for ev in plan.events.drain(..) {
+            plan.remove_events.push(ev.title);
+        }
+    }
+}
+
 /// The model sometimes DUPLICATES what it just created — a second event at the same start time
 /// ("quick 5 min sync with raj at 3:15" → "Sync with Raj" 3:15 AND "Quick Sync" 3:15) or a second
 /// habit for one routine ("every other tuesday retro" → "Team Retro" + "Retro Day"). Drop the later
@@ -728,6 +759,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     collapse_unrequested_decomposition(plan, user_text);
     drop_unrequested_prep_tasks(plan, user_text);
     route_recurring_to_habits(plan, user_text);
+    remove_verb_creates_become_removes(plan, user_text);
     dedup_same_time_and_habits(plan); // after backfill fills starts + route_recurring adds habits
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
@@ -4929,6 +4961,30 @@ mod tests {
         };
         apply_recovery(&mut plan, "team retro every other tuesday at 4", d());
         assert_eq!(plan.habits.len(), 1, "duplicate habit dropped");
+    }
+
+    #[test]
+    fn cancel_message_becomes_a_remove_not_a_create() {
+        // "cancel all my meetings friday" — the model made a "Meeting" event. A pure cancellation must
+        // reclassify it as a removal, never create the thing being cancelled.
+        let mut e = ev("friday", Some("14:00"), Some("15:00"));
+        e.title = "Meeting".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "cancel all my meetings friday", d());
+        assert!(plan.events.is_empty(), "no event created for a cancel");
+        assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("meeting")), "converted to a remove: {:?}", plan.remove_events);
+    }
+
+    #[test]
+    fn event_titled_cancel_x_becomes_a_remove() {
+        // Even in a mixed chunk (cancel + add), an event the model literally titled "Cancel Meetings
+        // Friday" is a mis-routed removal, not a create.
+        let mut e = ev("friday", Some("12:00"), Some("13:00"));
+        e.title = "Cancel Meetings Friday".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "cancel all my meetings friday and add a deep work block", d());
+        assert!(plan.events.is_empty(), "cancel-titled event not left as a create");
+        assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("meeting")), "→ remove: {:?}", plan.remove_events);
     }
 
     #[test]
