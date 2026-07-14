@@ -9,6 +9,14 @@ import type { Page } from "@playwright/test";
 export async function installMockBridge(page: Page) {
   await page.addInitScript(() => {
     /* eslint-disable @typescript-eslint/no-explicit-any */
+    // Suppress the post-update "What's New" overlay in E2E — it appears asynchronously after
+    // getVersion() resolves and intercepts pointer events, flaking slower flows. Seed lastSeenVersion
+    // to match the mocked app version (below) so `last === v` and the intro never shows.
+    try {
+      localStorage.setItem("pushin:lastSeenVersion", "0.0.0-e2e");
+    } catch {
+      /* ignore */
+    }
     const state: any = {
       nextId: 1,
       pages: [] as any[],
@@ -131,6 +139,7 @@ export async function installMockBridge(page: Page) {
         if (handlers[cmd]) return Promise.resolve(handlers[cmd](args || {}));
         // Tauri plugin calls (window controls, events): safe defaults so nothing throws on boot.
         if (cmd.startsWith("plugin:")) {
+          if (cmd.includes("|version")) return Promise.resolve("0.0.0-e2e"); // getVersion() → matches seeded lastSeenVersion
           if (cmd.includes("is_") || cmd.includes("fullscreen") || cmd.includes("maximize")) return Promise.resolve(false);
           return Promise.resolve(0);
         }
