@@ -639,6 +639,37 @@ fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) 
     plan.clarifications.clear(); // we created the event the model asked about — no need to also ask
 }
 
+/// When a short command clearly wants an action ("move it", "put it in for later", "schedule that
+/// thing") but names no resolvable subject/time — and the model produced NOTHING — ask instead of
+/// silently doing nothing. A good clarifying question is a success, not a miss.
+fn ask_when_ambiguous_command(plan: &mut ParsedPlan, text: &str) {
+    let empty = plan.events.is_empty()
+        && plan.update_events.is_empty()
+        && plan.remove_events.is_empty()
+        && plan.habits.is_empty()
+        && plan.projects.iter().all(|p| p.tasks.is_empty())
+        && plan.clarifications.is_empty();
+    if !empty {
+        return;
+    }
+    let lc = text.to_lowercase();
+    if text.split_whitespace().count() > 8 {
+        return; // long messages that produced nothing are handled elsewhere (restraint/queries)
+    }
+    let vague = [" it", " that", " this", " them", " those", "thing"].iter().any(|v| lc.contains(v));
+    if !vague {
+        return;
+    }
+    // Only ask on an EDIT verb *leading* the message — "move it", "change it", "reschedule that".
+    // (Create-ish "schedule it"/"add it" are usually affirmative replies, already handled by
+    // suppress_clarifications_when_proceeding; asking there would re-open a settled turn.)
+    const EDIT: &[&str] = &["move", "change", "cancel", "reschedule", "push", "shift", "delete", "remove"];
+    let first = lc.split_whitespace().next().unwrap_or("");
+    if EDIT.contains(&first) {
+        plan.clarifications.push("Which event would you like to change, and to what?".to_string());
+    }
+}
+
 /// A pure cancellation must never CREATE the thing being cancelled ("cancel all my meetings friday" →
 /// the model made a "Meeting" event). When the message is dominantly a removal (a cancel/delete verb
 /// and NO create verb), reclassify any created events as removals by title. Chunking isolates a
@@ -765,6 +796,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     apply_restraint_guard(plan, user_text, today);
     synthesize_dropped_trip(plan, user_text, today);
     suppress_clarifications_when_proceeding(plan, user_text);
+    ask_when_ambiguous_command(plan, user_text); // last: only asks when nothing else was produced
 }
 
 /// **Split-event / fabrication guard.** The fine-tuned student sometimes chops ONE event into several:
@@ -2097,11 +2129,17 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
     // --- "full day" / "all day": mark every targeted event all-day (span 1), unless it
     // already has a multi-day span. Applies broadly since "all day" is unambiguous. ---
     if find_all_day(user_text) {
+        // Only mark all-day an item with NO specific clock time — "free all day saturday EXCEPT soccer
+        // 10 to noon" must not turn the timed 10–noon soccer into an all-day block.
         for ev in &mut plan.events {
-            ev.span_days = ev.span_days.or(Some(1));
+            if ev.start_time.as_deref().and_then(parse_hm).is_none() {
+                ev.span_days = ev.span_days.or(Some(1));
+            }
         }
         for up in &mut plan.update_events {
-            up.span_days = up.span_days.or(Some(1));
+            if up.start_time.as_deref().and_then(parse_hm).is_none() {
+                up.span_days = up.span_days.or(Some(1));
+            }
         }
     }
 
@@ -4985,6 +5023,35 @@ mod tests {
         apply_recovery(&mut plan, "cancel all my meetings friday and add a deep work block", d());
         assert!(plan.events.is_empty(), "cancel-titled event not left as a create");
         assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("meeting")), "→ remove: {:?}", plan.remove_events);
+    }
+
+    #[test]
+    fn all_day_spares_a_timed_event_after_except() {
+        // "free all day saturday except soccer 10 to noon" — soccer has a specific time; it must stay a
+        // 10–noon event, not become an all-day block.
+        let mut e = ev("saturday", Some("10:00"), Some("12:00"));
+        e.title = "Soccer".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "i'm free all day saturday except i have soccer 10 to noon", d());
+        assert_eq!(plan.events.len(), 1);
+        assert_eq!(plan.events[0].span_days, None, "timed event not made all-day");
+    }
+
+    #[test]
+    fn ambiguous_bare_command_asks_a_question() {
+        let mut plan = ParsedPlan::default(); // the model produced nothing for "move it"
+        apply_recovery(&mut plan, "move it", d());
+        assert!(plan.clarifications.iter().any(|c| c.contains('?')), "asks a question: {:?}", plan.clarifications);
+        assert!(plan.events.is_empty() && plan.update_events.is_empty());
+    }
+
+    #[test]
+    fn concrete_command_does_not_ask() {
+        // A concrete create (subject + time) must NOT trigger the ambiguity question.
+        let e = ev("today", Some("14:00"), Some("15:00"));
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "add lunch at 2pm", d());
+        assert!(plan.clarifications.is_empty(), "no question for a concrete command: {:?}", plan.clarifications);
     }
 
     #[test]
