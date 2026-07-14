@@ -644,6 +644,21 @@ fn synthesize_dropped_trip(plan: &mut ParsedPlan, text: &str, today: NaiveDate) 
     plan.clarifications.clear(); // we created the event the model asked about — no need to also ask
 }
 
+/// A stated length applies to a LONE event even when the message also cancels or lists other things
+/// ("cancel my meetings, add a 3 HOUR deep work block" → 3h, not the 60-min default). The single-create
+/// duration path bails when a removal/task is also present; this recovers that. Gated to exactly one
+/// event + no explicit clock range in the text (a range would already govern the length).
+fn apply_lone_duration_to_lone_event(plan: &mut ParsedPlan, text: &str) {
+    if plan.events.len() != 1 || !find_time_ranges(text).is_empty() {
+        return;
+    }
+    if let Some(d) = find_duration_minutes(text).and_then(sane_duration) {
+        let ev = &mut plan.events[0];
+        ev.duration_minutes = Some(d);
+        ev.end_time = None;
+    }
+}
+
 /// When a short command clearly wants an action ("move it", "put it in for later", "schedule that
 /// thing") but names no resolvable subject/time — and the model produced NOTHING — ask instead of
 /// silently doing nothing. A good clarifying question is a success, not a miss.
@@ -797,6 +812,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     route_recurring_to_habits(plan, user_text);
     remove_verb_creates_become_removes(plan, user_text);
     dedup_same_time_and_habits(plan); // after backfill fills starts + route_recurring adds habits
+    apply_lone_duration_to_lone_event(plan, user_text); // after cancels/dups settle to a lone event
     strip_example_boilerplate(plan, user_text);
     apply_restraint_guard(plan, user_text, today);
     synthesize_dropped_trip(plan, user_text, today);
@@ -5028,6 +5044,21 @@ mod tests {
         apply_recovery(&mut plan, "cancel all my meetings friday and add a deep work block", d());
         assert!(plan.events.is_empty(), "cancel-titled event not left as a create");
         assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("meeting")), "→ remove: {:?}", plan.remove_events);
+    }
+
+    #[test]
+    fn lone_event_duration_survives_a_cancel_in_the_message() {
+        // "cancel my meetings and add a 3 hour deep work block" — the block is 3h, not the 60-min default
+        // (the removal must not block the stated length from reaching the lone event).
+        let mut e = ev("friday", Some("09:00"), Some("10:00")); // model's 60-min guess
+        e.title = "Deep Work Block".into();
+        let mut plan = ParsedPlan { events: vec![e], remove_events: vec!["meetings".into()], ..Default::default() };
+        apply_recovery(&mut plan, "cancel all my meetings friday and add a 3 hour deep work block friday morning", d());
+        let conn = crate::db::test_conn();
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let ev = crate::db::list_events(&conn).unwrap().into_iter().find(|e| e.title.to_lowercase().contains("deep")).unwrap();
+        let mins = (parse_dt(&ev.end).unwrap() - parse_dt(&ev.start).unwrap()).num_minutes();
+        assert_eq!(mins, 180, "3 hour block applied despite the cancel, got {mins}");
     }
 
     #[test]
