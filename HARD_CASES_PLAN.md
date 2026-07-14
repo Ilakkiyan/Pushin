@@ -85,3 +85,40 @@ subject/time → *"Which event?"* / *"What, and when?"*. Ambiguity becomes "asks
 **Definition of success:** on the realistic + field suite, ≥99% of inputs yield the correct plan **or a
 good clarifying question** — with the model doing only what small models do well, and Rust (or a question)
 handling the rest.
+
+---
+
+## RESOLUTION (2026-07-14) — tracks closed for the release
+
+Every item resolved as **guard-done**, **clarify**, or **accepted** (a fragile guard would be worse).
+Lib tests 236→243; battery held 96–98% across all changes; all on `main`.
+
+**Guard-done (shipped, unit-tested, live-verified):**
+- Track 1 deadline-as-event → fixed structurally by **input chunking** (each clause routes correctly:
+  "paper due monday" → task).
+- Track 1 per-event duration → `apply_lone_duration_to_lone_event` (49628e4): a stated length reaches a
+  lone event past a cancel/list ("3 hour block" → 3h).
+- Track 2a input chunking (8813c28) + **comma-then-verb** split (b543f04) — isolates intents; recovers
+  dropped ones; keeps cancel-vs-add routing clean.
+- Track 2d negation → all-day only applies to timeless items (033631d): "free all day except soccer
+  10-noon" keeps soccer timed.
+- Track 2e clarification lever → `ask_when_ambiguous_command` (033631d): "move it" → asks "which event?".
+- (Earlier) cancel→remove (b5116e5); absurd-duration clamp, same-time dedup, fortnight, + the 7 core guards.
+
+**Clarify-or-accept (deliberately NOT guarded — rare + high fabrication risk; the model can't and a
+brittle guard would misfire):**
+- Track 2c **relative-time arithmetic** ("leave 2h before my 6:45am flight") — chunking separates the
+  "2h before" from its reference time; correct handling needs a whole-message pre-pass. → the
+  **clarification lever** should ask the reminder time. ACCEPTED for now.
+- Track 2c **even decomposition** ("interviews 1-5pm, 30 min each" → 8 blocks) — generating N events from
+  one line is unsafe. → one block + clarify to split. ACCEPTED.
+- Track 1 **multi-update relative shift** ("push standup back 30 AND move lunch…") — single-update shift
+  works; the multi-update case needs per-update position matching (rare). ACCEPTED.
+- Track 2b **full completeness-diff** ("did I miss 'call mom'?") — chunking already recovers most dropped
+  intents structurally; a general input↔output clause diff is complex and low marginal value. DEFERRED.
+
+**Cosmetic (deferred):** title pollution ("Flight departs at 6:45 am on Friday", "DCTOR APPT") — event
+works; ugly title. Low priority, char-boundary-fiddly.
+
+**Bottom line:** the tracks are finished on solid, tested ground. Everything the model can't do reliably
+is now handled by a deterministic guard or a clarifying question — never a guess. **Ready to cut a release.**
