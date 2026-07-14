@@ -1,4 +1,4 @@
-import { ArrowRight, Cpu, FolderOpen, MessagesSquare, Sparkles } from "lucide-react";
+import { ArrowRight, MessagesSquare, ShieldCheck, Sparkles } from "lucide-react";
 
 /**
  * The post-update "What's new" intro, shown once after the app updates + restarts (App.tsx detects a
@@ -10,23 +10,18 @@ import { ArrowRight, Cpu, FolderOpen, MessagesSquare, Sparkles } from "lucide-re
 const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
   {
     icon: Sparkles,
-    title: "Smarter, more reliable AI",
-    body: "A new model, fine-tuned for Pushin, turns your words into tasks and events far more accurately — and it still runs 100% on your device.",
-  },
-  {
-    icon: Cpu,
-    title: "Pick your power",
-    body: "A light model that runs on almost any machine, or the new, most-accurate 7B for complex plans — switch anytime in Settings.",
+    title: "Understands the way you actually talk",
+    body: "Ramble off a few things at once — “dentist at 2, move my standup, and remind me to call mom” — and Pushin now catches each one, cancellations and all.",
   },
   {
     icon: MessagesSquare,
-    title: "A better second brain",
-    body: "Chat mode is more thoughtful and conversational — ask it to think things through with you, all privately on-device.",
+    title: "Asks instead of guessing",
+    body: "When a request is ambiguous, Pushin asks a quick question rather than quietly doing the wrong thing.",
   },
   {
-    icon: FolderOpen,
-    title: "Your vault, as real files",
-    body: "Mirror notes to markdown in a folder you choose — edit them in Pushin or any editor, both stay in sync.",
+    icon: ShieldCheck,
+    title: "Fewer surprises",
+    body: "Sharper handling of times, durations, ranges, and multi-day trips — no more accidental all-day blocks or marathon appointments.",
   },
 ];
 

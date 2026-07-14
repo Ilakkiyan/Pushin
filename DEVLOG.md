@@ -9,6 +9,29 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-07-14
+
+### v0.7.1 — parser reliability layer + honest eval ✅
+A patch focused on making the on-device parser robust to real-world, messy input — via **deterministic
+recovery guards** on the shipped 7B (no model change). This path reliably beat every QLoRA fine-tune
+attempt (which plateaued ~91% ±5%); guards reach ~97% *stably*.
+- **~15 recovery guards** in `parser::apply_recovery`, each reproduced from real model output, tightly
+  gated, unit-tested (lib 224→**243**): multi-task deadline, hedged/absurd-duration/split-fabrication
+  guards, vague-time→task, dropped-trip synthesis, multi-event range pairing, compact-time parsing,
+  same-time dedup, cancel→remove, negation-aware all-day, per-event duration, and a **clarification
+  lever** ("move it" → asks which event instead of guessing).
+- **Input chunking** (`split_intents`): long rambling multi-intent messages are split on safe clause
+  boundaries (incl. comma-then-action-verb) and extracted per-clause, then merged — fixing the small
+  model's habit of dropping intents in busy messages. Battery held **96–98%** (no regression).
+- **Honest eval (A1):** removed ~20% eval leakage (14/69 battery prompts were in the training data) —
+  a datagen denylist + `finetune/check_leakage.py` CI tripwire. Honest (held-out) accuracy **~93%→~97%**
+  (peak run 99%), and *stable* run-to-run.
+- New **pressure harness** (`src-tauri/tests/pressure.rs`) drives weird/conversational prompts through the
+  full pipeline to surface real-world folds. Plans: [GUARDS_TO_99_PLAN.md](GUARDS_TO_99_PLAN.md),
+  [HARD_CASES_PLAN.md](HARD_CASES_PLAN.md).
+- **What's New** flow updated to reflect the reliability improvements.
+- Verified: `cargo test --lib` **243** green, `tsc` clean, live `llm_eval` 96–98%.
+
 ## 2026-06-18
 
 ### Mobile UI — responsive phone shell + single-day calendar + quick-capture FAB ✅
