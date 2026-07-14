@@ -436,6 +436,11 @@ fn split_intents(text: &str) -> Vec<String> {
         return vec![text.to_string()];
     }
     let mut s = text.to_string();
+    // "comma-then-action-verb" is a clear new intent ("cancel X, add Y") — split BEFORE the verb so it
+    // stays in the next chunk. Never a bare " and "/", " — those split "mom and dad" / "coffee, tea, and juice".
+    for verb in ["add", "cancel", "schedule", "move", "delete", "remove", "book", "put", "reschedule", "set up"] {
+        s = s.replace(&format!(", {verb} "), &format!("\u{1}{verb} "));
+    }
     for sep in [". ", "! ", "? ", "; ", " also ", " Also ", ", and ", " and then ", " then "] {
         s = s.replace(sep, "\u{1}");
     }
@@ -5065,6 +5070,14 @@ mod tests {
         assert!(r.iter().any(|c| c.contains("dentist")));
         assert!(r.iter().any(|c| c.contains("standup")));
         assert!(r.iter().any(|c| c.contains("mom")));
+    }
+
+    #[test]
+    fn split_intents_splits_on_comma_then_verb() {
+        // "cancel X, add Y" → separate intents, and the verb stays with its clause.
+        let r = split_intents("cancel all of my meetings on friday, add a 3 hour deep work block on friday morning, and prep the launch deck");
+        assert!(r.iter().any(|c| c.starts_with("cancel")), "cancel clause: {r:?}");
+        assert!(r.iter().any(|c| c.starts_with("add") && c.contains("deep work")), "add clause keeps its verb: {r:?}");
     }
 
     #[test]
