@@ -4,10 +4,18 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { checkForUpdate, installUpdate } from "../lib/updates";
 
 /**
- * Top-of-window banner shown when a newer Pushin release is available on GitHub. Checks once on
- * mount (desktop only — mount this only in the desktop layout). Clicking "Update & restart"
- * downloads + installs the new version and relaunches; user data is untouched by the install.
+ * Top-of-window banner shown when a newer Pushin release is available on GitHub. Desktop only —
+ * mount this only in the desktop layout. Clicking "Update & restart" downloads + installs the new
+ * version and relaunches; user data is untouched by the install.
+ *
+ * It checks on mount AND re-checks periodically, because a once-on-mount check misses the common
+ * case: Pushin is an app people leave open for days, and a release's per-OS installers land minutes
+ * to tens of minutes apart (see .github/workflows/release.yml), so the manifest often gains your
+ * platform only AFTER you last launched. Without a re-check you would have to restart the app to be
+ * told an update exists. Also re-checks when the window regains focus, debounced by the same
+ * interval so tabbing back and forth can't hammer GitHub.
  */
+const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
 export default function UpdateBanner() {
   const [update, setUpdate] = useState<Update | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -18,12 +26,28 @@ export default function UpdateBanner() {
 
   useEffect(() => {
     let active = true;
-    checkForUpdate().then((u) => {
-      if (active) setUpdate(u);
-    });
+    let last = 0;
+    const run = () => {
+      last = Date.now();
+      // Never swap the banner out from under an in-flight install.
+      checkForUpdate().then((u) => {
+        if (active && !installing) setUpdate(u);
+      });
+    };
+    const onFocus = () => {
+      if (Date.now() - last >= CHECK_EVERY_MS) run();
+    };
+    run();
+    const id = setInterval(run, CHECK_EVERY_MS);
+    window.addEventListener("focus", onFocus);
     return () => {
       active = false;
+      clearInterval(id);
+      window.removeEventListener("focus", onFocus);
     };
+    // `installing` is read inside the callback only as a guard; re-subscribing on it would restart
+    // the interval on every install attempt, so it is deliberately not a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (!update || dismissed) return null;
