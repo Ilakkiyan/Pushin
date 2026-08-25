@@ -169,7 +169,7 @@ fn normalize_prompt(s: &str) -> String {
 
 /// The held-out battery's prompts (parsed from `src-tauri/tests/llm_eval.rs`), normalized. Used to
 /// DENY any templated candidate that matches — the eval battery must NEVER appear in training data
-/// (see GUARDS_TO_99_PLAN.md A1). Self-maintaining: always reflects the current battery.
+/// (see docs/notes/GUARDS_TO_99_PLAN.md A1). Self-maintaining: always reflects the current battery.
 fn load_eval_prompts() -> HashSet<String> {
     let src = ["src-tauri/tests/llm_eval.rs", "tests/llm_eval.rs", "../src-tauri/tests/llm_eval.rs"]
         .iter()
@@ -240,7 +240,7 @@ async fn main() {
     let pp_model = arg(&args, "--paraphrase-model").or_else(|| std::env::var("PUSHIN_PARAPHRASE_MODEL").ok()).unwrap_or_else(|| model.clone());
 
     let all = templates::all();
-    // Anti-leakage (GUARDS_TO_99_PLAN.md A1): never train on a prompt that appears in the held-out
+    // Anti-leakage (docs/notes/GUARDS_TO_99_PLAN.md A1): never train on a prompt that appears in the held-out
     // battery. Drop any templated candidate whose normalized text matches an `llm_eval.rs` prompt.
     let eval_prompts = load_eval_prompts();
     let leaked_dropped = all.iter().filter(|t| eval_prompts.contains(&normalize_prompt(&t.prompt))).count();
@@ -317,7 +317,13 @@ async fn main() {
             ev
         };
         let history: Vec<ChatTurn> = t.history.iter().map(|(r, c)| ChatTurn { role: r.clone(), content: c.clone() }).collect();
-        let prompt_text = if paraphrase {
+        // Selective paraphrase: the LLM rewrite adds realistic human phrasing (great for create/multi
+        // prompts) but it DRIFTS the exact facts that carry the truth in date/edit/remove categories —
+        // "in 10 days" → "next week", "cancel X" softened — and reject-sampling then drops every drifted
+        // label (rel-date/remove cratered to 0% with blanket paraphrase). So skip paraphrase for those
+        // truth-fragile categories; keep it where the facts survive a reword.
+        const PARAPHRASE_SKIP: &[&str] = &["rel-date", "remove", "correction", "multiday-window", "edit", "day-of-month"];
+        let prompt_text = if paraphrase && !PARAPHRASE_SKIP.contains(&t.category) {
             paraphrase_prompt(&client, &pp_base, &pp_model, &t.prompt).await.unwrap_or_else(|| t.prompt.clone())
         } else {
             t.prompt.clone()

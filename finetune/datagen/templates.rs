@@ -261,6 +261,52 @@ pub fn all() -> Vec<Template> {
         });
     }
 
+    // 2b) PM-less short ranges ("Block 12-2") + overnight ranges ("8pm to 8am") as SINGLE events —
+    // the exact `ranges` eval shapes, ABSENT from event-range above (which only has explicit am/pm).
+    // Thin here → 2-epoch overfit (ranges 100→50 across v7/v8). Duration is invariant to the PM guess
+    // and to overnight wraparound, so the check pins DURATION (robust to which half-day the model picks).
+    for _ in 0..120 {
+        let act = (*r.pick(EVENT_ACTS)).to_string();
+        let day = *r.pick(DAYS);
+        if r.chance(60) {
+            // PM-less short range ("12-2", "1-4", "6-9"): assume-PM, unambiguous duration.
+            let (rng, dur) = *r.pick(&[
+                ("12-2", 120i64), ("12-1", 60), ("1-3", 120), ("1-4", 180), ("2-4", 120), ("2-5", 180),
+                ("3-5", 120), ("4-6", 120), ("6-8", 120), ("6-9", 180), ("9-11", 120), ("10-12", 120), ("12-3", 180),
+            ]);
+            let prompt = match r.below(3) {
+                0 => format!("Block {rng} {day} for {act}."),
+                1 => format!("{act} {day} {rng}."),
+                _ => format!("{act} {day} from {rng}."),
+            };
+            out.push(Template {
+                category: "range-hard",
+                prompt,
+                seed: vec![],
+                history: vec![],
+                check: Box::new(move |o, c| o.created_event_titles.len() == 1 && only_event(c).and_then(|e| minutes(&e)) == Some(dur)),
+            });
+        } else {
+            // Overnight range ("8pm to 8am"): wraparound duration.
+            let (t1, t2, dur) = *r.pick(&[
+                ("8pm", "8am", 720i64), ("10pm", "6am", 480), ("11pm", "7am", 480), ("9pm", "5am", 480),
+                ("10pm", "8am", 600), ("11pm", "6am", 420), ("7pm", "7am", 720), ("9pm", "6am", 540),
+            ]);
+            let prompt = match r.below(3) {
+                0 => format!("{act} {day} {t1} to {t2}."),
+                1 => format!("{act} {day} from {t1} to {t2}."),
+                _ => format!("{act} {day}, {t1}-{t2}."),
+            };
+            out.push(Template {
+                category: "range-hard",
+                prompt,
+                seed: vec![],
+                history: vec![],
+                check: Box::new(move |o, c| o.created_event_titles.len() == 1 && only_event(c).and_then(|e| minutes(&e)) == Some(dur)),
+            });
+        }
+    }
+
     // 3) Event with a stated duration.
     for _ in 0..110 {
         let act = (*r.pick(EVENT_ACTS)).to_string();
@@ -789,6 +835,135 @@ pub fn all() -> Vec<Template> {
             history: vec![],
             check: Box::new(move |o, c| {
                 o.created_event_titles.len() == 1 && only_event(c).map(|e| e.title.to_lowercase().contains(needle)).unwrap_or(false)
+            }),
+        });
+    }
+
+    // 21) Compact / leading-zero 24h RANGES ("0900-1030"). The model saw compact single times but
+    // never a compact RANGE, and at inference crammed the end time into the start string
+    // (startTime="09:00','endTime':'17:30"). Train the clean start/end split with correct duration.
+    for _ in 0..70 {
+        let act = (*r.pick(EVENT_ACTS)).to_string();
+        let day = *r.pick(DAYS);
+        // (start disp, sh, sm, end disp, minutes)
+        let (s, sh, sm, e, mins) = *r.pick(&[
+            ("0900", 9u32, 0u32, "1030", 90i64),
+            ("1400", 14, 0, "1530", 90),
+            ("1300", 13, 0, "1430", 90),
+            ("0930", 9, 30, "1015", 45),
+            ("1100", 11, 0, "1200", 60),
+            ("0800", 8, 0, "0930", 90),
+            ("1600", 16, 0, "1730", 90),
+            ("1000", 10, 0, "1100", 60),
+        ]);
+        let prompt = match r.below(3) {
+            0 => format!("Block {s}-{e} {day} for {act}."),
+            1 => format!("{act} {day} {s} to {e}."),
+            _ => format!("{act} from {s} to {e} {day}."),
+        };
+        out.push(Template {
+            category: "odd-time",
+            prompt,
+            seed: vec![],
+            history: vec![],
+            check: Box::new(move |o, c| {
+                o.created_event_titles.len() == 1
+                    && only_event(c).map(|ev| start_hm(&ev) == Some((sh, sm)) && minutes(&ev) == Some(mins)).unwrap_or(false)
+            }),
+        });
+    }
+
+    // 22) Two events, PM-less ranges the model must disambiguate ("lunch 12-2 and party 6-10"). The
+    // 7B scrambled these (gave one event a start with no end, the other an end with no start). The
+    // DURATION is invariant to the AM/PM guess, so we check both spans regardless of resolved half-day.
+    for _ in 0..50 {
+        let combos: &[(&str, &str, i64, &str, &str, i64)] = &[
+            ("lunch 12-2", "lunch", 120, "a graduation party 6-10", "party", 240),
+            ("a meeting 10-11", "meeting", 60, "dinner 7-9", "dinner", 120),
+            ("brunch 11-1", "brunch", 120, "a movie 8-10", "movie", 120),
+            ("study 2-4", "study", 120, "a call 5-6", "call", 60),
+            ("a workshop 9-12", "workshop", 180, "drinks 6-8", "drinks", 120),
+        ];
+        let (p1, n1, m1, p2, n2, m2) = *r.pick(combos);
+        let day = *r.pick(&["today", "tomorrow", "friday", "saturday"]);
+        let (n1, m1, n2, m2) = (n1.to_string(), m1, n2.to_string(), m2);
+        let prompt = match r.below(2) {
+            0 => format!("On {day} I have {p1} and {p2}."),
+            _ => format!("{day}: {p1}, then {p2}."),
+        };
+        out.push(Template {
+            category: "multi-event",
+            prompt,
+            seed: vec![],
+            history: vec![],
+            check: Box::new(move |o, c| {
+                o.created_event_titles.len() == 2
+                    && ev_by(c, &n1).and_then(|e| minutes(&e)) == Some(m1)
+                    && ev_by(c, &n2).and_then(|e| minutes(&e)) == Some(m2)
+            }),
+        });
+    }
+
+    // 23) Vague part-of-day activity → a TASK, not a fabricated timed event. "Spend Saturday
+    // afternoon cleaning the garage" gives no clock time, yet the model invented 14:30. No explicit
+    // time → floating task the scheduler can place.
+    for _ in 0..50 {
+        let act = *r.pick(&[
+            "cleaning out the garage",
+            "sorting through old paperwork",
+            "deep-cleaning the kitchen",
+            "organizing the closet",
+            "catching up on reading",
+            "working on the yard",
+            "decluttering the basement",
+        ]);
+        let when = *r.pick(&["Saturday afternoon", "Sunday morning", "this weekend", "tomorrow afternoon", "Friday evening", "sometime this weekend"]);
+        let prompt = match r.below(3) {
+            0 => format!("Spend {when} {act}."),
+            1 => format!("I want to spend {when} {act}."),
+            _ => format!("Set aside {when} for {act}."),
+        };
+        out.push(Template {
+            category: "hard-task",
+            prompt,
+            seed: vec![],
+            history: vec![],
+            check: Box::new(|o, c| o.created_task_ids.len() == 1 && events(c).is_empty()),
+        });
+    }
+
+    // 24) Absolute-date multi-day span ("from 6/12 for two weeks" → one all-day multi-day block).
+    // The 7B emitted nothing here. Rust owns the span/date math, but the model must still produce the
+    // event shell so recovery can attach span_days + the M/D date. Check the multi-day all-day shape.
+    for _ in 0..40 {
+        let (place, act) = *r.pick(&[
+            ("Vietnam", "staying in"),
+            ("Tokyo", "traveling in"),
+            ("my parents'", "staying at"),
+            ("Berlin", "on a work trip in"),
+            ("the lake house", "up at"),
+        ]);
+        let (mo, dy) = *r.pick(&[(6u32, 12u32), (8, 3), (9, 20), (7, 1), (10, 15), (11, 5)]);
+        let (span_txt, days) = *r.pick(&[("two weeks", 14i64), ("10 days", 10), ("a week", 7), ("five days", 5), ("twelve days", 12)]);
+        let prompt = match r.below(2) {
+            0 => format!("From {mo}/{dy} I'll be {act} {place} for {span_txt}."),
+            _ => format!("I'm {act} {place} from {mo}/{dy} for {span_txt}."),
+        };
+        out.push(Template {
+            category: "multiday-window",
+            prompt,
+            seed: vec![],
+            history: vec![],
+            check: Box::new(move |o, c| {
+                if o.created_event_titles.len() != 1 {
+                    return false;
+                }
+                let Some(ev) = only_event(c) else {
+                    return false;
+                };
+                let all_day = start_hm(&ev) == Some((0, 0));
+                let span_ok = minutes(&ev).map(|mn| (mn / 1440 - days).abs() <= 1).unwrap_or(false);
+                all_day && span_ok
             }),
         });
     }

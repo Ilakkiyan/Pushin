@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Anti-leakage tripwire (GUARDS_TO_99_PLAN.md A1).
+"""Anti-leakage tripwire (docs/notes/GUARDS_TO_99_PLAN.md A1).
 
 Fails (exit 1) if any held-out battery prompt in `src-tauri/tests/llm_eval.rs` appears (normalized) as
 a user message in a training dataset. The datagen denylist prevents this at generation time; this is the
