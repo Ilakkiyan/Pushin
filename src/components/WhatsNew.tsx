@@ -1,4 +1,4 @@
-import { ArrowRight, MessagesSquare, ShieldCheck, Sparkles, Zap } from "lucide-react";
+import { ArrowRight, CalendarPlus, MessagesSquare, Sparkles, Sun, Zap } from "lucide-react";
 
 /**
  * The post-update "What's new" intro, shown once after the app updates + restarts (App.tsx detects a
@@ -9,19 +9,24 @@ import { ArrowRight, MessagesSquare, ShieldCheck, Sparkles, Zap } from "lucide-r
  */
 const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
   {
+    icon: Sun,
+    title: "Opens on your day, not a grid",
+    body: "Today is the new home screen — what's on, what's next, and your briefing in one place. The sidebar now holds one space at a time, so the vault's notes and graph no longer crowd your day.",
+  },
+  {
     icon: Sparkles,
-    title: "Understands the way you actually talk",
-    body: "Ramble off a few things at once — “dentist at 2, move my standup, and remind me to call mom” — and Pushin now catches each one, cancellations and all.",
+    title: "A model trained for this",
+    body: "Pushin now ships its own on-device model, tuned to read plans far more reliably than the general-purpose one it used to borrow — same size, same privacy, better answers.",
+  },
+  {
+    icon: CalendarPlus,
+    title: "Subscribe to any calendar",
+    body: "Paste an .ics feed — a shared calendar, a team schedule, holidays — and Pushin plans your tasks around it. Read-only: it never edits or sends anything back.",
   },
   {
     icon: MessagesSquare,
-    title: "Asks instead of guessing",
-    body: "When a request is ambiguous, Pushin asks a quick question rather than quietly doing the wrong thing.",
-  },
-  {
-    icon: ShieldCheck,
-    title: "Fewer surprises",
-    body: "Sharper handling of times, durations, ranges, and multi-day trips — no more accidental all-day blocks or marathon appointments.",
+    title: "Tells you why",
+    body: "Every auto-scheduled block can now explain itself: waiting on something else, held for a deadline, or just the earliest free slot.",
   },
   {
     icon: Zap,
@@ -29,7 +34,6 @@ const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
     body: "The AI starts faster and the first reply is quicker. When you step away, the model quietly unloads to free up memory (several GB) and springs back the moment you plan or chat again. Tune or turn it off under Settings ▸ On-device AI.",
   },
 ];
-
 const TITLE_DELAY = 80;
 const FIRST_CARD = 440;
 const STEP = 150;

@@ -9,6 +9,39 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-08-25
+
+### v0.8.0 — Today landing, tuned models by default, .ics subscriptions ✅
+The release that makes Pushin open on your day and ship its own model.
+- **Two-space nav + Today pane.** The sidebar holds one space at a time — planner (Today/Calendar/
+  Projects/Habits/People) or vault (notes/journal/inbox/graph/labels) — with `prevPlannerView` so
+  leaving the vault returns you where you were. `TodayPane` is the new default landing view. Plus a
+  flat visual pass across every pane (`--ink-*` tokens, sharp corners, tabular numerals).
+- **Pushin's tuned models are the default.** `recommend_model` + `Settings::default()` now pick the
+  tuned 7B (≥8GB RAM) or tuned 3B, looked up by id rather than `MODELS[i]`. Settings gained a real
+  model switch (download-if-missing + `restart_inference`; saving used to leave the OLD model serving
+  until an app restart) and a one-time base→tuned nudge.
+- **Read-only .ics subscriptions** (migration 0019, `calendar/ics.rs`): folded lines, escaped text,
+  all-day and UTC times → naive-local. RRULE expansion is explicitly out of scope for v1.
+- **"Why is this here"** — `scheduler::explain_block`/`explain_all` derive one dominant placement
+  reason per block (continuation → dependency → earliest-start → commitment → deadline → earliest).
+  Derived on demand, never stored or synced.
+- **Parser:** a fuzzy `updateEvents` match no longer rewrites a whole series (the "updated 17 events"
+  bug — `best_update_target` picks the single best), timed comma lists get chunked, crammed
+  `startTime` JSON is salvaged, and a bare "weekend" is no longer read as a cadence.
+- **Habits step aside** from an event dropped on top of them (`resolve_habit_conflicts`), future
+  occurrences only, before task scheduling.
+- **Lighter runtime:** idle-unload (`idle_unload_minutes`, default 10) + `llm::warmup` +
+  lazy memory engine (the embeddings server no longer spawns at boot).
+- **Mesh inference bridge** (built, live-unverified): `sync/frame.rs` + `sync/infer.rs` on a separate
+  ALPN let a modelless phone borrow a paired desktop's llama-server and embed server.
+- **Honest eval:** new `tests/real_world_eval.rs` battery scored against the STORED calendar, and
+  datagen paraphrase is now skipped for truth-fragile categories (it drifted rel-date/remove to 0% kept).
+- **Repo:** working notes moved to `docs/notes/`, `CLAUDE.md` slimmed ~600 lines into
+  `ARCHITECTURE_NOTES.md`, and VitePress `srcExclude` keeps the notes off the public docs site.
+- Verified: `cargo test --lib` **267** green, Vitest **80** green (19 files), `tsc` clean,
+  `npm run docs:build` clean. Live `llm_eval`/`real_world_eval` not re-run for this release.
+
 ## 2026-07-14
 
 ### v0.7.1 — parser reliability layer + honest eval ✅
