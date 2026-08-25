@@ -6,25 +6,37 @@
 //! (gotcha #8): each [`SyncStore`] method takes a short lock, does its work, and releases.
 
 use super::changeset::{self, Change};
+use super::infer::{self, InferReply, InferRequest};
 use super::protocol::{self, SessionStats, SyncStore};
 use super::{identity, state, transport};
-use anyhow::{anyhow, Context, Result};
-use iroh::endpoint::Incoming;
+use anyhow::{anyhow, bail, Context, Result};
+use iroh::endpoint::{Connection, Incoming};
 use iroh::{Endpoint, NodeAddr, NodeId};
-use rusqlite::Connection;
+use rusqlite::Connection as SqlConnection;
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Semaphore;
 
 /// How often the engine proactively pulls from every known peer.
 const SYNC_INTERVAL: Duration = Duration::from_secs(20);
+/// Per-peer timeout for a borrowed-inference attempt (a big model can be slow; matches the local
+/// first-run wait). On timeout we move to the next peer.
+const INFER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on simultaneous *inbound* inference requests we serve, so a phone can't overwhelm a desktop.
+const MAX_INFLIGHT_INFER: usize = 2;
 
 pub struct SyncEngine {
     endpoint: Endpoint,
     node_id: String,
     mesh: String,
-    db: Arc<Mutex<Connection>>,
+    db: Arc<Mutex<SqlConnection>>,
     app: AppHandle,
+    /// HTTP client for calling this device's OWN local chat/embed servers when serving a peer.
+    http: reqwest::Client,
+    /// Limits concurrent inbound inference we serve (see [`MAX_INFLIGHT_INFER`]).
+    infer_sem: Arc<Semaphore>,
 }
 
 fn now_ms() -> u64 {
@@ -37,8 +49,9 @@ fn now_iso() -> String {
 impl SyncEngine {
     /// Bind the endpoint and start the background loops. Errors if no mesh secret is set yet.
     pub async fn start(
-        db: Arc<Mutex<Connection>>,
+        db: Arc<Mutex<SqlConnection>>,
         app: AppHandle,
+        http: reqwest::Client,
         use_relay: bool,
     ) -> Result<Arc<SyncEngine>> {
         let mesh = identity::mesh_secret().context("device has not joined a sync network")?;
@@ -49,10 +62,38 @@ impl SyncEngine {
             let conn = db.lock().map_err(|_| anyhow!("db poisoned"))?;
             state::set_node_id(&conn, &node_id)?;
         }
-        let engine = Arc::new(SyncEngine { endpoint, node_id, mesh, db, app });
+        let infer_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_INFER));
+        let engine = Arc::new(SyncEngine { endpoint, node_id, mesh, db, app, http, infer_sem });
         engine.clone().spawn_accept_loop();
         engine.clone().spawn_periodic();
+        engine.register_peer_fallbacks();
         Ok(engine)
+    }
+
+    /// Register this engine as the process-wide peer-inference fallback: when the local chat/embed
+    /// server is unreachable (a phone with no model), `llm::chat_json` / `hermes::embed_text` route
+    /// through here to a paired desktop. Uses a `Weak` so a later leave/rejoin can replace it cleanly.
+    fn register_peer_fallbacks(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        crate::llm::register_peer_chat(Box::new(move |messages, schema| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(e) => e.request_chat(messages, schema).await,
+                    None => bail!("sync engine no longer running"),
+                }
+            })
+        }));
+        let weak = Arc::downgrade(self);
+        crate::hermes::register_peer_embed(Box::new(move |input| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                match weak.upgrade() {
+                    Some(e) => e.request_embed(input).await,
+                    None => bail!("sync engine no longer running"),
+                }
+            })
+        }));
     }
 
     /// Mint an invite ticket for another device to join this network.
@@ -122,10 +163,90 @@ impl SyncEngine {
 
     async fn handle_incoming(&self, incoming: Incoming) -> Result<()> {
         let conn = incoming.await.context("accepting inbound connection")?;
+        // Dispatch by ALPN: the inference bridge is a separate channel from changeset sync.
+        if conn.alpn().as_deref() == Some(transport::INFER_ALPN) {
+            return self.serve_inference(&conn).await;
+        }
         let (send, recv) = transport::accept_stream(&conn).await?;
         let stats = protocol::run_session(self, false, recv, send).await?;
         self.note_peer(&stats);
         Ok(())
+    }
+
+    /// Serve one inbound inference request by running it on THIS device's local model (only a device
+    /// with a running local server can usefully answer — a mobile peer will simply error out).
+    async fn serve_inference(&self, conn: &Connection) -> Result<()> {
+        let _permit = self.infer_sem.clone().acquire_owned().await.context("inference permit")?;
+        let (send, recv) = transport::accept_stream(conn).await?;
+        let (mesh, node, name) = (self.mesh.clone(), self.node_id.clone(), self.device_name());
+        infer::serve_infer(&mesh, &node, &name, recv, send, |req| self.run_local(req)).await
+    }
+
+    /// Run a request against this device's own local chat/embed server (used when serving a peer).
+    async fn run_local(&self, req: InferRequest) -> Result<InferReply> {
+        let (llm_base, model, embed_model) = {
+            let conn = self.db.lock().map_err(|_| anyhow!("db poisoned"))?;
+            let s = crate::db::get_settings(&conn)?;
+            (s.llm_base_url, s.model_id, s.embed_model)
+        };
+        match req {
+            // Ignore the requester's model name — use whatever THIS device has configured/running.
+            InferRequest::Chat { messages, schema, .. } => {
+                let v = crate::llm::chat_json(&self.http, &llm_base, &model, messages, schema).await?;
+                Ok(InferReply::Chat(v))
+            }
+            InferRequest::Embed { input, .. } => {
+                let base = crate::model_manager::embed_base_url();
+                let v = crate::hermes::embed_text(&self.http, &base, &embed_model, &input).await?;
+                Ok(InferReply::Embed(v))
+            }
+        }
+    }
+
+    /// Borrow a peer's model for a chat completion: try each known peer, **first success wins**.
+    /// Errors if no reachable peer can run it (the "no desktop online" fallback for mobile).
+    pub async fn request_chat(&self, messages: Value, schema: Value) -> Result<Value> {
+        match self.request_from_peers(InferRequest::Chat { model: String::new(), messages, schema }).await? {
+            InferReply::Chat(v) => Ok(v),
+            _ => bail!("peer returned the wrong reply kind for a chat request"),
+        }
+    }
+
+    /// Borrow a peer's embed server for one vector (first success wins).
+    pub async fn request_embed(&self, input: String) -> Result<Vec<f32>> {
+        match self.request_from_peers(InferRequest::Embed { model: String::new(), input }).await? {
+            InferReply::Embed(v) => Ok(v),
+            _ => bail!("peer returned the wrong reply kind for an embed request"),
+        }
+    }
+
+    async fn request_from_peers(&self, req: InferRequest) -> Result<InferReply> {
+        let peers = match self.db.lock() {
+            Ok(conn) => state::list_peers(&conn).unwrap_or_default(),
+            Err(_) => bail!("db poisoned"),
+        };
+        if peers.is_empty() {
+            bail!("no paired devices to borrow inference from");
+        }
+        let (mesh, node, name) = (self.mesh.clone(), self.node_id.clone(), self.device_name());
+        for p in peers {
+            let id = match p.node_id.parse::<NodeId>() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let attempt = async {
+                let (conn, send, recv) = transport::dial_infer(&self.endpoint, id).await?;
+                let reply = infer::request_infer(&mesh, &node, &name, req.clone(), recv, send).await;
+                conn.close(0u32.into(), b"done");
+                reply
+            };
+            match tokio::time::timeout(INFER_TIMEOUT, attempt).await {
+                Ok(Ok(reply)) => return Ok(reply), // first answer wins
+                Ok(Err(e)) => eprintln!("infer: peer {} failed: {e:#}", p.node_id),
+                Err(_) => eprintln!("infer: peer {} timed out", p.node_id),
+            }
+        }
+        bail!("no reachable device could run inference")
     }
 
     /// Record/refresh a peer after a session: store its node id + name and bump last-seen.

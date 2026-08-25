@@ -7,8 +7,11 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, RelayMode, SecretKey, Watcher};
 use serde::{Deserialize, Serialize};
 
-/// Application-layer protocol id negotiated on every connection.
+/// Application-layer protocol id for the changeset-sync channel.
 pub const ALPN: &[u8] = b"pushin-sync/0";
+/// Application-layer protocol id for the mobile→desktop inference bridge (separate channel so it can't
+/// disturb the sync choreography). Dispatched on `conn.alpn()` in the engine's accept loop.
+pub const INFER_ALPN: &[u8] = b"pushin-infer/0";
 
 /// Build this device's Iroh secret key from its persisted 32-byte seed.
 pub fn secret_key(seed: [u8; 32]) -> SecretKey {
@@ -21,7 +24,7 @@ pub async fn bind(secret: SecretKey, use_relay: bool) -> Result<Endpoint> {
     let relay = if use_relay { RelayMode::Default } else { RelayMode::Disabled };
     Endpoint::builder()
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), INFER_ALPN.to_vec()])
         .relay_mode(relay)
         .discovery_n0()
         .bind()
@@ -65,6 +68,16 @@ pub async fn dial(
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     let conn = ep.connect(addr, ALPN).await.context("dialing peer")?;
     let (send, recv) = conn.open_bi().await.context("opening sync stream")?;
+    Ok((conn, send, recv))
+}
+
+/// Dial a peer and open an **inference** stream (borrow its model). Same node keys + mesh, different ALPN.
+pub async fn dial_infer(
+    ep: &Endpoint,
+    addr: impl Into<NodeAddr>,
+) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
+    let conn = ep.connect(addr, INFER_ALPN).await.context("dialing peer for inference")?;
+    let (send, recv) = conn.open_bi().await.context("opening inference stream")?;
     Ok((conn, send, recv))
 }
 

@@ -13,8 +13,10 @@
 
 pub mod changeset;
 pub mod engine;
+pub mod frame;
 pub mod hlc;
 pub mod identity;
+pub mod infer;
 pub mod protocol;
 pub mod schema;
 pub mod state;

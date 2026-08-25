@@ -15,12 +15,10 @@
 //! functions, tests wire it to two in-memory DBs to prove end-to-end convergence over a real stream.
 
 use super::changeset::Change;
+use super::frame::{read_frame, write_frame};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-/// Hard cap on a single framed message (guards against a hostile/buggy peer forcing a huge alloc).
-const MAX_FRAME: u32 = 128 * 1024 * 1024;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Msg {
@@ -58,27 +56,13 @@ pub struct SessionStats {
     pub sent: usize,
 }
 
-async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
-    let bytes = serde_json::to_vec(msg)?;
-    if bytes.len() as u64 > MAX_FRAME as u64 {
-        bail!("outgoing sync frame too large: {} bytes", bytes.len());
-    }
-    w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    w.write_all(&bytes).await?;
-    w.flush().await?;
-    Ok(())
-}
-
+/// Read one framed `Msg` (thin alias so the sync choreography below reads unchanged).
 async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Msg> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len).await?;
-    let len = u32::from_be_bytes(len);
-    if len > MAX_FRAME {
-        bail!("incoming sync frame too large: {len} bytes");
-    }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf)?)
+    read_frame(r).await
+}
+/// Write one framed `Msg`.
+async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
+    write_frame(w, msg).await
 }
 
 /// Exchange Hellos and verify mesh membership; returns the peer's (node id, device name).
