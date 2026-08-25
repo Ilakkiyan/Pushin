@@ -431,7 +431,17 @@ fn split_intents(text: &str) -> Vec<String> {
     let words = text.split_whitespace().count();
     let lc = text.to_lowercase();
     let sentences = text.matches(". ").count() + text.matches("! ").count() + text.matches("? ").count();
-    let has_signal = lc.contains(" also ") || sentences >= 2 || lc.matches(" and ").count() >= 2 || lc.contains(", and ");
+    // A comma-separated clause carrying a digit is a timed schedule block ("call my gf from 3-5"). Two or
+    // more = a "do X 1-3, then Y 3-5, gym 7-8" schedule — the shape the small model under-extracts worst
+    // (it dropped 5 of 6 intents on the reporter's prompt). `" then "` is likewise a strong boundary this
+    // phrasing uses instead of "and"/periods.
+    let timed_comma_clauses = text.split(',').filter(|c| c.chars().any(|ch| ch.is_ascii_digit())).count();
+    let has_signal = lc.contains(" also ")
+        || lc.contains(" then ")
+        || sentences >= 2
+        || lc.matches(" and ").count() >= 2
+        || lc.contains(", and ")
+        || timed_comma_clauses >= 2;
     if words < 18 || !has_signal {
         return vec![text.to_string()];
     }
@@ -444,6 +454,9 @@ fn split_intents(text: &str) -> Vec<String> {
     for sep in [". ", "! ", "? ", "; ", " also ", " Also ", ", and ", " and then ", " then "] {
         s = s.replace(sep, "\u{1}");
     }
+    // Split a comma ONLY when the clause after it carries a time cue (a digit) — turns a timed schedule
+    // list into one clause per block, while leaving a plain "coffee, tea, juice" list (no digits) intact.
+    let s = split_timed_commas(&s);
     let chunks: Vec<String> = s
         .split('\u{1}')
         .map(|c| c.trim().trim_matches(|ch: char| ch == '.' || ch == ',' || ch == ';').trim().to_string())
@@ -454,6 +467,30 @@ fn split_intents(text: &str) -> Vec<String> {
     } else {
         vec![text.to_string()]
     }
+}
+
+/// Replace ", " with the chunk marker only when the following clause (up to the next comma/marker)
+/// carries a digit — i.e. it's a timed schedule block. Keeps non-timed comma lists whole.
+fn split_timed_commas(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ',' && chars.get(i + 1) == Some(&' ') {
+            let next_has_digit = chars[i + 2..]
+                .iter()
+                .take_while(|c| **c != ',' && **c != '\u{1}')
+                .any(|c| c.is_ascii_digit());
+            if next_has_digit {
+                out.push('\u{1}');
+                i += 2; // consume ", "
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Merge a per-clause raw plan into the accumulator, skipping obvious duplicates.
@@ -782,6 +819,65 @@ fn clamp_absurd_event_durations(plan: &mut ParsedPlan, text: &str) {
     }
 }
 
+/// The tuned model sometimes emits MALFORMED JSON for time ranges — it crams `endTime` into the
+/// `startTime` string: `"startTime":"15:00','endTime':'17:00}]}]}"`. Left alone, the start survives
+/// (parse_hm reads the leading time) but the end is lost and defaulted. Deterministically recover the
+/// two real clock times out of the garbage: start = the first, end = the second (when end is empty).
+/// Also strips JSON junk (`}`, quotes) from an otherwise-valid end. Only touches obviously-crammed
+/// fields, so clean plans are untouched. See memory `tuned-model-eval-ceiling` (malformed time JSON).
+fn recover_crammed_times(plan: &mut ParsedPlan) {
+    fn clock_times(s: &str) -> Vec<String> {
+        let ch: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < ch.len() {
+            if ch[i].is_ascii_digit() {
+                let start = i;
+                while i < ch.len() && (ch[i].is_ascii_digit() || ch[i] == ':') {
+                    i += 1;
+                }
+                let tok: String = ch[start..i].iter().collect();
+                if tok.contains(':') {
+                    out.push(tok);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+    fn crammed(s: &str) -> bool {
+        let lc = s.to_lowercase();
+        lc.contains("endtime") || lc.contains("','") || s.contains('}') || s.contains('{')
+    }
+    fn fix(start: &mut Option<String>, end: &mut Option<String>) {
+        if let Some(s) = start.clone() {
+            if crammed(&s) {
+                let times = clock_times(&s);
+                if let Some(a) = times.first() {
+                    *start = Some(a.clone());
+                }
+                if end.is_none() {
+                    if let Some(b) = times.get(1) {
+                        *end = Some(b.clone());
+                    }
+                }
+            }
+        }
+        if let Some(e) = end.clone() {
+            if crammed(&e) {
+                *end = clock_times(&e).first().cloned();
+            }
+        }
+    }
+    for e in &mut plan.events {
+        fix(&mut e.start_time, &mut e.end_time);
+    }
+    for u in &mut plan.update_events {
+        fix(&mut u.start_time, &mut u.end_time);
+    }
+}
+
 pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
     // PUSHIN_PLAN_DEBUG=1 → dump the RAW model plan (pre-recovery) so we can see exactly what the
     // model emitted vs. what recovery does to it. Diagnostic only; no effect when unset.
@@ -800,6 +896,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
         }
     }
     unescape_plan(plan);
+    recover_crammed_times(plan);
     resolve_task_deadlines(plan);
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
@@ -1702,15 +1799,18 @@ fn recurrence(text: &str) -> Option<(String, Vec<u8>, i64)> {
             }
         }
     }
-    // weekday sets
-    if t.contains("weekday") || t.contains("week day") {
+    // "weekday(s)"/"weekend(s)" as a recurring set — but ONLY when it's actually recurring: "every
+    // weekday", "on weekends" (plural). A bare singular "weekend" ("a pretty packed weekend") describes
+    // THIS weekend, not a cadence — reading it as one fabricates a habit from a conversational preamble.
+    let recurring_cue = t.contains("every") || t.contains("each");
+    if (t.contains("weekday") || t.contains("week day")) && (recurring_cue || t.contains("weekdays") || t.contains("week days")) {
         return Some(("weekly".into(), vec![1, 2, 3, 4, 5], 1));
     }
-    if t.contains("weekend") {
+    if t.contains("weekend") && (recurring_cue || t.contains("weekends")) {
         return Some(("weekly".into(), vec![6, 7], 1));
     }
     // specific weekdays, but only with a recurrence cue ("every"/"each", or a plural like "mondays")
-    let cue = t.contains("every") || t.contains("each") || toks.iter().any(|w| w.ends_with('s') && wd(w).is_some());
+    let cue = recurring_cue || toks.iter().any(|w| w.ends_with('s') && wd(w).is_some());
     if cue {
         let mut days: Vec<u8> = Vec::new();
         for w in &toks {
@@ -2955,6 +3055,37 @@ fn event_matches(event_title: &str, needle: &str) -> bool {
     !n.is_empty() && n.len() >= 3 && (e.contains(&n) || n.contains(&e))
 }
 
+/// The SINGLE event an `updateEvents` entry refers to. `match` is a fuzzy needle, so it routinely hits
+/// many events at once — a user who studies daily has a dozen "Study"/"Study C++" sessions, and applying
+/// one edit to all of them collapses the whole series onto a single time (the "updated 17 events" bug).
+/// The model always means one event, so rank the candidates and take the best:
+/// an exact title match beats a substring one, then prefer the soonest session that hasn't finished yet
+/// (what the user is talking about), falling back to the most recently finished.
+fn best_update_target<'a>(events: &'a [Event], needle: &str, now: NaiveDateTime) -> Option<&'a Event> {
+    let n = needle.trim().to_lowercase();
+    let mut best: Option<(&Event, (u8, i64))> = None;
+    for e in events {
+        if !event_matches(&e.title, needle) {
+            continue;
+        }
+        let exact = e.title.trim().to_lowercase() == n;
+        let upcoming = parse_dt(&e.end).map(|x| x >= now).unwrap_or(false);
+        let rank = match (exact, upcoming) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        // Closest in time wins within a rank: soonest upcoming, else most recently past.
+        let tie = parse_dt(&e.start).map(|s| (s - now).num_minutes().abs()).unwrap_or(i64::MAX);
+        let key = (rank, tie);
+        if best.as_ref().map(|(_, k)| key < *k).unwrap_or(true) {
+            best = Some((e, key));
+        }
+    }
+    best.map(|(e, _)| e)
+}
+
 fn weekday_from_str(s: &str) -> Option<Weekday> {
     Some(match s.to_lowercase().as_str() {
         "monday" => Weekday::Mon,
@@ -3425,23 +3556,23 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         }
     }
 
-    // UPDATE existing events (new time/day/title), keeping unspecified fields.
+    // UPDATE existing events (new time/day/title), keeping unspecified fields. A fuzzy `match` can hit
+    // a whole recurring series ("Study"), so only the single best target is changed — never all of them.
     for up in &plan.update_events {
-        for e in crate::db::list_events(conn)? {
-            if !event_matches(&e.title, &up.target) {
-                continue;
-            }
-            // A relative shift becomes a concrete new start, computed from THIS event's current
-            // start (Rust does the arithmetic the model can't). An explicit start_time wins over it.
-            let shifted = up
-                .shift_minutes
-                .filter(|_| up.start_time.is_none())
-                .and_then(|d| parse_dt(&e.start).map(|s| (s + Duration::minutes(d)).format("%H:%M").to_string()));
-            let start_arg = up.start_time.clone().or(shifted);
-            let (t, s, en) = merge_event(&e, now, up.day.as_deref(), up.date.as_deref(), start_arg.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
-            crate::db::update_event(conn, e.id, &t, &s, &en)?;
-            updated_event_titles.push(t);
-        }
+        let events = crate::db::list_events(conn)?;
+        let Some(e) = best_update_target(&events, &up.target, now) else {
+            continue;
+        };
+        // A relative shift becomes a concrete new start, computed from THIS event's current
+        // start (Rust does the arithmetic the model can't). An explicit start_time wins over it.
+        let shifted = up
+            .shift_minutes
+            .filter(|_| up.start_time.is_none())
+            .and_then(|d| parse_dt(&e.start).map(|s| (s + Duration::minutes(d)).format("%H:%M").to_string()));
+        let start_arg = up.start_time.clone().or(shifted);
+        let (t, s, en) = merge_event(e, now, up.day.as_deref(), up.date.as_deref(), start_arg.as_deref(), up.end_time.as_deref(), up.duration_minutes, up.span_days, up.title.as_deref());
+        crate::db::update_event(conn, e.id, &t, &s, &en)?;
+        updated_event_titles.push(t);
     }
 
     // CREATE — but the small model often routes an EDIT (e.g. "move the sleepover to 9pm")
@@ -3610,6 +3741,49 @@ mod tests {
         assert_eq!(outcome.created_event_ids.len(), 1, "the explicit 12–2 block is kept");
         assert!(outcome.created_task_ids.is_empty(), "the duplicate task is dropped");
         assert!(crate::db::list_tasks(&conn).unwrap().is_empty(), "no duplicate task persisted");
+    }
+
+    #[test]
+    fn store_plan_update_targets_one_event_not_every_fuzzy_match() {
+        // REGRESSION ("updated 17 events"): `updateEvents{match:"Study"}` used to rewrite EVERY event
+        // whose title merely CONTAINS the needle — a whole calendar of recurring "Study"/"Study C++"
+        // sessions collapsed onto one time, and the legitimate creates were then suppressed by the
+        // phantom-duplicate guard. An update must land on exactly ONE event.
+        let conn = crate::db::test_conn();
+        let today = Local::now().naive_local().date();
+        let at = |d: i64, h: u32| fmt_dt((today + Duration::days(d)).and_hms_opt(h, 0, 0).unwrap());
+        crate::db::insert_event(&conn, "Study C++", &at(-1, 18), &at(-1, 20), "fixed").unwrap();
+        crate::db::insert_event(&conn, "Study", &at(1, 9), &at(1, 11), "fixed").unwrap();
+        crate::db::insert_event(&conn, "Study", &at(2, 9), &at(2, 11), "fixed").unwrap();
+
+        let plan = ParsedPlan {
+            update_events: vec![UpdateEvent {
+                target: "Study".into(),
+                title: None,
+                day: None,
+                start_time: Some("17:00".into()),
+                end_time: Some("19:00".into()),
+                duration_minutes: None,
+                date: None,
+                span_days: None,
+                shift_minutes: None,
+            }],
+            ..Default::default()
+        };
+        let outcome = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert_eq!(
+            outcome.updated_event_titles.len(),
+            1,
+            "an update must touch exactly ONE event, not every fuzzy match (got {:?})",
+            outcome.updated_event_titles
+        );
+        // The untouched sessions keep their original times.
+        let untouched = crate::db::list_events(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.start.contains("T09:00"))
+            .count();
+        assert_eq!(untouched, 1, "only the single best match moved; the other recurring session is intact");
     }
 
     #[test]
@@ -4314,6 +4488,11 @@ mod tests {
         assert_eq!(recurrence("relax on weekends"), Some(("weekly".into(), vec![6, 7], 1)));
         assert_eq!(recurrence("exercise daily"), Some(("daily".into(), vec![], 1)));
         assert_eq!(recurrence("lunch on friday"), None); // one-off, not recurring
+        // A bare, singular, descriptive "weekend"/"weekday" is NOT a cadence — else a conversational
+        // preamble ("i got a pretty packed weekend") is fabricated into a recurring habit.
+        assert_eq!(recurrence("i got a pretty packed weekend, on saturday i have a sleepover"), None);
+        assert_eq!(recurrence("this weekend is gonna be busy"), None);
+        assert_eq!(recurrence("i have a big presentation on a weekday next month"), None);
         // "except" inverts the named days against the full week.
         assert_eq!(recurrence("workout every day except sunday at 8pm"), Some(("weekly".into(), vec![1, 2, 3, 4, 5, 6], 1)));
         assert_eq!(recurrence("gym every day but not saturday and sunday"), Some(("weekly".into(), vec![1, 2, 3, 4, 5], 1)));
@@ -5104,11 +5283,59 @@ mod tests {
     }
 
     #[test]
+    fn split_intents_splits_a_timed_schedule_list() {
+        // REGRESSION: a comma/"then"-separated list of time-blocked activities (no "and"/periods) is a
+        // very common multi-intent shape the model drops most of. It must chunk to ~one intent per block.
+        let r = split_intents(
+            "im gonna play minecraft w my friends from like 1 - 3, call my gf from 3-5, then study from 5-7, gym from 7-8, study again from 8-10, then take an exam from 10-11",
+        );
+        assert!(r.len() >= 5, "timed list split into per-activity clauses: {r:?}");
+        assert!(r.iter().any(|c| c.contains("minecraft")), "minecraft survives: {r:?}");
+        assert!(r.iter().any(|c| c.contains("gf") || c.contains("girlfriend")), "gf call survives: {r:?}");
+        assert!(r.iter().any(|c| c.contains("exam")), "exam survives: {r:?}");
+        assert!(r.iter().any(|c| c.contains("gym")), "gym survives: {r:?}");
+    }
+
+    #[test]
+    fn split_intents_does_not_oversplit_a_comma_list_without_times() {
+        // A comma list with no time cues (a shopping/errand list) must NOT be chopped into fragments,
+        // even when it's long — only TIMED clauses split (each has a digit).
+        assert_eq!(
+            split_intents("i should really pick up some coffee, some green tea, some fresh orange juice, some sourdough bread before the shops close later tonight").len(),
+            1,
+            "no digits in the comma clauses → not a timed schedule → left whole",
+        );
+    }
+
+    #[test]
     fn split_intents_splits_on_comma_then_verb() {
         // "cancel X, add Y" → separate intents, and the verb stays with its clause.
         let r = split_intents("cancel all of my meetings on friday, add a 3 hour deep work block on friday morning, and prep the launch deck");
         assert!(r.iter().any(|c| c.starts_with("cancel")), "cancel clause: {r:?}");
         assert!(r.iter().any(|c| c.starts_with("add") && c.contains("deep work")), "add clause keeps its verb: {r:?}");
+    }
+
+    #[test]
+    fn recovers_endtime_crammed_into_starttime() {
+        // The tuned 7B emits malformed JSON where endTime is jammed into the startTime string:
+        // "startTime":"15:00','endTime':'17:00}]}]}". The real range must be recovered, not lost.
+        let mut plan = ParsedPlan::default();
+        let mut e = ev("today", Some("15:00','endTime':'17:00}]}]}"), None);
+        e.title = "Call girlfriend".into();
+        plan.events.push(e);
+        apply_recovery(&mut plan, "call my gf from 3-5", d());
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("15:00"), "start recovered");
+        assert_eq!(plan.events[0].end_time.as_deref(), Some("17:00"), "crammed end recovered");
+    }
+
+    #[test]
+    fn clean_times_are_left_untouched() {
+        // A well-formed event must pass through recovery unchanged (no false positives).
+        let mut plan = ParsedPlan::default();
+        plan.events.push(ev("today", Some("14:00"), Some("16:00")));
+        apply_recovery(&mut plan, "minecraft 2-4", d());
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("14:00"));
+        assert_eq!(plan.events[0].end_time.as_deref(), Some("16:00"));
     }
 
     #[test]
