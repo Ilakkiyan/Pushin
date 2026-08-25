@@ -20,7 +20,7 @@ in-flight feature).
 ## Must-know workflow (this is a WSL box; the app is a Windows app)
 - **Rust: use Windows `cargo.exe`**, not Linux `cargo` (Linux build fails on openssl/pkg-config/webkit).
   `npm` works fine in WSL.
-- **Run the app:** double-click **`dev.bat`** on Windows (`npm run tauri dev` with Windows Node). Do
+- **Run the app:** double-click **`scripts/dev.bat`** on Windows (`npm run tauri dev` with Windows Node). Do
   **not** `npm run tauri dev` from WSL (no webkit/display).
 - **Rust tests:** `cd src-tauri && cargo.exe test --lib`. Force a rebuild with `touch src/lib.rs` first
   — `/mnt/c` mtime skew sometimes makes cargo think nothing changed. If the app is running, the
@@ -91,7 +91,7 @@ Don't collapse the structural kinds into labels — labels are orthogonal.
   so their blocks cluster.
 - **Events UI surface:** events have no editor pane, so they're currently label-able only via the
   backend/AI, not the UI. Add an event-detail popover (in `CalendarPane`) with a `LabelPicker`.
-- **Not run live yet:** migration 0010 + the scheduling bias need a `dev.bat` launch to eyeball (tag a
+- **Not run live yet:** migration 0010 + the scheduling bias need a `scripts/dev.bat` launch to eyeball (tag a
   task with a morning window → confirm its blocks land AM and at the min-chunk length).
 
 ---

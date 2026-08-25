@@ -59,4 +59,7 @@ Thumbs.db
 /unsloth_compiled_cache/
 
 # Android build helper scripts (machine-specific absolute paths; see memory mobile-cross-compile)
-/and-*.bat
+/scripts/and-*.bat
+
+# Vitest coverage output (regenerable: npm run coverage)
+/coverage/

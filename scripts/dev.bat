@@ -1,7 +1,7 @@
 @echo off
 REM Double-click this to run Pushin in dev mode on Windows (uses Windows Node + Tauri).
 REM Do NOT run via WSL/Ubuntu — Tauri must build the Windows app on Windows.
-cd /d "%~dp0"
+cd /d "%~dp0.."
 echo Node platform check (should say win32):
 node -e "console.log(process.platform)"
 echo.

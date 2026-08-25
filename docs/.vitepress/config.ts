@@ -5,6 +5,10 @@ export default defineConfig({
   description: "Documentation for Pushin, a local-first AI calendar and second brain.",
   base: "/Pushin/",
   cleanUrls: true,
+  // Internal working notes (DEVLOG, ROADMAP, HANDOFF, plans, ARCHITECTURE_NOTES) live in docs/notes/
+  // so they sit next to the docs in the repo — but they are NOT part of the public site. Without this
+  // VitePress would build every .md under docs/ into a reachable page AND index it in local search.
+  srcExclude: ["notes/**"],
   lastUpdated: true,
   head: [
     ["link", { rel: "icon", href: "/Pushin/pushin-icon.png" }],
