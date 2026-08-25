@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowRight, CalendarDays, Clock, ListChecks, Loader2, Send } from "lucide-react";
 import { useStore } from "../state/store";
+import StaleTasks from "../components/StaleTasks";
 import { api, type Briefing, type CalEvent, type PlanOutcome } from "../lib/ipc";
 import { fmtTime, parseLocal, sameDay } from "../lib/time";
 
@@ -78,6 +79,8 @@ export default function TodayPane() {
 
   const focus = briefing ? (briefing.focusMinutes >= 60 ? `${(briefing.focusMinutes / 60).toFixed(1)}h` : `${briefing.focusMinutes}m`) : null;
   const due = briefing?.dueTasks ?? [];
+  // Overdue by 30+ days — split out of `due` so a month-old miss stops burying today's work.
+  const stale = briefing?.staleTasks ?? [];
 
   const submit = async () => {
     const text = input.trim();
@@ -174,6 +177,8 @@ export default function TodayPane() {
               </div>
             </div>
           )}
+
+          <StaleTasks tasks={stale} />
         </section>
 
         {/* Into the detail — progressive disclosure: the full calendar is one click away. */}

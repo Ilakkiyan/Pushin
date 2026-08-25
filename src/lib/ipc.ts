@@ -183,7 +183,11 @@ export interface Briefing {
   date: string;
   weekday: string;
   events: CalEvent[];
+  /** Due today or overdue by less than a month — the actionable list. */
   dueTasks: Task[];
+  /** Overdue by 30+ days. Shown as a collapsed "Stale" group with an archive action rather than
+   *  leading the briefing forever (which is what they used to do). */
+  staleTasks: Task[];
   focusMinutes: number;
 }
 
@@ -474,6 +478,9 @@ export const api = {
   createTask: (title: string, estimatedMinutes: number, deadline: string | null, priority: number, projectId: number | null) =>
     invoke<ScheduleResult>("create_task", { title, estimatedMinutes, deadline, priority, projectId }),
   setTaskStatus: (id: number, status: string) => invoke<ScheduleResult>("set_task_status", { id, status }),
+  /** Let go of tasks the user has stopped intending to do (the stale group's "Archive all"). A status
+   *  change, not a delete — the rows survive, but they leave the briefing and stop being scheduled. */
+  archiveTasks: (ids: number[]) => invoke<ScheduleResult>("archive_tasks", { ids }),
   deleteTask: (id: number) => invoke<ScheduleResult>("delete_task", { id }),
 
   deleteProject: (id: number) => invoke<ScheduleResult>("delete_project", { id }),

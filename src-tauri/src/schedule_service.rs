@@ -95,7 +95,7 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
     let factor = scheduler::estimation_factor(&db::estimation_samples(conn).unwrap_or_default());
     if (factor - 1.0).abs() > 1e-6 {
         for t in &mut tasks {
-            if t.status != "done" && t.status != "in_progress" {
+            if t.is_active() && t.status != "in_progress" {
                 t.estimated_minutes = ((t.estimated_minutes as f64 * factor).round() as i64).max(15);
             }
         }
@@ -132,7 +132,7 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
     // them and still honours dependency timing (locked ends feed the DAG) — then re-emit them as unlocked
     // blocks. A block that now collides with a fixed event or a real locked block, or whose task is gone/
     // done, is dropped so that task reschedules cleanly.
-    let active_ids: HashSet<i64> = tasks.iter().filter(|t| t.status != "done").map(|t| t.id).collect();
+    let active_ids: HashSet<i64> = tasks.iter().filter(|t| t.is_active()).map(|t| t.id).collect();
     let is_busy = |iv: &Interval| {
         fixed.iter().any(|f| f.start < iv.end && iv.start < f.end) || locked.iter().any(|(_, l)| l.start < iv.end && iv.start < l.end)
     };
@@ -168,7 +168,7 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
 
     let scheduled_ids: std::collections::HashSet<i64> = db::list_blocks(conn)?.iter().map(|b| b.task_id).collect();
     for t in &tasks {
-        if t.status == "done" || t.status == "in_progress" {
+        if !t.is_active() || t.status == "in_progress" {
             continue;
         }
         let new = if scheduled_ids.contains(&t.id) { "scheduled" } else { "todo" };

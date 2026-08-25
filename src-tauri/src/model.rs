@@ -65,6 +65,22 @@ pub struct Block {
     pub sync_state: Option<String>,
 }
 
+/// Status helpers. `status` is a free-form string (`todo|scheduled|in_progress|done|archived`), and
+/// "is this still real work?" is asked at half a dozen filter sites (scheduler, briefing, dedupe,
+/// status sweep). Centralize it so a new terminal status can't be forgotten at one of them.
+impl Task {
+    /// Deliberately let go: a long-overdue task the user archived from the briefing's stale section.
+    /// Kept in the DB (and the task list, behind a filter) — just out of planning and out of the day.
+    pub fn is_archived(&self) -> bool {
+        self.status == "archived"
+    }
+
+    /// Still real work: neither finished nor archived.
+    pub fn is_active(&self) -> bool {
+        self.status != "done" && !self.is_archived()
+    }
+}
+
 /// A read-only iCalendar (`.ics`) feed subscription. Its events are mirrored into `events`
 /// (provider='ics') so the scheduler plans around them; never edited or pushed back.
 #[derive(Debug, Clone, Serialize, Deserialize)]

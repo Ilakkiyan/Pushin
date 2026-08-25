@@ -109,6 +109,7 @@ pub fn run() {
             commands::plan_tasks,
             commands::create_task,
             commands::set_task_status,
+            commands::archive_tasks,
             commands::delete_task,
             commands::delete_project,
             commands::set_project_archived,

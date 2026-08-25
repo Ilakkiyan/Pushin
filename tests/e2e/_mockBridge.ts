@@ -204,6 +204,7 @@ export async function installMockBridge(page: Page) {
           { id: 2, title: "Lunch with Sam", start: "2026-06-28T12:30:00", end: "2026-06-28T13:30:00", kind: "fixed", source: "manual", createdAt: "" },
           { id: 3, title: "Design review", start: "2026-06-28T15:00:00", end: "2026-06-28T16:00:00", kind: "fixed", source: "manual", createdAt: "" },
         ],
+        staleTasks: [],
         dueTasks: [
           { id: 10, title: "Finish the Q3 deck" },
           { id: 11, title: "Email the vendor" },

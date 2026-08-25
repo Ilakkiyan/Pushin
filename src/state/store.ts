@@ -143,6 +143,8 @@ interface State {
   wakeAi: () => Promise<void>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
   setTaskStatus: (id: number, status: string) => Promise<void>;
+  /** Let go of long-overdue tasks in one gesture (the briefing's stale group). */
+  archiveTasks: (ids: number[]) => Promise<void>;
   deleteTask: (id: number) => Promise<void>;
   deleteProject: (id: number) => Promise<void>;
   setProjectArchived: (id: number, archived: boolean) => Promise<void>;
@@ -350,6 +352,7 @@ export const useStore = create<State>((set, get) => {
     createTask: (title, minutes, deadline, priority, projectId = null) =>
       mutate(() => api.createTask(title, minutes, deadline, priority, projectId)),
     setTaskStatus: (id, status) => mutate(() => api.setTaskStatus(id, status)),
+    archiveTasks: (ids) => mutate(() => api.archiveTasks(ids)),
     deleteTask: (id) => mutate(() => api.deleteTask(id)),
     deleteProject: (id) => mutate(() => api.deleteProject(id)),
     setProjectArchived: (id, archived) => mutate(() => api.setProjectArchived(id, archived)),

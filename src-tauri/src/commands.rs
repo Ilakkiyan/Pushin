@@ -402,6 +402,21 @@ pub fn set_task_status(state: State<AppState>, id: i64, status: String) -> Resul
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
+/// Archive tasks the user has decided to let go — the "Archive all" on the briefing's stale group.
+/// Archiving is a status change, not a delete: the rows stay (recoverable from the task list) but
+/// `Task::is_active` excludes them, so they leave the briefing AND stop being scheduled. Bulk because
+/// the whole point of the stale group is clearing a month's worth in one gesture; one reschedule for
+/// the batch rather than one per task.
+#[tauri::command]
+pub fn archive_tasks(state: State<AppState>, ids: Vec<i64>) -> Result<ScheduleResult, String> {
+    let mut conn = state.db.lock().unwrap();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    for id in ids {
+        db::set_task_status(&conn, id, "archived").map_err(err)?;
+    }
+    reschedule_inner(&mut conn, &settings).map_err(err)
+}
+
 #[tauri::command]
 pub fn delete_task(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
     let mut conn = state.db.lock().unwrap();

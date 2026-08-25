@@ -683,7 +683,7 @@ pub fn schedule_with_prefs(
     locked: &[(i64, Interval)],
     prefs: &HashMap<i64, SchedulePref>,
 ) -> ScheduleResult {
-    let active: Vec<&Task> = tasks.iter().filter(|t| t.status != "done").collect();
+    let active: Vec<&Task> = tasks.iter().filter(|t| t.is_active()).collect();
     let id_set: HashSet<i64> = active.iter().map(|t| t.id).collect();
     let task_by_id: HashMap<i64, &Task> = active.iter().map(|t| (t.id, *t)).collect();
 

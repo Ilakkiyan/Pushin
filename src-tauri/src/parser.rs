@@ -3485,7 +3485,7 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
     // Projects + tasks. Skip tasks that duplicate an existing active task — the small model
     // tends to re-emit example tasks ("Pick platform") every turn, which otherwise piles up.
     let mut existing_task_lc: HashSet<String> =
-        crate::db::list_tasks(conn)?.iter().filter(|t| t.status != "done").map(|t| t.title.to_lowercase()).collect();
+        crate::db::list_tasks(conn)?.iter().filter(|t| t.is_active()).map(|t| t.title.to_lowercase()).collect();
     for proj in &plan.projects {
         // Keep only genuinely new tasks (not a duplicate, a habit, or blank).
         let mut seen_titles: HashSet<String> = HashSet::new();

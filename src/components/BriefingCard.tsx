@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Sparkles, CalendarDays, ListChecks, Clock, X } from "lucide-react";
 import { api, type Briefing } from "../lib/ipc";
+import StaleTasks from "./StaleTasks";
 import { useStore } from "../state/store";
 
 /** The morning Daily Briefing as a slim, dismissible banner above the calendar — today's event
@@ -29,7 +30,9 @@ export default function BriefingCard() {
   }, [tasks, events]);
 
   if (dismissed || !briefing) return null;
-  if (briefing.events.length === 0 && briefing.dueTasks.length === 0) return null;
+  // `staleTasks ?? []` guards an older backend / a test mock that predates the split.
+  const stale = briefing.staleTasks ?? [];
+  if (briefing.events.length === 0 && briefing.dueTasks.length === 0 && stale.length === 0) return null;
 
   const focus = briefing.focusMinutes >= 60 ? `${(briefing.focusMinutes / 60).toFixed(1)}h` : `${briefing.focusMinutes}m`;
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
@@ -58,6 +61,7 @@ export default function BriefingCard() {
           {briefing.dueTasks.length > 6 && <span className="tnum px-1 text-[var(--ink-faint)]">+{briefing.dueTasks.length - 6} more</span>}
         </div>
       )}
+      <StaleTasks tasks={stale} compact />
     </div>
   );
 }
