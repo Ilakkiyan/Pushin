@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as RPointerEven
 import { ChevronLeft, ChevronRight, Lock, Moon, Plus, X, NotebookPen } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { api, type Block, type CalEvent, type Label, type MeetingBrief } from "../lib/ipc";
-import { addDays, addMinutes, fmtTime, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
+import { api, formatPlacementReason, type Block, type CalEvent, type Label, type MeetingBrief } from "../lib/ipc";
+import { addDays, addMinutes, fmtTime, nearestFreeStart, parseLocal, sameDay, startOfWeek, toLocalIso, toLocalDate } from "../lib/time";
 import ViewToggle from "../components/ViewToggle";
 import CalendarLabelControls from "../components/CalendarLabelControls";
 import CalendarLegend from "../components/CalendarLegend";
@@ -46,6 +46,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   const blocks = useStore((s) => s.blocks);
   const moveBlock = useStore((s) => s.moveBlock);
   const unlockBlock = useStore((s) => s.unlockBlock);
+  const blockReasons = useStore((s) => s.blockReasons);
   const moveHabit = useStore((s) => s.moveHabit);
   const deleteEvent = useStore((s) => s.deleteEvent);
   const addEvent = useStore((s) => s.addEvent);
@@ -162,6 +163,20 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           startMin = Math.max(TOP_MIN, Math.min(startMin, TOP_MIN + TOTAL_MIN - d.durationMin));
           const base = new Date(d.origStart);
           base.setHours(0, 0, 0, 0);
+          // Don't drop onto an existing event/block — slide to the closest free time instead of
+          // overlapping (the backend rejects an overlapping drop, which looks like a snap-back).
+          const busy: Array<[number, number]> = [];
+          for (const ev of events) {
+            if (d.kind === "habit" && ev.id === d.id) continue; // ignore the habit being dragged
+            const s = parseLocal(ev.start);
+            if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(ev.end))]);
+          }
+          for (const b of blocks) {
+            if (d.kind === "block" && b.id === d.id) continue; // ignore the block being dragged
+            const s = parseLocal(b.start);
+            if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(b.end))]);
+          }
+          startMin = nearestFreeStart(startMin, d.durationMin, busy, TOP_MIN, TOP_MIN + TOTAL_MIN);
           const newStart = addMinutes(base, startMin);
           const newEnd = addMinutes(newStart, d.durationMin);
           if (d.kind === "habit") moveHabit(d.id, toLocalIso(newStart));
@@ -176,10 +191,10 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [drag, moveBlock, moveHabit]);
+  }, [drag, moveBlock, moveHabit, events, blocks]);
 
   const top = (d: Date) => ((minutesFromMidnight(d) - TOP_MIN) / 60) * PX_PER_HOUR;
-  const height = (mins: number) => Math.max(16, (mins / 60) * PX_PER_HOUR);
+  const height = (mins: number) => Math.max(20, (mins / 60) * PX_PER_HOUR);
 
   const SNAP = 30; // minutes per arrow step / click snap
   const topMin = (minutes: number) => ((minutes - TOP_MIN) / 60) * PX_PER_HOUR;
@@ -262,16 +277,16 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4 min-w-0 overflow-hidden">
         <ViewToggle />
         <div className="w-px h-5 bg-white/10 mx-1 shrink-0" />
-        <button onClick={() => setAnchor((a) => addDays(a, -dayCount))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => addDays(a, -dayCount))} title="Previous" className="p-1.5 hoverable shrink-0">
           <ChevronLeft className="size-4" />
         </button>
-        <button onClick={() => setAnchor(anchorStart(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor(anchorStart(new Date()))} className="text-xs px-2.5 py-1.5 hoverable border border-white/10 shrink-0">
           Today
         </button>
-        <button onClick={() => setAnchor((a) => addDays(a, dayCount))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => addDays(a, dayCount))} title="Next" className="p-1.5 hoverable shrink-0">
           <ChevronRight className="size-4" />
         </button>
-        <span className="text-sm text-gray-300 ml-2 whitespace-nowrap truncate">
+        <span className="tnum text-sm text-[var(--ink-muted)] ml-2 whitespace-nowrap truncate">
           {dayCount === 1
             ? anchor.toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" })
             : `${anchor.toLocaleDateString([], { month: "short", day: "numeric" })} – ${days[lastCol].toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}`}
@@ -285,22 +300,38 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       {/* Day headers */}
       <div className="shrink-0 grid border-b border-white/10" style={{ gridTemplateColumns: gridCols }}>
         <div />
-        {days.map((d) => (
-          <div key={d.toISOString()} className={clsx("group relative py-2 text-center text-xs", sameDay(d, now) ? "text-indigo-300" : "text-gray-400")}>
-            <div>{d.toLocaleDateString([], { weekday: "short" })}</div>
-            <div className={clsx("text-sm", sameDay(d, now) && "font-semibold")}>{d.getDate()}</div>
-            <button
-              onClick={() => openDaily(toLocalDate(d))}
-              title="Open this day's note"
-              className={clsx(
-                "absolute top-1.5 right-1.5 p-0.5 rounded text-gray-500 hover:text-indigo-300 hover:bg-white/10 transition",
-                dayCount === 1 ? "opacity-100" : "opacity-0 group-hover:opacity-100",
-              )}
-            >
-              <NotebookPen className="size-3.5" />
-            </button>
-          </div>
-        ))}
+        {days.map((d) => {
+          const isToday = sameDay(d, now);
+          return (
+            <div key={d.toISOString()} className="group relative py-2 text-center">
+              <div className={clsx("text-[11px] uppercase tracking-[0.08em]", isToday ? "text-white" : "text-[var(--ink-faint)]")}>
+                {d.toLocaleDateString([], { weekday: "short" })}
+              </div>
+              {/* Today is a filled inverted square — the theme collapses every accent hue to grey, so
+                  "today" has to be a VALUE inversion, not a colour, to stay unmistakable at a glance. */}
+              <div className="mt-1 flex justify-center">
+                <span
+                  className={clsx(
+                    "tnum inline-grid place-items-center h-6 min-w-6 px-1 text-sm",
+                    isToday ? "bg-white text-[var(--bg)] font-semibold" : "text-[var(--ink-muted)]",
+                  )}
+                >
+                  {d.getDate()}
+                </span>
+              </div>
+              <button
+                onClick={() => openDaily(toLocalDate(d))}
+                title="Open this day's note"
+                className={clsx(
+                  "absolute top-1.5 right-1.5 p-0.5 hoverable text-[var(--ink-faint)] hover:text-white",
+                  dayCount === 1 ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                )}
+              >
+                <NotebookPen className="size-3.5" />
+              </button>
+            </div>
+          );
+        })}
       </div>
 
       {/* All-day / multi-day bar */}
@@ -327,13 +358,13 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           ref={gridRef}
           tabIndex={0}
           onKeyDown={onGridKey}
-          className="grid relative outline-none"
+          className={clsx("grid relative outline-none", drag && "select-none")}
           style={{ gridTemplateColumns: gridCols, height: (TOTAL_MIN / 60) * PX_PER_HOUR }}
         >
           {/* Time gutter */}
           <div className="relative">
             {Array.from({ length: END_HOUR - START_HOUR }, (_, i) => (
-              <div key={i} className="absolute right-1 text-[10px] text-gray-600" style={{ top: i * PX_PER_HOUR - 6 }}>
+              <div key={i} className="tnum absolute right-1 text-[10px] text-[var(--ink-faint)]" style={{ top: i * PX_PER_HOUR - 6 }}>
                 {((START_HOUR + i) % 12) || 12}{START_HOUR + i < 12 ? "am" : "pm"}
               </div>
             ))}
@@ -403,9 +434,17 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                   const t = taskById.get(b.taskId);
                   const project = t?.projectId != null ? projectById.get(t.projectId) : undefined;
                   const dur = minutesBetweenBlock(b);
+                  const h = height(dur);
+                  // Two lines (title + start time) need ~40px; below that, show just a centered title line.
+                  const compact = h < 40;
                   const isDragging = drag?.kind === "block" && drag.id === b.id;
                   const dy = isDragging ? (drag!.deltaMin / 60) * PX_PER_HOUR : 0;
                   const color = (colorByLabel ? primaryLabelColor(taskLabels[b.taskId]) : null) ?? project?.color ?? "#6366f1";
+                  // "Why is this here" — derived scheduler reason. Full text on hover (title); shown
+                  // inline only on tall-enough blocks so it never crowds the title/time.
+                  const reason = blockReasons[b.id];
+                  const reasonText = reason ? formatPlacementReason(reason) : null;
+                  const roomy = h >= 58;
                   return (
                     <div
                       key={`b${b.id}`}
@@ -421,18 +460,19 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                         setDrag({ kind: "block", id: b.id, startClientY: e.clientY, origStart: parseLocal(b.start), durationMin: dur, deltaMin: 0 });
                       }}
                       className={clsx(
-                        "absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden cursor-grab active:cursor-grabbing z-10 border",
+                        "absolute left-1 right-1 select-none rounded-md px-1.5 text-[11px] leading-tight overflow-hidden cursor-grab active:cursor-grabbing z-10 border flex flex-col",
+                        compact ? "py-0 justify-center" : "py-1",
                         isDragging ? "opacity-80 ring-2 ring-white/40" : "",
                       )}
                       style={{
                         top: top(parseLocal(b.start)) + dy,
-                        height: height(dur),
+                        height: Math.max(h - 2, 6), // 2px gap so back-to-back blocks don't visually merge
                         background: color + "33",
                         borderColor: color + "aa",
                       }}
-                      title={t?.title}
+                      title={reasonText ? `${t?.title ?? "Task"} — ${reasonText}` : t?.title}
                     >
-                      <div className="flex items-center gap-1 font-medium text-gray-100 truncate">
+                      <div className="flex items-center gap-1 font-medium text-gray-100 min-w-0">
                         {b.locked && (
                           <button
                             onPointerDown={(e) => e.stopPropagation()}
@@ -448,7 +488,10 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                         )}
                         <span className="truncate">{t?.title ?? "Task"}</span>
                       </div>
-                      <div className="text-gray-300/70">{fmtTime(parseLocal(b.start))}</div>
+                      {!compact && <div className="tnum text-gray-300/70">{fmtTime(parseLocal(b.start))}</div>}
+                      {roomy && reasonText && (
+                        <div className="mt-auto truncate text-[10px] text-gray-300/60">{reasonText}</div>
+                      )}
                     </div>
                   );
                 })}
@@ -588,6 +631,9 @@ function EventCard({
 }) {
   const isHabit = ev.kind === "habit";
   const setView = useStore((s) => s.setView);
+  // Short blocks (<32px ≈ under ~35 min) can't fit padded, top-aligned text — vertically center a single
+  // tight line and drop the padding so the title isn't clipped.
+  const compact = height < 32;
   return (
     <div
       onClick={(e) => {
@@ -602,17 +648,20 @@ function EventCard({
       }}
       onPointerDown={isHabit ? onDragStart : undefined}
       className={clsx(
-        "group absolute left-1 right-1 rounded-md px-1.5 py-1 text-[11px] overflow-hidden z-10 border",
+        "group absolute left-1 right-1 select-none rounded-md px-1.5 text-[11px] leading-tight overflow-hidden z-10 border flex items-center",
+        compact ? "py-0" : "py-1 items-start",
         !isHabit && "cursor-pointer",
         isHabit && "cursor-grab active:cursor-grabbing",
         !color && (isHabit ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-100" : "bg-rose-500/15 border-rose-400/40 text-rose-100"),
       )}
-      style={{ top: top + dragDy, height, ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
+      // Render 2px short of the true height so back-to-back blocks (especially same-colored ones) show a
+      // clear gap instead of merging into one block with a doubled border line.
+      style={{ top: top + dragDy, height: Math.max(height - 2, 6), ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
       title={isHabit ? `${ev.title} — drag to set your preferred time` : ev.title}
     >
-      <div className="flex items-center gap-1">
+      <div className="flex w-full min-w-0 items-center gap-1">
         <span className="truncate flex-1">{ev.title}</span>
-        <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="opacity-0 group-hover:opacity-100 hover:text-white">
+        <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="shrink-0 opacity-0 group-hover:opacity-100 hover:text-white">
           <X className="size-3" />
         </button>
       </div>
@@ -662,7 +711,7 @@ function EventDetailModal({ ev, onClose, onDelete, onNotes }: { ev: CalEvent; on
           <h3 className="text-sm font-medium leading-snug">{ev.title}</h3>
           <button onClick={onClose} className="text-gray-500 hover:text-white shrink-0"><X className="size-4" /></button>
         </div>
-        <p className="text-xs text-gray-500">
+        <p className="tnum text-xs text-[var(--ink-faint)]">
           {parseLocal(ev.start).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })} – {fmtTime(parseLocal(ev.end))}
         </p>
         {hasBrief && (
@@ -719,7 +768,7 @@ function EventDetailModal({ ev, onClose, onDelete, onNotes }: { ev: CalEvent; on
                   key={i}
                   onClick={() => addItem(i)}
                   title="Add as a task"
-                  className="inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] text-indigo-200 hover:bg-indigo-500/20"
+                  className="inline-flex items-center gap-1 border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] text-indigo-200 hover:bg-indigo-500/20"
                 >
                   <Plus className="size-2.5" /> {it}
                 </button>
@@ -734,7 +783,7 @@ function EventDetailModal({ ev, onClose, onDelete, onNotes }: { ev: CalEvent; on
             className="text-xs px-3 py-1.5 rounded-md bg-white/5 border border-white/10 hover:bg-white/10 inline-flex items-center gap-1.5"
           >
             <NotebookPen className="size-3.5" /> Notes
-            <kbd className="text-[10px] text-gray-500 border border-white/10 rounded px-1">⌘T</kbd>
+            <kbd className="kbd">⌘T</kbd>
           </button>
           <button onClick={onDelete} className="text-xs px-3 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
             Delete event
@@ -755,8 +804,8 @@ function AddEventModal({ start, onClose, onSave }: { start: Date; onClose: () =>
           <h3 className="text-sm font-medium flex items-center gap-2"><Plus className="size-4" /> Add busy time</h3>
           <button onClick={onClose} className="text-gray-500 hover:text-white"><X className="size-4" /></button>
         </div>
-        <p className="text-xs text-gray-500">
-          {start.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })} — the scheduler will plan around it.
+        <p className="text-xs text-[var(--ink-faint)]">
+          <span className="tnum">{start.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</span> — the scheduler will plan around it.
         </p>
         <input
           autoFocus

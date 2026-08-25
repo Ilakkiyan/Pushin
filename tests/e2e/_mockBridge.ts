@@ -21,33 +21,102 @@ export async function installMockBridge(page: Page) {
       nextId: 1,
       pages: [] as any[],
       inbox: [] as any[],
+      icsSubs: [
+        { id: 501, name: "Team calendar", url: "https://example.com/team.ics", color: "#38bdf8", lastSynced: "2026-07-15T09:00:00", createdAt: "" },
+        { id: 502, name: "US Holidays", url: "https://example.com/holidays.ics", color: "#f59e0b", lastSynced: "2026-07-15T09:00:00", createdAt: "" },
+      ] as any[],
       settings: {
         // `?new` in the URL → a fresh (un-onboarded) user, for capturing the WelcomeGuide.
         onboarded: !new URLSearchParams(window.location.search).has("new"),
         googleConnected: false,
+        googleClientId: "",
+        googleClientSecret: "",
         timezone: "UTC",
         workStart: "09:00",
         workEnd: "17:00",
         workDays: [1, 2, 3, 4, 5],
+        horizonDays: 14,
+        bufferMinutes: 0,
+        defaultMinChunk: 30,
+        defaultMaxChunk: 120,
+        llmBaseUrl: "http://127.0.0.1:8080",
         commitments: [],
         sleepEnabled: false,
         sleepStart: "23:00",
         sleepEnd: "07:00",
-        modelId: "lite",
-        embedModel: "",
+        // On a BASE model on purpose, so Settings shows the "switch to the tuned model" nudge (Item A).
+        modelId: "qwen2.5-7b-instruct-q4_k_m",
+        embedModel: "bge-small-en-v1.5-q8_0",
+        idleUnloadMinutes: 10,
+        archetypes: [],
+        aboutMe: "",
+        vaultDir: null,
       },
     };
+
+    // A seeded day of scheduled work so the calendar shows task blocks WITH their "why here" reasons
+    // (Item C — scheduler explainability). Dated on `today` so it lands on the visible week.
+    const today = new Date().toISOString().slice(0, 10);
+    const at = (hm: string) => `${today}T${hm}:00`;
+    const seedTasks = [
+      { id: 1, projectId: null, title: "Draft outline", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
+      { id: 2, projectId: null, title: "Write thesis", notes: "", estimatedMinutes: 180, deadline: at("23:59"), earliestStart: null, priority: 3, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
+      { id: 3, projectId: null, title: "Revise draft", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [1] },
+      { id: 4, projectId: null, title: "Prep slides", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
+    ];
+    const blk = (id: number, taskId: number, s: string, e: string) => ({ id, taskId, start: at(s), end: at(e), locked: false, provider: null, externalId: null, syncState: null });
+    const seedBlocks = [
+      blk(101, 1, "08:00", "09:30"), // Draft outline — earliest free slot
+      blk(102, 2, "10:00", "11:30"), // Write thesis — has a deadline today
+      blk(103, 3, "13:00", "14:30"), // Revise draft — after Draft outline
+      blk(104, 2, "15:00", "16:30"), // Write thesis — continuation (part 2)
+      blk(105, 4, "16:45", "18:15"), // Prep slides — right after a fixed event
+    ];
+    const seedEvents = [
+      { id: 900, title: "Team meeting", start: at("15:00"), end: at("16:45"), kind: "fixed", source: "manual", createdAt: "", provider: null, externalId: null, accountId: null, etag: null },
+    ];
+    const seedReasons = [
+      { blockId: 101, reason: { kind: "earliest" } },
+      { blockId: 102, reason: { kind: "forDeadline", deadline: at("23:59") } },
+      { blockId: 103, reason: { kind: "afterDependency", depTitle: "Draft outline" } },
+      { blockId: 104, reason: { kind: "continuation", part: 2, of: 2 } },
+      { blockId: 105, reason: { kind: "aroundCommitment" } },
+    ];
+    const tunedModels = [
+      { id: "qwen2.5-7b-instruct-q4_k_m", name: "Qwen2.5 7B Instruct (base)", sizeMb: 4680 },
+      { id: "pushin-arch7b-chat-tuned-q4_k_m", name: "Pushin 7B (tuned, recommended)", sizeMb: 4470 },
+      { id: "pushin-arch3b-tuned-q4_k_m", name: "Pushin 3B (tuned)", sizeMb: 1841 },
+    ];
     const titleOf = (p: any) => (p.title && p.title.trim()) || (p.content || "").split("\n")[0]?.slice(0, 80) || "Untitled";
     const lite = (p: any) => ({ ...p, content: "", contentJson: undefined, title: titleOf(p) });
 
     const handlers: Record<string, (a: any) => any> = {
-      load_all: () => ({ settings: state.settings, projects: [], tasks: [], events: [], blocks: [], eventTypes: [], bookings: [] }),
+      load_all: () => ({ settings: state.settings, projects: [], tasks: seedTasks, events: seedEvents, blocks: seedBlocks, eventTypes: [], bookings: [] }),
       reschedule: () => ({ conflicts: [] }),
+      explain_schedule: () => seedReasons,
       save_settings: () => null,
-      llm_status: () => ({ reachable: true, baseUrl: "", modelPresent: true, modelId: "lite", models: [] }),
-      list_models: () => [],
+      llm_status: () => ({ reachable: true, baseUrl: "http://127.0.0.1:8080", modelPresent: true, modelId: state.settings.modelId, models: tunedModels }),
+      list_models: () => tunedModels,
+      model_present: () => true,
+      recommend_model: () => ({ modelId: "pushin-arch7b-chat-tuned-q4_k_m", reason: "16 GB RAM comfortably runs Pushin's tuned 7B — the most reliable", ramGb: 16, hasGpu: true }),
       ensure_inference: () => "ready",
+      restart_inference: () => "ready",
+      sleep_inference: () => true,
       ensure_embeddings: () => "ready",
+      list_memories: () => [],
+      sync_status: () => ({ joined: false, deviceName: "This device", peers: [], relay: null }),
+      // Read-only .ics subscriptions (Stage 2 ingestion).
+      list_ics_subscriptions: () => state.icsSubs,
+      add_ics_subscription: ({ name, url, color }: any) => {
+        const sub = { id: state.nextId++, name: name || "Subscribed calendar", url, color: color || "#64748b", lastSynced: "2026-07-15T00:00:00", createdAt: "" };
+        state.icsSubs.push(sub);
+        return sub;
+      },
+      refresh_ics_subscriptions: () => state.icsSubs.length * 3,
+      remove_ics_subscription: ({ id }: any) => {
+        state.icsSubs = state.icsSubs.filter((s: any) => s.id !== id);
+        return null;
+      },
       list_habits: () => [],
       list_event_types: () => [],
       booking_server_status: () => ({ running: false, localUrl: null, host: "127.0.0.1", port: null }),

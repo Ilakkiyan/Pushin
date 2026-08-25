@@ -27,6 +27,7 @@ vi.mock("./lib/ipc", () => {
   return {
     api: {
       loadAll: vi.fn().mockResolvedValue({ settings, projects: [], tasks: [], events: [], blocks: [], eventTypes: [], bookings: [] }),
+      explainSchedule: vi.fn().mockResolvedValue([]),
       llmStatus: vi.fn().mockResolvedValue({ reachable: true, baseUrl: "", modelPresent: true, modelId: "lite", models: [] }),
       ensureInference: vi.fn().mockResolvedValue("ready"),
       ensureEmbeddings: vi.fn().mockResolvedValue("ready"),
@@ -60,21 +61,22 @@ import { useStore } from "./state/store";
 beforeEach(() => {
   vi.clearAllMocks();
   // Reset transient store bits between renders of the singleton store.
-  useStore.setState({ view: "calendar", captureOpen: false, currentPageId: null, chatMessages: [] });
+  useStore.setState({ view: "calendar", space: "planner", prevPlannerView: "calendar", captureOpen: false, currentPageId: null, chatMessages: [] });
 });
 
 describe("App (mocked-IPC integration)", () => {
   it("boots past the loading screen to the calendar shell", async () => {
     render(<App />);
-    // Sidebar + calendar toolbar appear once load_all resolves.
-    expect(await screen.findByText("Today")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Plan" })).toBeInTheDocument(); // AI chat pane (Plan/Chat toggle)
+    // ChatPane's Plan/Chat toggle is unique to the calendar shell — a reliable "we're in" signal
+    // ("Today" is now ambiguous: it's both a sidebar nav item and the calendar's Today button).
+    expect(await screen.findByRole("button", { name: "Plan" })).toBeInTheDocument();
+    expect(screen.getByText("Calendar")).toBeInTheDocument(); // sidebar nav
     expect(api.loadAll).toHaveBeenCalled();
   });
 
   it("quick-capture flows into the Inbox", async () => {
     render(<App />);
-    await screen.findByText("Today");
+    await screen.findByRole("button", { name: "Plan" });
 
     fireEvent.keyDown(window, { key: "n", ctrlKey: true, shiftKey: true });
     // Target the QuickCapture modal's box specifically (ChatPane also has a textbox).
@@ -83,7 +85,8 @@ describe("App (mocked-IPC integration)", () => {
     fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
     await waitFor(() => expect(api.captureNote).toHaveBeenCalledWith("buy oat milk"));
 
-    // Open the Inbox view and see the capture.
+    // Inbox now lives in the Vault space — step into it, then open Inbox.
+    await userEvent.click(screen.getByText("Vault"));
     await userEvent.click(screen.getByText("Inbox", { exact: true }));
     expect(await screen.findByText("buy oat milk")).toBeInTheDocument();
   });

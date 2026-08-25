@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
@@ -7,6 +7,7 @@ import UpdateBanner from "./components/UpdateBanner";
 import OpeningAnimation from "./components/OpeningAnimation";
 import WelcomeBack from "./components/WelcomeBack";
 import WhatsNew from "./components/WhatsNew";
+import TodayPane from "./panes/TodayPane";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
@@ -60,7 +61,16 @@ export default function App() {
     return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("enter") === "1";
   });
   // The post-update "what's new" intro (shown once after the app version changes — see the effect below).
-  const [whatsNew, setWhatsNew] = useState(false);
+  // The FORCED case (dev builds + `?whatsnew=1`) is seeded synchronously here, not in the effect below:
+  // effects run AFTER the first paint, so setting it there let one calendar frame slip through before the
+  // overlay mounted (the "flash before What's New"). Seeding the initial state closes that gap. Never in
+  // tests. Production's version-changed case is still set in the effect and covered by `bootCover`.
+  const [whatsNew, setWhatsNew] = useState(
+    () =>
+      import.meta.env.MODE !== "test" &&
+      (import.meta.env.DEV ||
+        (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1")),
+  );
   const [appVersion, setAppVersion] = useState<string | undefined>(undefined);
   // Until the version check resolves we don't yet know whether to show "what's new"; cover the gap so
   // the app never flashes the calendar before the intro. (`true` in tests so they render the app.)
@@ -84,10 +94,14 @@ export default function App() {
       />
     ) : null;
   // After an update + restart an existing user gets the "what's new" intro instead of the welcome-back
-  // landing; dismissing it drops them straight into the app. It always sits AFTER the opening flow — while
-  // the guided intro is up (`guide`), it's held back so it can't paint over the opening flow.
+  // landing; dismissing it drops them straight into the app.
+  // NOTE: intentionally NOT gated on `splashDone`. The splash (z-100) fades out over ~460ms BEFORE it
+  // calls onDone/sets splashDone, so gating What's New (z-60) on splashDone left it unmounted during the
+  // fade — the splash faded to reveal the calendar (z-10), then What's New popped in (the "flash"). By
+  // mounting it now, it sits opaque BEHIND the still-on-top splash, so the fade reveals it, not the
+  // calendar. `guide` still holds it back so it can't paint over the new-user opening flow.
   const whatsNewEl =
-    !guide && splashDone && whatsNew ? (
+    !guide && whatsNew ? (
       <WhatsNew version={appVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
     ) : null;
   // Cover the brief window between the splash clearing and the version check resolving, so the app
@@ -125,6 +139,33 @@ export default function App() {
       clearTimeout(t);
     };
   }, [aiBootDone, llmReachable, activeModelId]);
+
+  // Idle-unload: after `idleUnloadMinutes` of no AI use (0 = never), free the chat model's RAM/VRAM.
+  // It respawns transparently on the next AI action (store.wakeAi), so this is invisible apart from a
+  // one-time reload. We deliberately DON'T flip `llm.reachable` — a sleeping model is still "set up",
+  // and flipping it would wrongly surface the AI-setup card. Checked once a minute; `sleptRef` stops
+  // us from re-issuing the (no-op) unload every tick, and resets the moment activity is recent again.
+  const sleptRef = useRef(false);
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s = useStore.getState();
+      const mins = s.settings?.idleUnloadMinutes ?? 0;
+      if (mins <= 0) return;
+      const idle = Date.now() - s.lastAiActivity >= mins * 60_000;
+      if (!idle) {
+        sleptRef.current = false; // activity is recent again → re-arm
+        return;
+      }
+      if (s.busy || sleptRef.current) return; // never mid-request; unload at most once per idle stretch
+      api
+        .sleepInference()
+        .then((killed) => {
+          if (killed) sleptRef.current = true;
+        })
+        .catch(() => {});
+    }, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   // Show the "what's new" intro once, on the first launch after the app version changes (i.e. an
   // update was installed + the app restarted). New users (not onboarded) and unit tests are skipped;
@@ -205,6 +246,7 @@ export default function App() {
             <UpdateBanner />
             <ConflictBanner />
             <main className="flex-1 min-h-0 flex">
+              {view === "today" && <TodayPane />}
               {view === "calendar" && (
                 <>
                   <div className="flex-1 min-w-0">{calMode === "month" ? <MonthPane /> : <CalendarPane />}</div>

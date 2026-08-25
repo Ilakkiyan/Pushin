@@ -108,18 +108,18 @@ export default function MonthPane() {
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center gap-2 px-4 min-w-0 overflow-hidden">
         <ViewToggle />
         <div className="w-px h-5 bg-white/10 mx-1 shrink-0" />
-        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() - 1, 1))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() - 1, 1))} title="Previous month" className="p-1.5 hoverable shrink-0">
           <ChevronLeft className="size-4" />
         </button>
-        <button onClick={() => setAnchor(startOfMonth(new Date()))} className="text-xs px-2 py-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor(startOfMonth(new Date()))} className="text-xs px-2.5 py-1.5 hoverable border border-white/10 shrink-0">
           Today
         </button>
-        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + 1, 1))} className="p-1 rounded hover:bg-white/10 shrink-0">
+        <button onClick={() => setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + 1, 1))} title="Next month" className="p-1.5 hoverable shrink-0">
           <ChevronRight className="size-4" />
         </button>
-        <span className="text-sm text-gray-300 ml-2 whitespace-nowrap truncate">{anchor.toLocaleDateString([], { month: "long", year: "numeric" })}</span>
+        <span className="tnum text-sm text-[var(--ink-muted)] ml-2 whitespace-nowrap truncate">{anchor.toLocaleDateString([], { month: "long", year: "numeric" })}</span>
         <CalendarLabelControls />
-        <div className="hidden 2xl:flex items-center gap-3 text-[11px] text-gray-500 shrink-0 pl-3">
+        <div className="hidden 2xl:flex items-center gap-3 text-[11px] text-[var(--ink-faint)] shrink-0 pl-3">
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-indigo-400" /> task block</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-rose-400/70" /> fixed event</span>
           <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-400/70" /> habit</span>
@@ -129,7 +129,7 @@ export default function MonthPane() {
       {/* Weekday header */}
       <div className="shrink-0 grid grid-cols-7 border-b border-white/10">
         {WEEKDAYS.map((w) => (
-          <div key={w} className="py-1.5 text-center text-[11px] text-gray-500">{w}</div>
+          <div key={w} className="py-1.5 text-center text-[11px] uppercase tracking-wide text-[var(--ink-faint)]">{w}</div>
         ))}
       </div>
 
@@ -144,15 +144,16 @@ export default function MonthPane() {
               key={day.toISOString()}
               onClick={() => openWeek(day)}
               className={clsx(
-                "text-left border-b border-r border-white/5 p-1 min-h-0 overflow-hidden flex flex-col gap-0.5 transition hover:bg-white/[0.03] focus:outline-none focus:bg-white/5",
+                "text-left border-b border-r border-white/5 p-1 min-h-0 overflow-hidden flex flex-col gap-0.5 hoverable focus:outline-none focus:bg-white/5",
                 !inMonth && "bg-black/20",
               )}
             >
               <div className="flex items-center justify-between px-0.5">
+                {/* Today = inverted white square (value inversion, not colour — the theme greys all hues). */}
                 <span
                   className={clsx(
-                    "text-xs grid place-items-center size-5 rounded-full",
-                    isToday ? "bg-indigo-500 text-white font-semibold" : inMonth ? "text-gray-300" : "text-gray-600",
+                    "tnum text-xs grid place-items-center size-5",
+                    isToday ? "bg-white text-[var(--bg)] font-semibold" : inMonth ? "text-[var(--ink-muted)]" : "text-[var(--ink-faint)]",
                   )}
                 >
                   {day.getDate()}
@@ -171,7 +172,7 @@ export default function MonthPane() {
                   </div>
                 ))}
                 {items.length > MAX_CHIPS && (
-                  <span className="text-[10px] text-gray-500 px-1">+{items.length - MAX_CHIPS} more</span>
+                  <span className="tnum text-[10px] text-[var(--ink-faint)] px-1">+{items.length - MAX_CHIPS} more</span>
                 )}
               </div>
             </button>

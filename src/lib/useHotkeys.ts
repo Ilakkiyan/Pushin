@@ -6,8 +6,8 @@ type View = ReturnType<typeof useStore.getState>["view"];
 // Linear-style "g then key" navigation. Press `g`, then a letter within ~1.2s to jump to a view.
 // Keep this in sync with the help shown in the ⌘K palette (HOTKEYS below is exported for it).
 const NAV: Record<string, View> = {
+  t: "today", // the your-day landing (home)
   c: "calendar",
-  t: "calendar", // tasks live in the calendar aside
   v: "vault",
   p: "projects",
   h: "habits",
@@ -21,6 +21,7 @@ const NAV: Record<string, View> = {
 
 /** The `g`-leader navigation map as display pairs, for the palette/help. */
 export const NAV_HOTKEYS: { combo: string; label: string }[] = [
+  { combo: "g t", label: "Today" },
   { combo: "g c", label: "Calendar" },
   { combo: "g v", label: "Vault" },
   { combo: "g p", label: "Projects" },

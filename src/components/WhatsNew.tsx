@@ -1,4 +1,4 @@
-import { ArrowRight, MessagesSquare, ShieldCheck, Sparkles } from "lucide-react";
+import { ArrowRight, MessagesSquare, ShieldCheck, Sparkles, Zap } from "lucide-react";
 
 /**
  * The post-update "What's new" intro, shown once after the app updates + restarts (App.tsx detects a
@@ -22,6 +22,11 @@ const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
     icon: ShieldCheck,
     title: "Fewer surprises",
     body: "Sharper handling of times, durations, ranges, and multi-day trips — no more accidental all-day blocks or marathon appointments.",
+  },
+  {
+    icon: Zap,
+    title: "Lighter on your machine",
+    body: "The AI starts faster and the first reply is quicker. When you step away, the model quietly unloads to free up memory (several GB) and springs back the moment you plan or chat again. Tune or turn it off under Settings ▸ On-device AI.",
   },
 ];
 

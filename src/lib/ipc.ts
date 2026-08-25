@@ -1,5 +1,6 @@
 // Typed wrappers over the Rust command surface. Types mirror the serde (camelCase) structs.
 import { invoke } from "@tauri-apps/api/core";
+import { parseLocal, fmtDayLabel, fmtTime } from "./time";
 
 /** A recurring blocked time / routine the scheduler keeps free. `end <= start` runs overnight;
  *  empty `days` means every day. `kind` is a UI label only ("routine" | "blocked"). */
@@ -37,6 +38,7 @@ export interface Settings {
   // "About you" profile from setup — selected archetype keys + a free-form blurb, fed to the AI.
   archetypes: string[];
   aboutMe: string;
+  idleUnloadMinutes: number; // unload the chat model after N idle minutes (0 = keep resident)
 }
 
 /** A `.md` change the Rust watcher saw on disk (two-way vault, files→DB). Emitted as `vault-changed`. */
@@ -193,6 +195,52 @@ export type Conflict =
 export interface ScheduleResult {
   blocks: Block[];
   conflicts: Conflict[];
+}
+
+/** Why the scheduler placed a task block where it did — derived, shown as a "why here" on the block. */
+export type PlacementReason =
+  | { kind: "continuation"; part: number; of: number }
+  | { kind: "afterDependency"; depTitle: string }
+  | { kind: "notBefore"; earliestStart: string }
+  | { kind: "aroundCommitment" }
+  | { kind: "forDeadline"; deadline: string }
+  | { kind: "earliest" };
+
+export interface BlockReason {
+  blockId: number;
+  reason: PlacementReason;
+}
+
+/** A read-only iCalendar (.ics) feed subscription; its events are mirrored into the calendar. */
+export interface IcsSubscription {
+  id: number;
+  name: string;
+  url: string;
+  color: string;
+  lastSynced: string | null;
+  createdAt: string;
+}
+
+/** A short, human "why is this here" for a scheduled block. */
+export function formatPlacementReason(r: PlacementReason): string {
+  const when = (iso: string) => {
+    const d = parseLocal(iso);
+    return `${fmtDayLabel(d)} ${fmtTime(d)}`;
+  };
+  switch (r.kind) {
+    case "continuation":
+      return `Part ${r.part} of ${r.of}`;
+    case "afterDependency":
+      return `After ${r.depTitle}`;
+    case "notBefore":
+      return `Not before ${when(r.earliestStart)}`;
+    case "aroundCommitment":
+      return "Around a fixed commitment";
+    case "forDeadline":
+      return `Due ${when(r.deadline)}`;
+    case "earliest":
+      return "Earliest free slot";
+  }
 }
 
 export interface AppData {
@@ -396,6 +444,15 @@ export interface PageGraph {
 export const api = {
   loadAll: () => invoke<AppData>("load_all"),
   reschedule: () => invoke<ScheduleResult>("reschedule"),
+  // Per-block "why is this here" for the calendar. Read-only + derived; safe to call whenever the
+  // schedule is shown.
+  explainSchedule: () => invoke<BlockReason[]>("explain_schedule"),
+  // Read-only .ics calendar subscriptions.
+  listIcsSubscriptions: () => invoke<IcsSubscription[]>("list_ics_subscriptions"),
+  addIcsSubscription: (name: string, url: string, color?: string) =>
+    invoke<IcsSubscription>("add_ics_subscription", { name, url, color: color ?? null }),
+  refreshIcsSubscriptions: () => invoke<number>("refresh_ics_subscriptions"),
+  removeIcsSubscription: (id: number) => invoke<void>("remove_ics_subscription", { id }),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
   /** Mirror a page to `<vault_dir>/<relPath>` as markdown (no-op if no vault folder is set). */
   vaultWrite: (pageId: number, relPath: string, markdown: string) =>
@@ -536,6 +593,11 @@ export const api = {
   recommendModel: () => invoke<ModelRecommendation>("recommend_model"),
   downloadModel: (id: string, sha256?: string) => invoke<string>("download_model", { id, sha256: sha256 ?? null }),
   ensureInference: () => invoke<string>("ensure_inference"),
+  // Kill + respawn the local inference server on the currently-saved model (used when switching models).
+  restartInference: () => invoke<string>("restart_inference"),
+  // Idle-unload: free the chat model's RAM/VRAM. Returns true if a server was actually killed. The next
+  // ensureInference() respawns it. Resolves the "is anything running" question for the caller.
+  sleepInference: () => invoke<boolean>("sleep_inference"),
   // Hermes: auto-download the embedding model + start the embeddings server (idempotent).
   ensureEmbeddings: () => invoke<string>("ensure_embeddings"),
 

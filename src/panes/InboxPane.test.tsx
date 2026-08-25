@@ -10,6 +10,7 @@ vi.mock("../lib/ipc", () => ({
     listPages: vi.fn().mockResolvedValue([]),
     planTasks: vi.fn().mockResolvedValue({ createdTaskIds: [], createdEventIds: [], createdHabitNames: [], projectNames: [], createdEventTitles: [], updatedEventTitles: [], removedEventTitles: [], clarifications: [] }),
     loadAll: vi.fn().mockResolvedValue({ settings: {}, projects: [], tasks: [], events: [], blocks: [], eventTypes: [], bookings: [] }),
+    explainSchedule: vi.fn().mockResolvedValue([]),
     reschedule: vi.fn().mockResolvedValue({ conflicts: [] }),
   },
 }));

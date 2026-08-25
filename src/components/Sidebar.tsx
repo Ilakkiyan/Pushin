@@ -12,6 +12,10 @@ import {
   Loader2,
   PanelLeftClose,
   PanelLeftOpen,
+  Sun,
+  Library,
+  ArrowLeft,
+  ChevronRight,
 } from "lucide-react";
 import clsx from "clsx";
 import { useState } from "react";
@@ -42,22 +46,23 @@ function NavItem({
       onClick={onClick}
       title={collapsed ? label : undefined}
       className={clsx(
-        "w-full flex items-center gap-2.5 rounded-lg text-sm transition",
-        collapsed ? "justify-center px-0 py-2" : "px-3 py-1.5",
-        active ? "bg-white/10 text-white" : "text-gray-400 hover:text-white hover:bg-white/5",
+        "w-full flex items-center gap-2.5 text-sm",
+        // Roomier target — a nav row is a high-frequency destination, so it earns an easy Fitts hit.
+        collapsed ? "justify-center px-0 py-2.5" : "px-3 py-2",
+        active ? "is-selected text-white font-medium" : "hoverable text-[var(--ink-muted)] hover:text-white",
       )}
     >
       <span className="shrink-0">{icon}</span>
       {!collapsed && <span className="truncate flex-1 text-left">{label}</span>}
       {!collapsed && !!badge && (
-        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-500/30 text-indigo-200">{badge}</span>
+        <span className="tnum shrink-0 text-[10px] px-1.5 py-0.5 bg-white/10 text-[var(--ink-muted)]">{badge}</span>
       )}
     </button>
   );
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
-  return <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600">{children}</div>;
+  return <div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)]">{children}</div>;
 }
 
 /** Labels list in the sidebar — click a label to open its cross-cutting filtered view. */
@@ -75,13 +80,13 @@ function LabelsSection() {
           key={l.id}
           onClick={() => openLabel(l.id)}
           className={clsx(
-            "w-full flex items-center gap-2 rounded-md px-3 py-1 text-sm",
-            view === "label" && currentLabelId === l.id ? "bg-white/10 text-white" : "text-gray-400 hover:bg-white/5 hover:text-white",
+            "w-full flex items-center gap-2 px-3 py-1.5 text-sm",
+            view === "label" && currentLabelId === l.id ? "is-selected text-white" : "hoverable text-[var(--ink-muted)] hover:text-white",
           )}
         >
           <span className="size-2 rounded-full shrink-0" style={{ background: l.color }} />
           <span className="truncate flex-1 text-left">{l.name}</span>
-          {l.count > 0 && <span className="text-[10px] text-gray-600">{l.count}</span>}
+          {l.count > 0 && <span className="tnum text-[10px] text-[var(--ink-faint)]">{l.count}</span>}
         </button>
       ))}
     </div>
@@ -90,7 +95,9 @@ function LabelsSection() {
 
 export default function Sidebar() {
   const view = useStore((s) => s.view);
+  const space = useStore((s) => s.space);
   const setView = useStore((s) => s.setView);
+  const exitVault = useStore((s) => s.exitVault);
   const openDaily = useStore((s) => s.openDaily);
   const inboxCount = useStore((s) => s.inbox.length);
   const collapsed = useStore((s) => s.sidebarCollapsed);
@@ -126,43 +133,83 @@ export default function Sidebar() {
       <div className={clsx("h-14 shrink-0 flex items-center border-b border-white/10", collapsed ? "justify-center px-0" : "justify-between px-3")}>
         {!collapsed && (
           <div className="wordmark truncate text-sm text-gray-200" style={{ letterSpacing: "0.22em" }}>
-            Pushin
+            {space === "vault" ? "Vault" : "Pushin"}
           </div>
         )}
         <button
           onClick={() => setCollapsed(!collapsed)}
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          className="p-1.5 rounded-md text-gray-500 hover:text-white hover:bg-white/5"
+          className="p-1.5 hoverable text-[var(--ink-faint)] hover:text-white"
         >
           {collapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
         </button>
       </div>
 
-      {/* Nav */}
+      {/* Nav — two spaces, one column. The PLANNER (run-your-day) keeps the primary nav short; the VAULT
+          (second brain) is a space you step into, so notes/journal/graph/labels don't crowd the day. */}
       <nav className="flex-1 min-h-0 overflow-y-auto px-2 py-2 space-y-0.5">
-        {!collapsed && <SectionLabel>Workspace</SectionLabel>}
-        <NavItem active={view === "calendar"} collapsed={collapsed} onClick={go("calendar")} icon={<CalendarDays className="size-4" />} label="Calendar" />
-        <NavItem active={view === "projects"} collapsed={collapsed} onClick={go("projects")} icon={<FolderKanban className="size-4" />} label="Projects" />
-        <NavItem active={view === "habits"} collapsed={collapsed} onClick={go("habits")} icon={<Flame className="size-4" />} label="Habits" />
-        {/* Booking hidden from public release builds for now (still available in `npm run tauri dev`). */}
-        {import.meta.env.DEV && (
-          <NavItem active={view === "booking"} collapsed={collapsed} onClick={go("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
-        )}
-        <NavItem active={view === "people"} collapsed={collapsed} onClick={go("people")} icon={<Users className="size-4" />} label="People" />
+        {space === "planner" ? (
+          <>
+            <NavItem active={view === "today"} collapsed={collapsed} onClick={go("today")} icon={<Sun className="size-4" />} label="Today" />
+            <NavItem active={view === "calendar"} collapsed={collapsed} onClick={go("calendar")} icon={<CalendarDays className="size-4" />} label="Calendar" />
+            <NavItem active={view === "projects"} collapsed={collapsed} onClick={go("projects")} icon={<FolderKanban className="size-4" />} label="Projects" />
+            <NavItem active={view === "habits"} collapsed={collapsed} onClick={go("habits")} icon={<Flame className="size-4" />} label="Habits" />
+            {/* Booking hidden from public release builds for now (still available in `npm run tauri dev`). */}
+            {import.meta.env.DEV && (
+              <NavItem active={view === "booking"} collapsed={collapsed} onClick={go("booking")} icon={<CalendarClock className="size-4" />} label="Booking" />
+            )}
+            <NavItem active={view === "people"} collapsed={collapsed} onClick={go("people")} icon={<Users className="size-4" />} label="People" />
 
-        {!collapsed && <SectionLabel>Vault</SectionLabel>}
-        <NavItem active={view === "vault"} collapsed={collapsed} onClick={go("vault")} icon={<Notebook className="size-4" />} label="Notes" />
-        <NavItem
-          active={false}
-          collapsed={collapsed}
-          onClick={() => openDaily(toLocalDate(new Date()))}
-          icon={<CalendarHeart className="size-4" />}
-          label="Today's note"
-        />
-        <NavItem active={view === "inbox"} collapsed={collapsed} onClick={go("inbox")} icon={<Inbox className="size-4" />} label="Inbox" badge={inboxCount} />
-        <NavItem active={view === "graph"} collapsed={collapsed} onClick={go("graph")} icon={<Network className="size-4" />} label="Graph" />
-        {!collapsed && <VaultTree />}
-        {!collapsed && <LabelsSection />}
+            <div className="my-2 mx-1 border-t border-white/10" />
+            {/* Enter the vault space — the trailing chevron signals it opens a place, not a page. */}
+            <button
+              onClick={() => setView("vault")}
+              title={collapsed ? "Vault" : undefined}
+              className={clsx(
+                "w-full flex items-center gap-2.5 text-sm hoverable text-[var(--ink-muted)] hover:text-white",
+                collapsed ? "justify-center px-0 py-2.5" : "px-3 py-2",
+              )}
+            >
+              <Library className="size-4 shrink-0" />
+              {!collapsed && (
+                <>
+                  <span className="truncate flex-1 text-left">Vault</span>
+                  {inboxCount > 0 && <span className="tnum text-[10px] px-1.5 py-0.5 bg-white/10 text-[var(--ink-muted)]">{inboxCount}</span>}
+                  <ChevronRight className="size-3.5 shrink-0 text-[var(--ink-faint)]" />
+                </>
+              )}
+            </button>
+          </>
+        ) : (
+          <>
+            {/* Back to the planner (returns to whichever planner view you left). */}
+            <button
+              onClick={exitVault}
+              title={collapsed ? "Back to app" : undefined}
+              className={clsx(
+                "w-full flex items-center gap-2.5 text-sm hoverable text-[var(--ink-muted)] hover:text-white",
+                collapsed ? "justify-center px-0 py-2.5" : "px-3 py-2",
+              )}
+            >
+              <ArrowLeft className="size-4 shrink-0" />
+              {!collapsed && <span className="truncate flex-1 text-left">Back to app</span>}
+            </button>
+
+            {!collapsed && <SectionLabel>Vault</SectionLabel>}
+            <NavItem active={view === "vault"} collapsed={collapsed} onClick={go("vault")} icon={<Notebook className="size-4" />} label="Notes" />
+            <NavItem
+              active={false}
+              collapsed={collapsed}
+              onClick={() => openDaily(toLocalDate(new Date()))}
+              icon={<CalendarHeart className="size-4" />}
+              label="Today's note"
+            />
+            <NavItem active={view === "inbox"} collapsed={collapsed} onClick={go("inbox")} icon={<Inbox className="size-4" />} label="Inbox" badge={inboxCount} />
+            <NavItem active={view === "graph"} collapsed={collapsed} onClick={go("graph")} icon={<Network className="size-4" />} label="Graph" />
+            {!collapsed && <VaultTree />}
+            {!collapsed && <LabelsSection />}
+          </>
+        )}
       </nav>
 
       {/* Bottom: AI status + settings */}

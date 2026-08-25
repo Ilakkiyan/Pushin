@@ -69,9 +69,9 @@ export default function LabelPane() {
           <h1 className="text-lg font-semibold flex items-center gap-2">
             {label.icon && <span>{label.icon}</span>}
             {label.name}
-            {label.groupName && <span className="text-xs font-normal text-gray-500">· {label.groupName}</span>}
+            {label.groupName && <span className="text-xs font-normal text-[var(--ink-faint)]">· {label.groupName}</span>}
           </h1>
-          <span className="text-sm text-gray-600">{items.length} item{items.length === 1 ? "" : "s"}</span>
+          <span className="tnum text-sm text-[var(--ink-faint)]">{items.length} item{items.length === 1 ? "" : "s"}</span>
           {actionable && (
             <span className="text-[11px] flex items-center gap-1 text-indigo-300/80" title="This label biases scheduling">
               <Clock className="size-3" /> scheduling
@@ -89,7 +89,7 @@ export default function LabelPane() {
         ) : (
           <div className="space-y-1">
             {items.map((it, i) => (
-              <button key={i} onClick={it.onClick} className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 rounded-lg text-gray-300 hover:bg-white/5 hover:text-white">
+              <button key={i} onClick={it.onClick} className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 hoverable text-[var(--ink-muted)] hover:text-white">
                 <span className="shrink-0">{it.icon}</span>
                 <span className="truncate">{it.title}</span>
               </button>
@@ -113,17 +113,17 @@ function LabelEditor({ initial, onSave, onDelete }: { initial: { name: string; c
     prefMaxChunk: initial.prefMaxChunk ?? null,
     prefBatch: initial.prefBatch,
   });
-  const inp = "rounded-md bg-white/5 border border-white/10 px-2 py-1 text-sm outline-none focus:border-indigo-500/50";
+  const inp = "bg-white/5 border border-white/10 px-2 py-1 text-sm outline-none focus:border-white/30";
 
   return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3 space-y-3 text-sm">
+    <div className="border border-white/10 bg-white/[0.02] p-3 space-y-3 text-sm">
       <div className="flex items-center gap-2">
         <input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="Name" className={`${inp} flex-1`} />
         <input type="color" value={f.color} onChange={(e) => setF({ ...f, color: e.target.value })} className="size-8 rounded bg-transparent border border-white/10" />
         <input value={f.groupName ?? ""} onChange={(e) => setF({ ...f, groupName: e.target.value || null })} placeholder="Group (Context/Area/Energy)" className={`${inp} w-44`} />
       </div>
       <div className="space-y-2 border-t border-white/10 pt-2">
-        <div className="text-[11px] uppercase tracking-wider text-gray-500 flex items-center gap-1"><Clock className="size-3" /> Scheduling (optional — biases the planner)</div>
+        <div className="text-[11px] uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1"><Clock className="size-3" /> Scheduling (optional — biases the planner)</div>
         <div className="flex items-center gap-2 flex-wrap text-xs text-gray-400">
           <span>Prefer</span>
           <input type="time" value={f.prefWindowStart ?? ""} onChange={(e) => setF({ ...f, prefWindowStart: e.target.value || null })} className={inp} />
@@ -139,8 +139,8 @@ function LabelEditor({ initial, onSave, onDelete }: { initial: { name: string; c
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <button onClick={() => onSave(f)} className="text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900">Save</button>
-        <button onClick={() => { if (confirm(`Delete label "${initial.name}"?`)) onDelete(); }} className="ml-auto text-xs px-2 py-1.5 rounded-md text-gray-400 hover:text-rose-300 flex items-center gap-1">
+        <button onClick={() => onSave(f)} className="text-xs px-3 py-1.5 bg-white/90 hover:bg-white text-gray-900 font-medium">Save</button>
+        <button onClick={() => { if (confirm(`Delete label "${initial.name}"?`)) onDelete(); }} className="ml-auto text-xs px-2 py-1.5 text-[var(--ink-muted)] hover:text-rose-300 flex items-center gap-1">
           <Trash2 className="size-3.5" /> Delete
         </button>
       </div>

@@ -66,9 +66,9 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
         onDragLeave={() => setDropHover(false)}
         onDrop={onDrop}
         className={clsx(
-          "group flex items-center gap-1 rounded-md pr-1 text-sm cursor-pointer",
-          active ? "bg-white/10 text-white" : "text-gray-400 hover:bg-white/5 hover:text-white",
-          dropHover && "ring-1 ring-indigo-400/50 bg-indigo-500/10",
+          "group flex items-center gap-1 pr-1 text-sm cursor-pointer",
+          active ? "is-selected text-white" : "hoverable text-[var(--ink-muted)] hover:text-white",
+          dropHover && "ring-1 ring-white/40 bg-white/[0.08]",
         )}
         style={{ paddingLeft: depth * 12 + 4 }}
         onClick={() => openPage(page.id)}
@@ -153,7 +153,7 @@ export default function VaultTree() {
   return (
     <div className="mt-1 space-y-0.5" onDragOver={(e) => e.preventDefault()} onDrop={onRootDrop}>
       <div className="flex items-center justify-between px-3 pt-2 pb-0.5">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-600">Pages</span>
+        <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)]">Pages</span>
         <div className="flex items-center gap-0.5">
           <button
             onClick={runImport}
@@ -168,28 +168,28 @@ export default function VaultTree() {
         </div>
       </div>
       {importing && importing.total > 0 && (
-        <p className="px-3 py-0.5 text-[10px] text-indigo-300/80">Importing… {importing.done}/{importing.total}</p>
+        <p className="tnum px-3 py-0.5 text-[10px] text-[var(--ink-muted)]">Importing… {importing.done}/{importing.total}</p>
       )}
       {roots.length === 0 ? (
-        <p className="px-3 py-1 text-[11px] text-gray-600">No pages yet. Hit + to create one.</p>
+        <p className="px-3 py-1 text-[11px] text-[var(--ink-faint)]">No pages yet. Hit + to create one.</p>
       ) : (
         roots.map((p) => <TreeNode key={p.id} page={p} byParent={byParent} depth={0} />)
       )}
 
       {dailies.length > 0 && (
         <>
-          <div className="px-3 pt-3 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-600">Journal</div>
+          <div className="px-3 pt-3 pb-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)]">Journal</div>
           {dailies.map((p) => (
             <div
               key={p.id}
               onClick={() => openPage(p.id)}
               className={clsx(
-                "flex items-center gap-1.5 rounded-md px-2 py-1 text-sm cursor-pointer",
-                currentPageId === p.id ? "bg-white/10 text-white" : "text-gray-400 hover:bg-white/5 hover:text-white",
+                "flex items-center gap-1.5 px-2 py-1 text-sm cursor-pointer",
+                currentPageId === p.id ? "is-selected text-white" : "hoverable text-[var(--ink-muted)] hover:text-white",
               )}
             >
               <CalendarHeart className="size-3.5 shrink-0 text-gray-500" />
-              <span className="truncate">{parseLocal(p.dailyDate!).toLocaleDateString([], { month: "short", day: "numeric" })}</span>
+              <span className="tnum truncate">{parseLocal(p.dailyDate!).toLocaleDateString([], { month: "short", day: "numeric" })}</span>
             </div>
           ))}
         </>

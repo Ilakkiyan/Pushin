@@ -57,9 +57,9 @@ export default function GraphPane() {
       <div className="h-12 shrink-0 border-b border-white/10 flex items-center justify-between px-4">
         <h1 className="text-sm font-semibold flex items-center gap-2">
           <Network className="size-4 text-indigo-400" /> Connection graph
-          {graph && <span className="text-gray-600 font-normal">· {graph.nodes.length} pages, {graph.edges.length} links</span>}
+          {graph && <span className="tnum text-[var(--ink-faint)] font-normal">· {graph.nodes.length} pages, {graph.edges.length} links</span>}
         </h1>
-        <button onClick={load} title="Refresh" className="p-1.5 rounded-md text-gray-500 hover:text-white hover:bg-white/5">
+        <button onClick={load} title="Refresh" className="p-1.5 hoverable text-[var(--ink-muted)] hover:text-white">
           <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} />
         </button>
       </div>

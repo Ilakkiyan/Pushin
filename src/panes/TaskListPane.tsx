@@ -31,7 +31,7 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
   const elapsed = focusing ? Math.max(0, Math.floor((now - parseLocal(active!.start).getTime()) / 1000)) : 0;
 
   return (
-    <div className="group flex items-start gap-2.5 px-3 py-2 hover:bg-white/[0.03] rounded-lg">
+    <div className="group flex items-start gap-2.5 px-3 py-2.5 hoverable">
       <button
         aria-label={done ? "Mark not done" : "Mark done"}
         onClick={() => setTaskStatus(task.id, done ? "todo" : "done")}
@@ -51,7 +51,7 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
           <span className={clsx("shrink-0 rounded px-1.5 py-0.5 text-[10px]", pr.cls)}>{pr.label}</span>
         </div>
         {/* line 2: meta · labels */}
-        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-gray-500">
+        <div className="tnum mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--ink-faint)]">
           <span>{humanMinutes(task.estimatedMinutes)}</span>
           {task.deadline && <span>· due {parseLocal(task.deadline).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
@@ -62,7 +62,7 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
       {/* right rail: focus timer (always when running) + hover actions */}
       <div className="flex shrink-0 items-center gap-1.5 self-center text-gray-500">
         {focusing ? (
-          <button onClick={onStop} title="Stop focus" className="flex items-center gap-1 text-[11px] text-emerald-300 tabular-nums">
+          <button onClick={onStop} title="Stop focus" className="tnum flex items-center gap-1 text-[11px] text-emerald-300">
             <Square className="size-3 fill-current" />
             {fmtElapsed(elapsed)}
           </button>
@@ -144,8 +144,8 @@ export default function TaskListPane() {
   return (
     <div className="h-full flex flex-col">
       <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between shrink-0">
-        <span className="text-sm font-medium">Tasks <span className="text-gray-500">· {active.length}</span></span>
-        <button onClick={() => setAdding((v) => !v)} className="text-gray-400 hover:text-white">
+        <span className="text-sm font-medium">Tasks <span className="tnum text-[var(--ink-faint)]">· {active.length}</span></span>
+        <button onClick={() => setAdding((v) => !v)} title="Add a task" className="p-1 hoverable text-[var(--ink-muted)] hover:text-white">
           <Plus className="size-4" />
         </button>
       </div>
@@ -158,7 +158,7 @@ export default function TaskListPane() {
             onChange={(e) => setTitle(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && add()}
             placeholder="Task title"
-            className="w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50"
+            className="w-full bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-white/30"
           />
           <div className="flex items-center gap-2">
             <input
@@ -167,10 +167,10 @@ export default function TaskListPane() {
               min={15}
               step={15}
               onChange={(e) => setMinutes(Number(e.target.value))}
-              className="w-20 rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none"
+              className="tnum w-20 bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-white/30"
             />
-            <span className="text-xs text-gray-500">minutes</span>
-            <button onClick={add} className="ml-auto text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900">
+            <span className="text-xs text-[var(--ink-faint)]">minutes</span>
+            <button onClick={add} className="ml-auto text-xs px-3 py-1.5 bg-white/90 hover:bg-white text-gray-900 font-medium">
               Add
             </button>
           </div>
@@ -186,7 +186,7 @@ export default function TaskListPane() {
         ))}
         {done.length > 0 && (
           <div className="mt-2 pt-2 border-t border-white/5">
-            <div className="px-4 py-1 text-[11px] uppercase tracking-wide text-gray-600">Done</div>
+            <div className="px-4 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)]">Done</div>
             {done.map((t) => (
               <TaskRow key={t.id} task={t} active={focus} now={now} onStart={startFocus} onStop={stopFocus} />
             ))}

@@ -6,6 +6,7 @@ vi.mock("../lib/ipc", () => ({
   api: {
     planTasks: vi.fn().mockResolvedValue({ createdTaskIds: [1], createdEventIds: [], projectNames: [], createdEventTitles: [], updatedEventTitles: [], removedEventTitles: [], createdHabitNames: [], clarifications: [], recalledNotes: [] }),
     loadAll: vi.fn().mockResolvedValue({ settings: { googleConnected: false }, projects: [], tasks: [], events: [], blocks: [], eventTypes: [], bookings: [] }),
+    explainSchedule: vi.fn().mockResolvedValue([]),
     reschedule: vi.fn().mockResolvedValue({ conflicts: [] }),
     extractMemories: vi.fn().mockResolvedValue(["Sarah prefers afternoon meetings"]),
     hermesAddNote: vi.fn().mockResolvedValue([]),
@@ -15,6 +16,7 @@ vi.mock("../lib/ipc", () => ({
     setEntityLabels: vi.fn().mockResolvedValue(undefined),
     listLabels: vi.fn().mockResolvedValue([]),
     routeIntent: vi.fn().mockResolvedValue("plan"),
+    ensureEmbeddings: vi.fn().mockResolvedValue("Memory engine ready."),
   },
 }));
 

@@ -11,8 +11,8 @@ export default function ViewToggle() {
     <button
       onClick={() => setCalMode(mode)}
       className={clsx(
-        "flex items-center gap-1 px-2 py-1 rounded-md text-xs transition",
-        calMode === mode ? "bg-white/10 text-white" : "text-gray-400 hover:text-white",
+        "flex items-center gap-1 px-2 py-1 text-xs transition",
+        calMode === mode ? "bg-white/90 text-gray-900 font-medium" : "text-[var(--ink-muted)] hover:text-white",
       )}
     >
       {icon}
@@ -21,7 +21,7 @@ export default function ViewToggle() {
   );
 
   return (
-    <div className="flex items-center gap-0.5 rounded-lg bg-white/5 border border-white/10 p-0.5">
+    <div className="flex items-center gap-0.5 bg-white/5 border border-white/10 p-0.5">
       <Btn mode="week" icon={<CalendarDays className="size-3.5" />} label="Week" />
       <Btn mode="month" icon={<CalendarRange className="size-3.5" />} label="Month" />
     </div>

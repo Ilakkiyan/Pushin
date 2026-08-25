@@ -68,6 +68,43 @@ export function fmtDayLabel(d: Date): string {
   return d.toLocaleDateString([], { weekday: "short", day: "numeric" });
 }
 
+/** Nearest start (minutes from midnight) where a `dur`-min slot fits without overlapping any `busy`
+ *  interval, within [lo, hi]. Returns `desired` when it's already free — otherwise the closest free
+ *  time on either side. Used on drag-drop so a habit/block dropped onto an event lands next to it
+ *  instead of overlapping (and getting bounced back). */
+export function nearestFreeStart(desired: number, dur: number, busy: Array<[number, number]>, lo: number, hi: number): number {
+  const clipped = busy
+    .map(([s, e]) => [Math.max(lo, s), Math.min(hi, e)] as [number, number])
+    .filter(([s, e]) => e > s)
+    .sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of clipped) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  const gaps: Array<[number, number]> = [];
+  let cursor = lo;
+  for (const [s, e] of merged) {
+    if (s > cursor) gaps.push([cursor, s]);
+    cursor = Math.max(cursor, e);
+  }
+  if (cursor < hi) gaps.push([cursor, hi]);
+
+  let best = desired;
+  let bestDist = Infinity;
+  for (const [gs, ge] of gaps) {
+    if (ge - gs < dur) continue; // gap too small to fit
+    const cand = Math.max(gs, Math.min(desired, ge - dur)); // closest feasible start in this gap
+    const dist = Math.abs(cand - desired);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = cand;
+    }
+  }
+  return bestDist === Infinity ? desired : best;
+}
+
 const HUMAN = (m: number) => {
   if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);

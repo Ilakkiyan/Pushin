@@ -11,6 +11,7 @@ vi.mock("../lib/ipc", () => ({
     deleteTask: vi.fn().mockResolvedValue({ conflicts: [] }),
     createTask: vi.fn().mockResolvedValue({ conflicts: [] }),
     loadAll: vi.fn().mockResolvedValue({ settings: { googleConnected: false }, projects: [], tasks: [], events: [], blocks: [], eventTypes: [], bookings: [] }),
+    explainSchedule: vi.fn().mockResolvedValue([]),
     entityPages: vi.fn().mockResolvedValue([]),
     createPage: vi.fn().mockResolvedValue({ id: 7, title: "Write slides" }),
     linkPageEntity: vi.fn().mockResolvedValue(undefined),

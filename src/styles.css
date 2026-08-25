@@ -31,6 +31,14 @@
   /* The wide wordmark font — Saira variable, used at max width (wdth 125) for the Porsche-wide look. */
   --font-wordmark: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
 
+  /* Data / technical face. The theme collapses every hue to grey, so identity + hierarchy have to come
+     from VALUE, WEIGHT and TYPE rather than colour. A monospaced, tabular face for all machine-readable
+     text — times, durations, dates, counts, keyboard hints — is the one deliberate type pairing (Saira
+     display + system-ui body + this): it reads precise/mechanical/on-device, which IS the brand, and it
+     keeps numbers vertically aligned so scanning a column of times costs less. Zero-dependency system
+     stack (Cascadia/Consolas on Windows, SF Mono/Menlo on macOS). */
+  --font-mono: ui-monospace, "Cascadia Code", "Cascadia Mono", "Segoe UI Mono", "SF Mono", Menlo, Consolas, monospace;
+
   /* Brutalist — SHARP CORNERS. Zero the box-radius scale so every rounded-{sm..4xl}/rounded utility is
      square (cards, buttons, inputs, modals). `rounded-full` (pills, status dots, avatars) is a separate
      literal and stays circular on purpose. One global change, no per-component edits. */
@@ -52,6 +60,20 @@
   --raised: #282828;
   /* Premium decel curve (easeOutExpo) used for entrances + interactions. */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ONE interaction vocabulary. Every interactive surface (nav rows, list rows, menu items, palette
+     results) draws its rest/hover/selected/pressed from these, so the whole app responds the same way to
+     the same gesture — consistency is the strongest "trustworthy tool" tell (Linear/Raycast/Notion). */
+  --hover: rgba(255, 255, 255, 0.055);
+  --selected: rgba(255, 255, 255, 0.1);
+  --pressed: rgba(255, 255, 255, 0.14);
+
+  /* Readable muted ink. The old greys leaned too dark for meta text on charcoal; these clear ~4.5:1 for
+     body-muted and stay quiet for the faintest labels without disappearing (cognitive-load: don't make
+     the eye work to read the calm parts). */
+  --ink: #ececf1; /* primary text */
+  --ink-muted: #b4b4b8; /* secondary / meta */
+  --ink-faint: #86868c; /* tertiary / section labels, hints */
 }
 
 /* ===== Motion: premium + tactile, but fast (never hinders quick use) ======= */
@@ -157,14 +179,65 @@ textarea:focus-visible,
   border-width: 2px;
 }
 
-/* Thin scrollbars tuned to the slate UI */
+/* 4. ONE data face for machine-readable text — times, durations, dates, counts, keyboard hints. Tabular
+      figures keep numeric columns aligned (scan a stack of times without re-fixating); the negative track
+      tightens the monospace so it sits at the same visual weight as the body sans beside it. */
+.tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.02em;
+}
+
+/* 5. ONE interactive-surface treatment. `.hoverable` = rest→hover; add `.is-selected` for the current
+      item. Matches the brutalist charcoal (value shift, no glow) and gives every row the same feel. */
+.hoverable {
+  transition: background-color 120ms var(--ease-out);
+}
+.hoverable:hover {
+  background-color: var(--hover);
+}
+.is-selected {
+  background-color: var(--selected);
+}
+
+/* 6. Keyboard-hint chip — sharp, hairline-outlined, monospaced. Used in the palette, hotkey footer and
+      shortcut affordances so every `kbd` in the app is the same object. */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 5px;
+  color: #c2c2c6;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* On-brand text selection + readable placeholders (the default browser blue selection breaks the
+   monochrome; the old placeholder grey sat under the ~4.5:1 legibility floor). */
+::selection {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+::placeholder {
+  color: #8a8a8e;
+  opacity: 1;
+}
+
+/* Brutalist scrollbars — SQUARE thumb (the rounded 8px thumb was the one soft edge left in the chrome),
+   a touch wider so it's an easy Fitts target, with a hover state. */
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 *::-webkit-scrollbar-thumb {
   background: #3a3a3a;
-  border-radius: 8px;
+  border: 2px solid var(--bg);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #4d4d4d;
 }
 *::-webkit-scrollbar-track {
   background: transparent;

@@ -61,6 +61,11 @@ export default function ChatPane() {
   const send = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || busy || chatBusy) return;
+    // Wake a possibly idle-unloaded chat model + lazily warm the memory engine before we route/send.
+    // (The plan route also does this inside store.plan; harmless to do twice — both are fast no-ops
+    // when everything's already up.)
+    await useStore.getState().wakeAi();
+    useStore.getState().ensureMemoryEngine();
     // Conversation context (prior turns) so follow-ups like "this friday at 7pm" work.
     const history = messages.map((m) => ({ role: m.role === "ai" ? "assistant" : "user", content: m.text }));
     setInput("");
@@ -176,8 +181,8 @@ export default function ChatPane() {
               title={m === "auto" ? "Auto — pick Plan or Chat per message" : m === "plan" ? "Plan — calendar planner" : "Chat — second-brain assistant"}
               className={
                 mode === m
-                  ? "px-2.5 py-1 rounded-md bg-white/90 text-gray-900 font-medium"
-                  : "px-2.5 py-1 rounded-md text-gray-400 hover:text-gray-200"
+                  ? "px-2.5 py-1 bg-white/90 text-gray-900 font-medium"
+                  : "px-2.5 py-1 text-[var(--ink-faint)] hover:text-white"
               }
             >
               {m.charAt(0).toUpperCase() + m.slice(1)}
@@ -203,11 +208,14 @@ export default function ChatPane() {
 
         {messages.map((m, i) => (
           <div key={i} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
+            {/* Hue is gone (theme collapses accents to grey), so "who said this" reads through FORM: the
+                user speaks in a discrete bright-bordered block on the right; the assistant narrates as
+                flat flush-left text. Figure/ground does the work colour used to. */}
             <div
               className={
                 m.role === "user"
-                  ? "max-w-[85%] rounded-2xl rounded-br-sm bg-indigo-500/80 text-white px-3 py-2 text-sm whitespace-pre-wrap"
-                  : "max-w-[90%] rounded-2xl rounded-bl-sm bg-white/[0.06] text-gray-200 px-3 py-2 text-sm whitespace-pre-wrap"
+                  ? "max-w-[85%] bg-white/[0.10] border border-white/20 text-white px-3 py-2 text-sm whitespace-pre-wrap"
+                  : "max-w-[92%] text-[var(--ink)] text-sm leading-relaxed whitespace-pre-wrap"
               }
             >
               {m.text}
@@ -281,7 +289,7 @@ export default function ChatPane() {
             }}
             rows={2}
             placeholder={!llm?.reachable ? "Set up the AI above to start…" : mode === "plan" ? "Describe your projects and tasks…" : mode === "chat" ? "Ask anything, or think out loud…" : "Plan something, or just ask…"}
-            className="flex-1 resize-none rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-indigo-500/50 placeholder:text-gray-600"
+            className="flex-1 resize-none bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
           />
           <button
             type="submit"

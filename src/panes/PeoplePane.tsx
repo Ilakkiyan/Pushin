@@ -29,7 +29,7 @@ export default function PeoplePane() {
       <div className="w-72 shrink-0 border-r border-white/10 flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
           <h2 className="text-sm font-semibold">People</h2>
-          <button onClick={createNew} title="Add person" className="grid size-7 place-items-center rounded-md text-gray-400 hover:bg-white/10 hover:text-white">
+          <button onClick={createNew} title="Add person" className="grid size-7 place-items-center hoverable text-[var(--ink-muted)] hover:text-white">
             <UserPlus className="size-4" />
           </button>
         </div>
@@ -41,10 +41,10 @@ export default function PeoplePane() {
               <button
                 key={p.id}
                 onClick={() => setSelectedId(p.id)}
-                className={clsx("w-full text-left px-4 py-2.5 border-b border-white/5 hover:bg-white/5", selectedId === p.id && "bg-white/10")}
+                className={clsx("w-full text-left px-4 py-2.5 border-b border-white/5", selectedId === p.id ? "is-selected" : "hoverable")}
               >
                 <div className="truncate text-sm">{p.name || "Unnamed"}</div>
-                {p.email && <div className="truncate text-xs text-gray-500">{p.email}</div>}
+                {p.email && <div className="truncate text-xs text-[var(--ink-faint)]">{p.email}</div>}
               </button>
             ))
           )}
@@ -104,7 +104,7 @@ function PersonDetail({ person, bookings, onSaved, onDeleted }: { person: Person
           onChange={(e) => setEmail(e.target.value)}
           onBlur={save}
           placeholder="name@example.com"
-          className="w-full rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-indigo-500/50"
+          className="w-full bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
         />
       </div>
 
@@ -121,7 +121,7 @@ function PersonDetail({ person, bookings, onSaved, onDeleted }: { person: Person
           onBlur={save}
           rows={5}
           placeholder="What you want to remember about them…"
-          className="w-full rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-indigo-500/50 resize-y"
+          className="w-full bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30 resize-y"
         />
       </div>
 
@@ -132,9 +132,9 @@ function PersonDetail({ person, bookings, onSaved, onDeleted }: { person: Person
         ) : (
           <ul className="space-y-1">
             {meetings.map((m) => (
-              <li key={m.id} className="flex items-center gap-2 text-sm text-gray-300">
+              <li key={m.id} className="flex items-center gap-2 text-sm text-[var(--ink-muted)]">
                 <CalendarClock className="size-3.5 text-gray-500 shrink-0" />
-                <span>{parseLocal(m.start).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span>
+                <span className="tnum">{parseLocal(m.start).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}</span>
                 {m.status === "cancelled" && <span className="text-xs text-rose-400">cancelled</span>}
               </li>
             ))}
@@ -145,7 +145,7 @@ function PersonDetail({ person, bookings, onSaved, onDeleted }: { person: Person
       <div className="pt-2">
         <button
           onClick={() => api.deletePerson(person.id).then(onDeleted)}
-          className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-rose-500/40 text-rose-300 hover:bg-rose-500/10"
+          className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 border border-rose-500/40 text-rose-300 hover:bg-rose-500/10"
         >
           <Trash2 className="size-3.5" /> Delete person
         </button>

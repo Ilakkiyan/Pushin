@@ -47,7 +47,7 @@ export default function VaultPane() {
           </p>
           <button
             onClick={() => createPage(null)}
-            className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900"
+            className="flex items-center gap-2 text-sm px-4 py-2 bg-white/90 hover:bg-white text-gray-900 font-medium"
           >
             <Plus className="size-4" /> New page
           </button>

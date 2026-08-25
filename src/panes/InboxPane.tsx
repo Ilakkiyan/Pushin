@@ -43,25 +43,25 @@ export default function InboxPane() {
       <div className="max-w-2xl mx-auto p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-semibold flex items-center gap-2">
-            <Inbox className="size-5 text-indigo-400" /> Inbox {inbox.length > 0 && <span className="text-gray-600 font-normal">· {inbox.length}</span>}
+            <Inbox className="size-5 text-indigo-400" /> Inbox {inbox.length > 0 && <span className="tnum text-[var(--ink-faint)] font-normal">· {inbox.length}</span>}
           </h1>
-          <button onClick={() => setCaptureOpen(true)} className="text-xs px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15">
-            Capture (⌘/Ctrl+Shift+N)
+          <button onClick={() => setCaptureOpen(true)} className="text-xs px-3 py-1.5 hoverable border border-white/10">
+            Capture <kbd className="kbd ml-1">⌘⇧N</kbd>
           </button>
         </div>
 
         {inbox.length === 0 ? (
-          <p className="text-sm text-gray-500 py-10 text-center">Inbox zero. Capture a thought with ⌘/Ctrl+Shift+N — sort it here later.</p>
+          <p className="text-sm text-[var(--ink-muted)] py-10 text-center">Inbox zero. Capture a thought with ⌘/Ctrl+Shift+N — sort it here later.</p>
         ) : (
           <div className="space-y-2">
             {inbox.map((item) => (
-              <div key={item.id} className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
+              <div key={item.id} className="border border-white/10 bg-white/[0.02] p-3">
                 <div className="text-sm text-gray-200 whitespace-pre-wrap">{item.content}</div>
                 <div className="mt-2 flex items-center gap-2">
                   <button
                     onClick={() => planItem(item.id, item.content)}
                     disabled={busyId === item.id}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md bg-indigo-500/80 hover:bg-indigo-500 text-white disabled:opacity-40"
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1 bg-white/90 hover:bg-white text-gray-900 font-medium disabled:opacity-40"
                     title="Let the AI turn this into a task or event"
                   >
                     {busyId === item.id ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} Plan with AI
@@ -69,7 +69,7 @@ export default function InboxPane() {
                   <button
                     onClick={() => keepInboxNote(item.id)}
                     disabled={busyId === item.id}
-                    className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md bg-white/10 hover:bg-white/15 disabled:opacity-40"
+                    className="flex items-center gap-1.5 text-xs px-2.5 py-1 hoverable border border-white/10 disabled:opacity-40"
                     title="Keep as a vault note"
                   >
                     <FileText className="size-3.5" /> Keep as note

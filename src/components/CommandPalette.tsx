@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, Zap, ArrowLeft, Loader2 } from "lucide-react";
+import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, Zap, ArrowLeft, Loader2, Sun } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type Page, type PlanOutcome, type VaultAnswer } from "../lib/ipc";
@@ -105,6 +105,7 @@ export default function CommandPalette() {
   const q = query.trim().toLowerCase();
 
   const views: Item[] = [
+    { key: "v:today", label: "Today", icon: <Sun className="size-4" />, run: () => setView("today") },
     { key: "v:calendar", label: "Calendar", icon: <CalendarDays className="size-4" />, run: () => setView("calendar") },
     { key: "v:projects", label: "Projects", icon: <FolderKanban className="size-4" />, run: () => setView("projects") },
     { key: "v:habits", label: "Habits", icon: <Flame className="size-4" />, run: () => setView("habits") },
@@ -206,12 +207,12 @@ export default function CommandPalette() {
               }
             }}
             placeholder="Search, run a command, jump to a view, or ask…"
-            className="flex-1 bg-transparent py-3 text-sm outline-none placeholder:text-gray-600"
+            className="flex-1 bg-transparent py-3.5 text-sm outline-none"
           />
           {mode && pages.length > 0 && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-gray-400">{mode}</span>
+            <span className="text-[10px] px-1.5 py-0.5 bg-white/10 text-[var(--ink-muted)] uppercase tracking-wide">{mode}</span>
           )}
-          <kbd className="text-[10px] text-gray-600 border border-white/10 rounded px-1.5 py-0.5">esc</kbd>
+          <kbd className="kbd">esc</kbd>
         </div>
         <div className="max-h-[50vh] overflow-y-auto py-1">
           {running || planMsg ? (
@@ -242,13 +243,13 @@ export default function CommandPalette() {
                     <p className="text-sm text-gray-200 whitespace-pre-wrap leading-relaxed">{answer.answer}</p>
                     {citedPages.length > 0 && (
                       <div className="mt-3 pt-3 border-t border-white/10">
-                        <div className="text-[10px] uppercase tracking-wider text-gray-600 mb-1.5">Sources</div>
+                        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)] mb-1.5">Sources</div>
                         <div className="space-y-1">
                           {citedPages.map((p) => (
                             <button
                               key={p.id}
                               onClick={() => { openPage(p.id); close(); }}
-                              className="w-full flex items-center gap-2 text-left text-xs px-2 py-1.5 rounded text-indigo-300 hover:bg-white/5"
+                              className="w-full flex items-center gap-2 text-left text-xs px-2 py-1.5 hoverable text-[var(--ink-muted)] hover:text-white"
                             >
                               <FileText className="size-3.5 shrink-0" />
                               <span className="truncate">{p.title}</span>
@@ -270,22 +271,22 @@ export default function CommandPalette() {
                 onMouseEnter={() => setSel(i)}
                 onClick={() => activate(i)}
                 className={clsx(
-                  "w-full flex items-center gap-3 px-4 py-2 text-left text-sm",
-                  i === sel ? "bg-white/10 text-white" : "text-gray-300",
+                  "w-full flex items-center gap-3 px-4 py-2.5 text-left text-sm",
+                  i === sel ? "is-selected text-white" : "text-[var(--ink-muted)]",
                 )}
               >
                 <span className="shrink-0">{it.icon}</span>
                 <span className="truncate flex-1">{it.label}</span>
-                {it.hint && <span className="text-[10px] text-gray-600">{it.hint}</span>}
+                {it.hint && <span className="text-[10px] uppercase tracking-wide text-[var(--ink-faint)]">{it.hint}</span>}
               </button>
             ))
           )}
         </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-white/10 px-4 py-2 text-[10px] text-gray-600">
-          <span className="text-gray-500">Jump</span>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-white/10 px-4 py-2.5 text-[10px] text-[var(--ink-faint)]">
+          <span className="uppercase tracking-wide">Jump</span>
           {NAV_HOTKEYS.slice(0, 6).map((h) => (
-            <span key={h.combo} className="flex items-center gap-1">
-              <kbd className="rounded border border-white/10 px-1 py-0.5 font-mono text-gray-400">{h.combo}</kbd>
+            <span key={h.combo} className="flex items-center gap-1.5">
+              <kbd className="kbd">{h.combo}</kbd>
               {h.label}
             </span>
           ))}

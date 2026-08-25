@@ -13,6 +13,7 @@ import {
   type LabelKind,
   type LlmStatus,
   type Page,
+  type PlacementReason,
   type VaultAnswer,
   type PlanOutcome,
   type Project,
@@ -22,8 +23,13 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "people" | "booking" | "settings";
+type View = "today" | "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "people" | "booking" | "settings";
 type CalMode = "week" | "month";
+// The app is split into two spaces so the primary nav stays lean: the "planner" (run-your-day: Today,
+// Calendar, Projects, Habits, People) and the "vault" (second brain: notes, journal, inbox, graph,
+// labels). Clicking Vault swaps the sidebar into the vault space; Back returns to the last planner view.
+type Space = "planner" | "vault";
+const VAULT_VIEWS = new Set<View>(["vault", "graph", "inbox", "label"]);
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
 // conversation survives navigating away from the calendar; it lives only for the session and
@@ -34,6 +40,8 @@ interface State {
   loaded: boolean;
   busy: boolean;
   view: View;
+  space: Space; // which sidebar/nav space is active (planner vs vault)
+  prevPlannerView: View; // last planner view, so leaving the vault returns you where you were
   sidebarCollapsed: boolean;
   settings: Settings | null;
   projects: Project[];
@@ -46,6 +54,10 @@ interface State {
   llm: LlmStatus | null;
   /** Whether the on-device embedding (memory) engine is up — drives the "Memory" status badge. */
   embedReady: boolean;
+  /** Epoch ms of the last AI interaction — drives idle-unload of the chat model (App.tsx). */
+  lastAiActivity: number;
+  /** Per-block "why is this here" (block id → reason), refreshed with the schedule. */
+  blockReasons: Record<number, PlacementReason>;
 
   // Calendar view mode (week vs month), independent of which page you're on.
   calMode: CalMode;
@@ -78,6 +90,7 @@ interface State {
   setPendingChat: (t: string | null) => void;
 
   setView: (v: View) => void;
+  exitVault: () => void; // leave the vault space, back to the last planner view
   setSidebarCollapsed: (c: boolean) => void;
   setCalMode: (m: CalMode) => void;
   setChatMode: (m: "auto" | "plan" | "chat") => void;
@@ -123,6 +136,11 @@ interface State {
   openLabel: (id: number) => void;
 
   plan: (text: string, history: { role: string; content: string }[]) => Promise<PlanOutcome>;
+  /** Lazily spin up the memory (embeddings) engine on first AI use; one-shot, safe to call blindly. */
+  ensureMemoryEngine: () => void;
+  /** Mark AI activity + ensure the chat model is loaded (respawns it if idle-unloaded). Call before
+   *  any AI request so a slept model wakes transparently. Fast no-op when the server is already up. */
+  wakeAi: () => Promise<void>;
   createTask: (title: string, minutes: number, deadline: string | null, priority: number, projectId?: number | null) => Promise<void>;
   setTaskStatus: (id: number, status: string) => Promise<void>;
   deleteTask: (id: number) => Promise<void>;
@@ -157,7 +175,33 @@ export const useStore = create<State>((set, get) => {
       loaded: true,
     });
 
-  const refreshData = async () => applyData(await api.loadAll());
+  const refreshData = async () => {
+    applyData(await api.loadAll());
+    // Refresh the per-block "why here" reasons alongside the schedule (read-only + derived; never
+    // blocks the data render).
+    api
+      .explainSchedule()
+      .then((rs) => {
+        const map: Record<number, PlacementReason> = {};
+        for (const r of rs) map[r.blockId] = r.reason;
+        set({ blockReasons: map });
+      })
+      .catch(() => {});
+  };
+
+  // Bring Hermes' memory engine (the second, embeddings llama-server) online lazily — on the FIRST
+  // time the user actually uses an AI/memory surface, not eagerly at boot. A calendar-only session
+  // never pays for the second server + its reindex sweep. One-shot (the guard makes repeat calls
+  // free); best-effort in the background, so the triggering request just falls back to keyword recall
+  // until the engine warms, then subsequent recalls upgrade to semantic.
+  let memoryEngineKicked = false;
+  const ensureMemoryEngine = () => {
+    if (memoryEngineKicked || !get().llm?.reachable) return;
+    memoryEngineKicked = true;
+    api.ensureEmbeddings()
+      .then((m) => set({ embedReady: /ready/i.test(m) }))
+      .catch(() => set({ embedReady: false }));
+  };
 
   // Fire-and-forget Google sync after a local change (only when connected and idle —
   // the `syncing` guard naturally debounces bursts of edits).
@@ -185,7 +229,9 @@ export const useStore = create<State>((set, get) => {
     loaded: false,
     busy: false,
     syncing: false,
-    view: "calendar",
+    view: "today",
+    space: "planner",
+    prevPlannerView: "today",
     sidebarCollapsed: false,
     settings: null,
     projects: [],
@@ -197,6 +243,8 @@ export const useStore = create<State>((set, get) => {
     conflicts: [],
     llm: null,
     embedReady: false,
+    lastAiActivity: Date.now(),
+    blockReasons: {},
     calMode: "week",
     chatMode: "auto",
     calColorByLabel: false,
@@ -215,7 +263,15 @@ export const useStore = create<State>((set, get) => {
     setChatMessages: (m) => set((s) => ({ chatMessages: typeof m === "function" ? m(s.chatMessages) : m })),
     setPendingChat: (t) => set({ pendingChat: t }),
 
-    setView: (v) => set({ view: v }),
+    setView: (v) =>
+      set((s) => {
+        // Settings is reachable from either space and shouldn't switch it. Otherwise the target view
+        // decides the space, and we remember the planner view so Back can restore it.
+        const space: Space = v === "settings" ? s.space : VAULT_VIEWS.has(v) ? "vault" : "planner";
+        const prevPlannerView = space === "planner" && v !== "settings" ? v : s.prevPlannerView;
+        return { view: v, space, prevPlannerView };
+      }),
+    exitVault: () => set((s) => ({ view: s.prevPlannerView, space: "planner" })),
     setSidebarCollapsed: (c) => set({ sidebarCollapsed: c }),
     setCalMode: (m) => set({ calMode: m }),
     setChatMode: (m) => set({ chatMode: m }),
@@ -247,18 +303,9 @@ export const useStore = create<State>((set, get) => {
         }
         await get().refreshLlm();
       }
-      // Once the chat AI is set up, bring Hermes' memory engine online too (auto-downloads the
-      // tiny embedding model on first run + spawns its server). Best-effort and in the background —
-      // if it's not ready, recall just uses keyword search. Skipped until a chat model exists so we
-      // don't download anything before the user has opted into the AI.
-      if (get().llm?.reachable) {
-        // ensure_embeddings cheap-early-returns when the engine is already healthy, so its result
-        // doubles as a status signal for the "Memory" badge. Resolves once the engine is up (~30s
-        // on first spawn), flipping the badge to ready.
-        api.ensureEmbeddings()
-          .then((m) => set({ embedReady: /ready/i.test(m) }))
-          .catch(() => set({ embedReady: false }));
-      }
+      // Hermes' memory engine is NOT started here anymore — it spins up lazily on first AI/memory use
+      // (see `ensureMemoryEngine`), so a calendar-only session never spawns the second server or runs
+      // a reindex sweep in the background.
     },
 
     refreshLlm: async () => {
@@ -269,9 +316,23 @@ export const useStore = create<State>((set, get) => {
       }
     },
 
+    ensureMemoryEngine,
+    wakeAi: async () => {
+      set({ lastAiActivity: Date.now() });
+      // Respawn the chat model if it was idle-unloaded. ensure_inference early-returns fast when the
+      // server is already healthy, so this is a cheap health check on the common path. Errors (no model
+      // downloaded) are swallowed here — the caller's own request surfaces the real error.
+      try {
+        await api.ensureInference();
+      } catch {
+        /* no model yet, or spawn failed → the caller's request reports it */
+      }
+    },
     plan: async (text, history) => {
       set({ busy: true });
       try {
+        await get().wakeAi(); // wake a slept model before planning
+        ensureMemoryEngine(); // first AI use → warm the memory engine for auto-recall
         const outcome = await api.planTasks(text, history);
         await refreshData();
         // plan_tasks reschedules internally; pull fresh conflicts.
@@ -324,12 +385,12 @@ export const useStore = create<State>((set, get) => {
 
     // Vault pages. The tree is lightweight (no bodies); the editor fetches a full page via getPage.
     loadPages: async () => set({ pages: await api.listPages() }),
-    openPage: (id) => set({ currentPageId: id, view: "vault" }),
+    openPage: (id) => set({ currentPageId: id, view: "vault", space: "vault" }),
     // Open (creating on first access) the note for a calendar day, then refresh the tree so it
     // appears under the Journal section.
     openDaily: async (date) => {
       const page = await api.dailyNote(date);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
     },
     // Open the page a task/event is linked to, creating + linking one (titled after the entity) on
     // first use — the bridge from the calendar into the vault.
@@ -337,11 +398,11 @@ export const useStore = create<State>((set, get) => {
       const existing = await api.entityPages(kind, id);
       const page = existing[0] ?? (await api.createPage(title, null));
       if (!existing.length) await api.linkPageEntity(page.id, kind, id);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
     },
     createPage: async (parentId = null) => {
       const page = await api.createPage("Untitled", parentId ?? null);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault" });
+      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
       return page;
     },
     savePage: async (id, title, icon, content, contentJson, linkTitles) => {
@@ -354,7 +415,11 @@ export const useStore = create<State>((set, get) => {
       set((s) => ({ pages, currentPageId: s.currentPageId === id ? null : s.currentPageId }));
     },
     movePage: async (id, parentId, sortOrder) => set({ pages: await api.movePage(id, parentId, sortOrder) }),
-    askVault: (question) => api.vaultAsk(question),
+    askVault: async (question) => {
+      await get().wakeAi(); // wake a slept model before answering
+      ensureMemoryEngine(); // ask-your-vault needs semantic recall → warm the memory engine
+      return api.vaultAsk(question);
+    },
     loadInbox: async () => set({ inbox: await api.listInbox() }),
     captureNote: async (text) => {
       await api.captureNote(text);
@@ -391,7 +456,7 @@ export const useStore = create<State>((set, get) => {
         maybeSync();
       }
     },
-    openLabel: (id) => set({ currentLabelId: id, view: "label" }),
+    openLabel: (id) => set({ currentLabelId: id, view: "label", space: "vault" }),
 
     saveSettings: async (s) => {
       await api.saveSettings(s);

@@ -76,7 +76,7 @@ export default function HabitsPane() {
         </header>
 
         {/* Add habit */}
-        <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3 space-y-2.5">
+        <div className="border border-white/10 bg-white/[0.02] p-3 space-y-2.5">
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-1.5">
               {COLORS.map((c) => (
@@ -94,23 +94,23 @@ export default function HabitsPane() {
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && add()}
               placeholder="New habit, e.g. Read"
-              className="flex-1 min-w-[160px] rounded-md bg-white/5 border border-white/10 px-3 py-1.5 text-sm outline-none focus:border-indigo-500/50"
+              className="flex-1 min-w-[160px] bg-white/5 border border-white/10 px-3 py-1.5 text-sm outline-none focus:border-white/30"
             />
-            <div className="flex items-center gap-1.5 rounded-md bg-white/5 border border-white/10 px-2 py-1">
+            <div className="flex items-center gap-1.5 bg-white/5 border border-white/10 px-2 py-1">
               <input
                 type="number"
                 min={5}
                 step={5}
                 value={duration}
                 onChange={(e) => setDuration(Math.max(5, Number(e.target.value) || 0))}
-                className="w-14 bg-transparent text-sm outline-none text-right"
+                className="tnum w-14 bg-transparent text-sm outline-none text-right"
               />
-              <span className="text-xs text-gray-500">min</span>
+              <span className="text-xs text-[var(--ink-faint)]">min</span>
             </div>
             <button
               onClick={add}
               disabled={!name.trim()}
-              className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40"
+              className="flex items-center gap-1 text-sm px-3 py-1.5 bg-white/90 hover:bg-white text-gray-900 font-medium disabled:opacity-40"
             >
               <Plus className="size-4" /> Add
             </button>
@@ -118,12 +118,12 @@ export default function HabitsPane() {
 
           {/* Cadence */}
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <div className="flex rounded-md border border-white/10 overflow-hidden">
+            <div className="flex border border-white/10 overflow-hidden">
               {(["daily", "weekly", "interval"] as Cadence[]).map((c) => (
                 <button
                   key={c}
                   onClick={() => setCadence(c)}
-                  className={clsx("px-2.5 py-1 capitalize", cadence === c ? "bg-indigo-500/30 text-indigo-100" : "text-gray-400 hover:bg-white/5")}
+                  className={clsx("px-2.5 py-1 capitalize", cadence === c ? "bg-white/90 text-gray-900 font-medium" : "text-[var(--ink-muted)] hover:bg-white/5")}
                 >
                   {c === "interval" ? "Every N days" : c === "weekly" ? "Days of week" : "Daily"}
                 </button>
@@ -136,8 +136,8 @@ export default function HabitsPane() {
                     key={d.n}
                     onClick={() => toggleDay(d.n)}
                     className={clsx(
-                      "size-6 rounded text-[11px]",
-                      selDays.includes(d.n) ? "bg-indigo-500/30 text-indigo-100 border border-indigo-400/40" : "bg-white/5 text-gray-500 border border-white/10",
+                      "size-6 text-[11px] border",
+                      selDays.includes(d.n) ? "bg-white/20 text-white border-white/40" : "bg-white/5 text-[var(--ink-muted)] border-white/10 hover:bg-white/10",
                     )}
                   >
                     {d.l}
@@ -146,7 +146,7 @@ export default function HabitsPane() {
               </div>
             )}
             {cadence === "interval" && (
-              <div className="flex items-center gap-1.5 text-gray-400">
+              <div className="flex items-center gap-1.5 text-[var(--ink-muted)]">
                 every
                 <input
                   type="number"
@@ -154,7 +154,7 @@ export default function HabitsPane() {
                   max={30}
                   value={intervalDays}
                   onChange={(e) => setIntervalDays(Math.min(30, Math.max(2, Number(e.target.value) || 2)))}
-                  className="w-12 rounded-md bg-white/5 border border-white/10 px-2 py-0.5 text-right outline-none"
+                  className="tnum w-12 bg-white/5 border border-white/10 px-2 py-0.5 text-right outline-none focus:border-white/30"
                 />
                 days
               </div>
@@ -208,9 +208,9 @@ function HabitCard({ habit }: { habit: HabitStats }) {
   };
 
   return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+    <div className="border border-white/10 bg-white/[0.02] p-4">
       <div className="flex items-center gap-3">
-        {/* Today toggle */}
+        {/* Today toggle — circular ring is a deliberate, conventional habit-completion affordance. */}
         <button
           onClick={() => toggleHabit(habit.id)}
           title={habit.doneToday ? "Done today — click to undo" : "Mark done for today"}
@@ -226,9 +226,9 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         <div className="min-w-0 flex-1">
           <div className="font-medium truncate flex items-center gap-2">
             {habit.name}
-            <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-white/8 text-gray-400 border border-white/10 shrink-0">{cadenceLabel(habit)}</span>
+            <span className="text-[10px] font-normal px-1.5 py-0.5 bg-white/8 text-[var(--ink-muted)] border border-white/10 shrink-0">{cadenceLabel(habit)}</span>
           </div>
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-400 mt-0.5">
+          <div className="tnum flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-[var(--ink-muted)] mt-1">
             <span className="flex items-center gap-1" title="Current streak">
               <Flame className={clsx("size-3.5", habit.currentStreak > 0 ? "text-orange-400" : "text-gray-600")} />
               {habit.currentStreak} {habit.currentStreak === 1 ? "time" : "times"}
@@ -245,7 +245,7 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         </div>
 
         {/* Duration */}
-        <div className="flex items-center gap-1.5 rounded-md bg-white/5 border border-white/10 px-2 py-1 shrink-0" title="Time per session, used when adding to the calendar">
+        <div className="flex items-center gap-1.5 bg-white/5 border border-white/10 px-2 py-1 shrink-0" title="Time per session, used when adding to the calendar">
           <input
             type="number"
             min={5}
@@ -254,9 +254,9 @@ function HabitCard({ habit }: { habit: HabitStats }) {
             onChange={(e) => setDur(Math.max(0, Number(e.target.value) || 0))}
             onBlur={commitDuration}
             onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-            className="w-12 bg-transparent text-sm outline-none text-right"
+            className="tnum w-12 bg-transparent text-sm outline-none text-right"
           />
-          <span className="text-xs text-gray-500">min</span>
+          <span className="text-xs text-[var(--ink-faint)]">min</span>
         </div>
 
         {/* Calendar toggle — slots the habit into free space on each of its due days */}
@@ -269,8 +269,8 @@ function HabitCard({ habit }: { habit: HabitStats }) {
               : "Slot this habit into a free space on each of its scheduled days"
           }
           className={clsx(
-            "flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md border transition shrink-0 disabled:opacity-50",
-            onCalendar ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-white/10 text-gray-300 hover:bg-white/10",
+            "flex items-center gap-1 text-xs px-2.5 py-1.5 border transition shrink-0 disabled:opacity-50",
+            onCalendar ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-white/10 text-[var(--ink-muted)] hover:bg-white/10",
           )}
         >
           {onCalendar ? <Check className="size-3.5" /> : <CalendarPlus className="size-3.5" />}
@@ -282,7 +282,7 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         </button>
       </div>
 
-      <div className="mt-1 text-[11px] text-gray-600 pl-12">{humanMinutes(habit.durationMinutes)} per session · {cadenceLabel(habit).toLowerCase()}</div>
+      <div className="tnum mt-1 text-[11px] text-[var(--ink-faint)] pl-12">{humanMinutes(habit.durationMinutes)} per session · {cadenceLabel(habit).toLowerCase()}</div>
 
       <Heatmap habit={habit} />
     </div>
@@ -310,7 +310,7 @@ function Heatmap({ habit }: { habit: HabitStats }) {
             key={d.day}
             onClick={() => toggleHabit(habit.id, d.day)}
             title={`${d.day}${d.done ? " · done" : d.due ? "" : " · not scheduled"}`}
-            className="size-[10px] rounded-[2px] transition hover:ring-1 hover:ring-white/50"
+            className="size-[10px] transition hover:ring-1 hover:ring-white/50"
             style={{ background: d.done ? habit.color : d.due ? "rgba(255,255,255,0.10)" : "rgba(255,255,255,0.02)" }}
           />
         ))}

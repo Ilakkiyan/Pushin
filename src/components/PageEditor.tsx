@@ -215,7 +215,7 @@ export default function PageEditor({ page }: { page: Page }) {
 
         {linkedEntities.length > 0 && (
           <section className="mt-10 pt-6 border-t border-white/10">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-500 flex items-center gap-1.5 mb-3">
+            <h2 className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1.5 mb-3">
               <Link2 className="size-3.5" /> Linked tasks & events ({linkedEntities.length})
             </h2>
             <div className="space-y-1">
@@ -223,11 +223,11 @@ export default function PageEditor({ page }: { page: Page }) {
                 <button
                   key={`${e.kind}-${e.id}`}
                   onClick={() => setView("calendar")}
-                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 rounded-lg text-gray-300 hover:bg-white/5 hover:text-white"
+                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 hoverable text-[var(--ink-muted)] hover:text-white"
                 >
                   {e.kind === "task" ? <CheckSquare className="size-3.5 shrink-0 text-emerald-400/70" /> : <CalendarDays className="size-3.5 shrink-0 text-rose-400/70" />}
                   <span className="truncate">{e.title}</span>
-                  <span className="ml-auto text-[10px] text-gray-600">{e.kind}</span>
+                  <span className="ml-auto text-[10px] uppercase tracking-wide text-[var(--ink-faint)]">{e.kind}</span>
                 </button>
               ))}
             </div>
@@ -236,7 +236,7 @@ export default function PageEditor({ page }: { page: Page }) {
 
         {backlinks.length > 0 && (
           <section className="mt-10 pt-6 border-t border-white/10">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-500 flex items-center gap-1.5 mb-3">
+            <h2 className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1.5 mb-3">
               <Link2 className="size-3.5" /> Linked references ({backlinks.length})
             </h2>
             <div className="space-y-1">
@@ -244,7 +244,7 @@ export default function PageEditor({ page }: { page: Page }) {
                 <button
                   key={b.id}
                   onClick={() => openPage(b.id)}
-                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 rounded-lg text-gray-300 hover:bg-white/5 hover:text-white"
+                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 hoverable text-[var(--ink-muted)] hover:text-white"
                 >
                   <span className="shrink-0">{b.icon ?? <FileText className="size-3.5 inline text-gray-500" />}</span>
                   <span className="truncate">{b.title}</span>
@@ -256,16 +256,16 @@ export default function PageEditor({ page }: { page: Page }) {
 
         {mentions.length > 0 && (
           <section className="mt-8">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-600 flex items-center gap-1.5 mb-2">
+            <h2 className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1.5 mb-2">
               Unlinked mentions ({mentions.length})
             </h2>
-            <p className="text-[11px] text-gray-600 mb-2">These pages mention "{page.title}" but don't link it. Open one and type [[ to link.</p>
+            <p className="text-[11px] text-[var(--ink-faint)] mb-2">These pages mention "{page.title}" but don't link it. Open one and type [[ to link.</p>
             <div className="space-y-1">
               {mentions.map((m) => (
                 <button
                   key={m.id}
                   onClick={() => openPage(m.id)}
-                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 rounded-lg text-gray-400 hover:bg-white/5 hover:text-white"
+                  className="w-full flex items-center gap-2 text-left text-sm px-3 py-2 hoverable text-[var(--ink-muted)] hover:text-white"
                 >
                   <span className="shrink-0">{m.icon ?? <FileText className="size-3.5 inline text-gray-500" />}</span>
                   <span className="truncate">{m.title}</span>

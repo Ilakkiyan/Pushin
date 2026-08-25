@@ -84,7 +84,7 @@ export default function ProjectsPane() {
         {/* Multi-day events / trips */}
         {trips.length > 0 && (
           <section className="space-y-2">
-            <h2 className="text-xs uppercase tracking-wide text-gray-500 flex items-center gap-1.5">
+            <h2 className="text-xs uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1.5">
               <Plane className="size-3.5" /> Trips & multi-day
             </h2>
             <div className="space-y-2">
@@ -93,11 +93,11 @@ export default function ProjectsPane() {
                 const last = new Date(parseLocal(e.end).getTime() - 86_400_000); // inclusive last day
                 const days = Math.round((parseLocal(e.end).getTime() - s.getTime()) / 86_400_000);
                 return (
-                  <div key={e.id} className="rounded-xl px-4 py-3 flex items-center gap-3 transition-colors hover:bg-white/[0.025]">
+                  <div key={e.id} className="px-4 py-3 flex items-center gap-3 hoverable">
                     <span className="size-2 rounded-full bg-rose-400 shrink-0" />
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{e.title}</div>
-                      <div className="text-xs text-gray-500">
+                      <div className="tnum text-xs text-[var(--ink-faint)]">
                         {fmtDate(s)} – {fmtDate(last)} · {days} days
                       </div>
                     </div>
@@ -124,7 +124,7 @@ export default function ProjectsPane() {
               className="text-xs uppercase tracking-wide text-gray-500 hover:text-gray-300 flex items-center gap-1.5"
             >
               <CheckCircle2 className="size-3.5" /> Completed
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/10 normal-case tracking-normal">
+              <span className="tnum text-[10px] px-1.5 py-0.5 bg-white/10 normal-case tracking-normal">
                 {completedProjects.length}
               </span>
               <ChevronDown className={clsx("size-3.5 transition-transform", !showCompleted && "-rotate-90")} />
@@ -178,12 +178,12 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
   };
 
   return (
-    <section className={clsx("group rounded-xl overflow-hidden transition-colors hover:bg-white/[0.025]", archived && "opacity-60")}>
+    <section className={clsx("group overflow-hidden transition-colors hover:bg-white/[0.025]", archived && "opacity-60")}>
       <div className="px-4 pt-3 pb-2">
         <div className="flex items-center gap-2">
           <span className="size-2.5 rounded-full shrink-0" style={{ background: color }} />
           <h2 className="font-medium truncate flex-1">{project ? project.name.trim() || "Untitled project" : "No project"}</h2>
-          <span className="text-xs text-gray-500 shrink-0">
+          <span className="tnum text-xs text-[var(--ink-faint)] shrink-0">
             {done}/{total} done
           </span>
           {/* Action buttons stay hidden until the card is hovered (or a button is focused). */}
@@ -215,11 +215,11 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
             <LabelPicker kind="project" entityId={project.id} compact />
           </div>
         )}
-        {/* Progress bar */}
-        <div className="mt-2 h-1.5 rounded-full bg-white/10 overflow-hidden">
-          <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />
+        {/* Progress bar — square, brutalist (a rounded pill bar was the one soft edge in the card). */}
+        <div className="mt-2 h-1.5 bg-white/10 overflow-hidden">
+          <div className="h-full transition-all" style={{ width: `${pct}%`, background: color }} />
         </div>
-        <div className="mt-1.5 text-[11px] text-gray-500 flex items-center gap-3 flex-wrap">
+        <div className="tnum mt-1.5 text-[11px] text-[var(--ink-faint)] flex items-center gap-3 flex-wrap">
           {remainingMin > 0 && <span>{humanMinutes(remainingMin)} of work left</span>}
           {nextDue && <span>next due {fmtDate(nextDue)}</span>}
           {remainingMin === 0 && total > 0 && <span className="text-emerald-400">all done 🎉</span>}
@@ -251,9 +251,9 @@ function ProjectCard({ project, tasks, archived = false }: { project: Project | 
               if (e.key === "Escape") setAdding(false);
             }}
             placeholder="New subtask…"
-            className="flex-1 rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50"
+            className="flex-1 bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-white/30"
           />
-          <button onClick={add} disabled={!title.trim()} className="text-xs px-3 py-1.5 rounded-md bg-white/90 hover:bg-white text-gray-900 disabled:opacity-40">
+          <button onClick={add} disabled={!title.trim()} className="text-xs px-3 py-1.5 bg-white/90 hover:bg-white text-gray-900 font-medium disabled:opacity-40">
             Add
           </button>
         </div>
@@ -275,11 +275,11 @@ function SubtaskRow({ task }: { task: Task }) {
   const pr = PRIORITY[task.priority] ?? PRIORITY[2];
 
   return (
-    <div className="group flex items-center gap-2 px-4 py-2 hover:bg-white/[0.03]">
+    <div className="group flex items-center gap-2 px-4 py-2 hoverable">
       <button
         onClick={() => setTaskStatus(task.id, done ? "todo" : "done")}
         className={clsx(
-          "size-4 shrink-0 rounded border grid place-items-center",
+          "size-4 shrink-0 border grid place-items-center",
           done ? "bg-emerald-500 border-emerald-500" : "border-white/25 hover:border-white/50",
         )}
       >
@@ -288,15 +288,15 @@ function SubtaskRow({ task }: { task: Task }) {
 
       <div className="min-w-0 flex-1">
         <div className={clsx("text-sm truncate", done && "line-through text-gray-500")}>{task.title}</div>
-        <div className="flex items-center gap-2 text-[11px] text-gray-500">
+        <div className="tnum flex items-center gap-2 text-[11px] text-[var(--ink-faint)]">
           <span>{humanMinutes(task.estimatedMinutes)}</span>
-          {task.status === "scheduled" && <span className="text-indigo-300/80">· scheduled</span>}
+          {task.status === "scheduled" && <span>· scheduled</span>}
           {task.deadline && <span>· due {fmtDate(parseLocal(task.deadline))}</span>}
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
         </div>
       </div>
 
-      <span className={clsx("text-[10px] px-1.5 py-0.5 rounded shrink-0", pr.cls)}>{pr.label}</span>
+      <span className={clsx("text-[10px] px-1.5 py-0.5 shrink-0", pr.cls)}>{pr.label}</span>
       <button onClick={() => deleteTask(task.id)} className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-rose-400 shrink-0">
         <Trash2 className="size-3.5" />
       </button>
