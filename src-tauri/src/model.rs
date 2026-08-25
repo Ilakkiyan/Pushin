@@ -505,6 +505,11 @@ pub struct Settings {
     pub archetypes: Vec<String>,
     #[serde(default)]
     pub about_me: String,
+    /// Idle-unload: minutes of no AI use after which the chat model is unloaded from RAM/VRAM (it
+    /// respawns transparently on the next AI request). `0` disables it (model stays resident). Defaults
+    /// to 10 — old settings rows upgrade to the on-by-default behavior via `default_idle_unload_minutes`.
+    #[serde(default = "default_idle_unload_minutes")]
+    pub idle_unload_minutes: i64,
 }
 
 impl Settings {
@@ -549,6 +554,11 @@ fn default_embed_model() -> String {
     "bge-small-en-v1.5-q8_0".into()
 }
 
+/// Default idle-unload window (minutes). On by default; `0` in settings disables it.
+fn default_idle_unload_minutes() -> i64 {
+    10
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -560,10 +570,11 @@ impl Default for Settings {
             buffer_minutes: 0,
             default_min_chunk: 30,
             default_max_chunk: 120,
-            // Default to the 7B: the 3B misroutes edits/recurrence and relative dates too often
-            // (it's the documented reliability ceiling). The 7B is the "most reliable" model; users
-            // on light hardware can still pick the 3B/1.5B in Settings. ~4.7GB first-run download.
-            model_id: "qwen2.5-7b-instruct-q4_k_m".into(),
+            // Default to Pushin's tuned 7B — it reads plans far more reliably than the vanilla base at
+            // the same size (~93% vs base on the eval battery) and gives a richer deharnessed assistant.
+            // Users on light hardware can pick the tuned/base 3B in Settings; the first-run recommend
+            // flow (`model_manager::recommend_model`) steers by RAM. ~4.4 GB first-run download.
+            model_id: "pushin-arch7b-chat-tuned-q4_k_m".into(),
             llm_base_url: "http://127.0.0.1:8080".into(),
             google_connected: false,
             google_client_id: String::new(),
@@ -577,6 +588,7 @@ impl Default for Settings {
             vault_dir: None,
             archetypes: Vec::new(),
             about_me: String::new(),
+            idle_unload_minutes: default_idle_unload_minutes(),
         }
     }
 }

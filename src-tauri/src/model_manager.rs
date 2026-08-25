@@ -42,11 +42,11 @@ pub const MODELS: &[ModelInfo] = &[
     },
     ModelInfo {
         id: "qwen2.5-7b-instruct-q4_k_m",
-        name: "Qwen2.5 7B Instruct (recommended)",
+        name: "Qwen2.5 7B Instruct (base)",
         filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         url: "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
         size_mb: 4680,
-        note: "Recommended — the most reliable multi-step parsing; needs ~6 GB RAM and is a bit slower.",
+        note: "The vanilla base 7B. Pushin's tuned 7B reads plans more reliably at the same size — prefer that unless you have a reason not to.",
     },
     ModelInfo {
         id: "qwen2.5-14b-instruct-q4_k_m",
@@ -313,16 +313,26 @@ fn total_ram_gb() -> Option<f64> {
 }
 
 /// Recommend a model for this machine from its RAM (and whether a CUDA GPU is present) — the model
-/// must fit comfortably in RAM. Falls back to the balanced 7B when RAM can't be read.
+/// must fit comfortably in RAM. Prefers Pushin's TUNED models: they read plans far more reliably than
+/// the vanilla base at the same size, so accuracy beats raw parameter count for this task — we never
+/// recommend the base 14B over the tuned 7B (it stays selectable in the picker for power users). Falls
+/// back to the tuned 7B when RAM can't be read. Looked up by id (not index) so `MODELS` can be reordered.
 pub fn recommend_model() -> ModelRecommendation {
     let ram = total_ram_gb();
     let gpu = prefer_cuda();
-    let (model, why): (&ModelInfo, String) = match ram {
-        Some(g) if g >= 15.0 => (&MODELS[2], format!("{g:.0} GB RAM comfortably fits the 14B")),
-        Some(g) if g >= 8.0 => (&MODELS[1], format!("{g:.0} GB RAM is a good match for the 7B")),
-        Some(g) => (&MODELS[0], format!("{g:.0} GB RAM — the light 3B is the safe pick")),
-        None => (&MODELS[1], "a balanced default".to_string()),
+    let (id, why): (&str, String) = match ram {
+        Some(g) if g >= 8.0 => (
+            "pushin-arch7b-chat-tuned-q4_k_m",
+            format!("{g:.0} GB RAM comfortably runs Pushin's tuned 7B — the most reliable"),
+        ),
+        Some(g) => (
+            "pushin-arch3b-tuned-q4_k_m",
+            format!("{g:.0} GB RAM — Pushin's tuned 3B is the light, reliable pick"),
+        ),
+        None => ("pushin-arch7b-chat-tuned-q4_k_m", "Pushin's tuned 7B — the most reliable default".to_string()),
     };
+    // Fall back to the base 7B only if the tuned id somehow isn't in the catalog (it always is).
+    let model = model_info(id).unwrap_or(&MODELS[1]);
     let reason = if gpu { format!("{why}, plus a GPU for acceleration") } else { why };
     ModelRecommendation { model_id: model.id.to_string(), reason, ram_gb: ram, has_gpu: gpu }
 }

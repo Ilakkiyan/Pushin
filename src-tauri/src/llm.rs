@@ -1,8 +1,24 @@
 //! Client for the local, OpenAI-compatible inference server (llama.cpp `llama-server`).
-//! Everything here stays on `127.0.0.1` — no data leaves the device.
+//! Everything here stays on `127.0.0.1` — no data leaves the device, EXCEPT the mobile→desktop
+//! bridge: a device with no local model (a phone) can register a `PeerChat` fallback that routes a
+//! completion to a paired desktop over the encrypted Iroh mesh (see `sync::infer`). Desktops keep a
+//! reachable local server, so they never hit the fallback.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
+
+/// A registered "borrow a peer's model" callback: `(messages, schema) -> completion JSON`. Set by the
+/// sync engine at startup; used only when the local server is unreachable.
+pub type PeerChat = Box<dyn Fn(Value, Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> + Send + Sync>;
+static PEER_CHAT: Mutex<Option<PeerChat>> = Mutex::new(None);
+
+/// Register (or replace) the peer-inference fallback. The engine calls this on start/restart.
+pub fn register_peer_chat(f: PeerChat) {
+    *PEER_CHAT.lock().unwrap() = Some(f);
+}
 
 /// Is a local inference server reachable at `base_url`?
 pub async fn health(client: &reqwest::Client, base_url: &str) -> bool {
@@ -17,6 +33,24 @@ pub async fn health(client: &reqwest::Client, base_url: &str) -> bool {
     false
 }
 
+/// Fire a tiny, best-effort completion to warm a freshly-spawned server: this allocates the KV cache
+/// and pays the one-time CUDA PTX-JIT now, so the user's FIRST real prompt doesn't eat cold-start cost.
+/// Errors are ignored — a cold model still works, it's just slow on the first request. Intended to be
+/// run detached (off the "AI ready" critical path) right after `health` first returns true.
+pub async fn warmup(client: &reqwest::Client, base_url: &str, model: &str) {
+    let base = base_url.trim_end_matches('/');
+    let body = json!({
+        "model": model,
+        "max_tokens": 1,
+        "temperature": 0.0,
+        // Don't retain this throwaway prompt in the server's prompt cache — it must not shadow the
+        // real system prompt that follows.
+        "cache_prompt": false,
+        "messages": [{ "role": "user", "content": "hi" }],
+    });
+    let _ = client.post(format!("{base}/v1/chat/completions")).json(&body).send().await;
+}
+
 /// Run a chat completion constrained to `schema` and return the parsed JSON object.
 /// `schema` is a JSON Schema describing the expected response shape.
 pub async fn chat_json(
@@ -26,6 +60,18 @@ pub async fn chat_json(
     messages: Value,
     schema: Value,
 ) -> Result<Value> {
+    // Mobile bridge: if there's no local server, borrow a paired desktop's model over the mesh. Desktops
+    // have a reachable local server so they skip this and run locally (PC-side inference is mobile-only).
+    if !health(client, base_url).await {
+        let fut = {
+            let guard = PEER_CHAT.lock().unwrap();
+            guard.as_ref().map(|f| f(messages.clone(), schema.clone()))
+        };
+        if let Some(fut) = fut {
+            return fut.await;
+        }
+    }
+
     let base = base_url.trim_end_matches('/');
     let mut body = json!({
         "model": model,
