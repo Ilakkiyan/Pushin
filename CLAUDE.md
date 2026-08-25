@@ -91,7 +91,11 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 ## Build / run / test
 - Environment specifics (WSL uses the Windows `cargo.exe`; no live llama-server there): memory `build-test-env`.
 - **Backend:** `cargo build`/`cargo test --lib` (~188 tests) with `--manifest-path src-tauri/Cargo.toml`. The Bash cwd resets to project root between calls — use absolute paths or `--manifest-path`.
-- **Frontend:** `npm run build` (`tsc && vite build`); tests `npm test` (Vitest), `npm run test:e2e` (Playwright, CI-only).
+- **Frontend:** `npm run build` (`tsc && vite build`); tests `npm test` (Vitest), `npm run test:e2e` (Playwright).
+  "CI-only" means CI *runs* it, NOT that you may skip it: **run it locally before tagging a release, and
+  after ANY change to nav structure, pane copy, or `_mockBridge.ts`.** It is the only suite that renders the
+  real app, so it catches what the others can't — v0.8.0 shipped with it red (nav walk + a `getByText`
+  strict-mode break), and it was the suite that caught PeoplePane unmounting the whole app on a null payload.
 - **Run (dev):** `npm run tauri dev` (watches Rust + Vite HMR). App icons: `npm run tauri icon <1024.png>`.
 - **Test the model directly** without the GUI: a `llama-server` runs on `:8080` when the app is up — POST to `/v1/chat/completions` with the `json_schema` body. This is how parser changes are verified — **do it, don't just compile.**
 - **`[profile.release]`** is tuned for install size (`strip` + `lto` + `codegen-units=1` + `opt-level="s"`) → slower *release* builds only; dev/debug unaffected. `panic` is intentionally unwind (booking server is thread-per-connection).
