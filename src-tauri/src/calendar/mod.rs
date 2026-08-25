@@ -2,3 +2,4 @@
 //! Pushin's source of truth, so there's no local-provider indirection.
 
 pub mod google;
+pub mod ics;

@@ -65,6 +65,19 @@ pub struct Block {
     pub sync_state: Option<String>,
 }
 
+/// A read-only iCalendar (`.ics`) feed subscription. Its events are mirrored into `events`
+/// (provider='ics') so the scheduler plans around them; never edited or pushed back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IcsSubscription {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub color: String,
+    pub last_synced: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventType {

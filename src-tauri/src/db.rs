@@ -24,6 +24,7 @@ const MIGRATION_0014: &str = include_str!("../migrations/0014_focus_sessions.sql
 const MIGRATION_0016: &str = include_str!("../migrations/0016_vault_files.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_habit_preferred_time.sql");
 const MIGRATION_0018: &str = include_str!("../migrations/0018_note_origin.sql");
+const MIGRATION_0019: &str = include_str!("../migrations/0019_ics_subscriptions.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -113,6 +114,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         // notes.origin — separates AI memory facts from user vault pages.
         conn.execute_batch(MIGRATION_0018)?;
         conn.pragma_update(None, "user_version", 18)?;
+    }
+    if version < 19 {
+        // Read-only .ics calendar subscriptions + events.ics_sub_id.
+        conn.execute_batch(MIGRATION_0019)?;
+        conn.pragma_update(None, "user_version", 19)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -554,6 +560,59 @@ pub fn find_event_by_external(conn: &Connection, external_id: &str) -> Result<Op
         .query_row("SELECT * FROM events WHERE external_id = ?1 LIMIT 1", params![external_id], row_to_event)
         .ok();
     Ok(row)
+}
+
+// ---------- iCalendar (.ics) subscriptions (read-only feeds) ----------
+
+pub fn insert_ics_subscription(conn: &Connection, name: &str, url: &str, color: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO ics_subscriptions(name, url, color, created_at) VALUES(?1, ?2, ?3, ?4)",
+        params![name, url, color, now_iso()],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_ics_subscriptions(conn: &Connection) -> Result<Vec<IcsSubscription>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, url, color, last_synced, created_at FROM ics_subscriptions ORDER BY created_at",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(IcsSubscription {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                url: r.get(2)?,
+                color: r.get(3)?,
+                last_synced: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Remove a subscription and the events it mirrored.
+pub fn delete_ics_subscription(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM events WHERE ics_sub_id = ?1", params![id])?;
+    conn.execute("DELETE FROM ics_subscriptions WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Replace a subscription's mirrored events with the freshly-fetched set (read-only feeds are a full
+/// mirror — simplest correct refresh). Stamps `last_synced`.
+pub fn replace_ics_events(conn: &mut Connection, sub_id: i64, events: &[crate::calendar::ics::IcsEvent]) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM events WHERE ics_sub_id = ?1", params![sub_id])?;
+    for e in events {
+        tx.execute(
+            "INSERT INTO events(title, start, end, kind, source, created_at, provider, external_id, ics_sub_id)
+             VALUES(?1, ?2, ?3, 'fixed', 'ics', ?4, 'ics', ?5, ?6)",
+            params![e.title, e.start, e.end, now_iso(), e.uid, sub_id],
+        )?;
+    }
+    tx.execute("UPDATE ics_subscriptions SET last_synced = ?2 WHERE id = ?1", params![sub_id, now_iso()])?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Insert an event pulled from Google.
