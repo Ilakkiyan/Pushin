@@ -21,6 +21,7 @@ export async function installMockBridge(page: Page) {
       nextId: 1,
       pages: [] as any[],
       inbox: [] as any[],
+      people: [] as any[],
       icsSubs: [
         { id: 501, name: "Team calendar", url: "https://example.com/team.ics", color: "#38bdf8", lastSynced: "2026-07-15T09:00:00", createdAt: "" },
         { id: 502, name: "US Holidays", url: "https://example.com/holidays.ics", color: "#f59e0b", lastSynced: "2026-07-15T09:00:00", createdAt: "" },
@@ -115,6 +116,21 @@ export async function installMockBridge(page: Page) {
       refresh_ics_subscriptions: () => state.icsSubs.length * 3,
       remove_ics_subscription: ({ id }: any) => {
         state.icsSubs = state.icsSubs.filter((s: any) => s.id !== id);
+        return null;
+      },
+      // ---- people (private CRM) ----
+      // NOTE: these must exist. The unknown-command fallback resolves to `null`, and PeoplePane does
+      // `api.listPeople().then(setPeople)` — a null payload resolves successfully, so its .catch never
+      // fires and `people.find(...)` throws, unmounting the WHOLE app (there is no error boundary).
+      list_people: () => state.people,
+      create_person: ({ name, email, notes }: any) => {
+        const person = { id: state.nextId++, name: name || "New person", email: email ?? null, notes: notes ?? "", createdAt: "" };
+        state.people.push(person);
+        return person;
+      },
+      update_person: () => null,
+      delete_person: ({ id }: any) => {
+        state.people = state.people.filter((p: any) => p.id !== id);
         return null;
       },
       list_habits: () => [],

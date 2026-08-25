@@ -13,7 +13,14 @@ export default function PeoplePane() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const bookings = useStore((s) => s.bookings);
 
-  const load = () => api.listPeople().then(setPeople).catch(() => setPeople([]));
+  // Guard the payload shape, not just the rejection: a command that resolves to null/undefined (an
+  // older backend, a stubbed bridge) would otherwise sail past .catch and make `people.find` throw —
+  // and an uncaught render error unmounts the entire app, not just this pane.
+  const load = () =>
+    api
+      .listPeople()
+      .then((rows) => setPeople(Array.isArray(rows) ? rows : []))
+      .catch(() => setPeople([]));
   useEffect(() => { load(); }, []);
 
   const selected = people.find((p) => p.id === selectedId) ?? null;
