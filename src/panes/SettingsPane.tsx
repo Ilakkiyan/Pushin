@@ -1,17 +1,27 @@
 import { useEffect, useState } from "react";
-import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, FolderOpen, Github, Loader2, Moon, RefreshCw, UserRound } from "lucide-react";
+import { BookOpen, Calendar, Check, Cpu, DownloadCloud, ExternalLink, FolderOpen, Github, Loader2, Moon, RefreshCw, Sparkles, UserRound } from "lucide-react";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import type { Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import { useStore } from "../state/store";
-import { api, type Settings } from "../lib/ipc";
+import { api, type IcsSubscription, type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
 import { exportAllPages } from "../lib/vaultExport";
 import { AboutYou, CommitmentList, SleepFields } from "../components/Personalization";
 import AiMemory from "../components/AiMemory";
 import DevicesSync from "../components/DevicesSync";
+
+// Base (vanilla Qwen) model → Pushin's tuned equivalent. Drives the one-time "a more reliable model is
+// available" nudge for users still on a base model. 14B has no tuned build, so it maps to the tuned 7B
+// (accuracy beats raw size for this task — same reasoning as model_manager::recommend_model).
+const TUNED_FOR_BASE: Record<string, string> = {
+  "qwen2.5-3b-instruct-q4_k_m": "pushin-arch3b-tuned-q4_k_m",
+  "qwen2.5-7b-instruct-q4_k_m": "pushin-arch7b-chat-tuned-q4_k_m",
+  "qwen2.5-14b-instruct-q4_k_m": "pushin-arch7b-chat-tuned-q4_k_m",
+};
 
 const REPO_URL = "https://github.com/Ilakkiyan/Pushin";
 const DOCS = {
@@ -62,7 +72,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-const inputCls = "w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50";
+const inputCls = "w-full bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-white/30";
 
 export default function SettingsPane() {
   const settings = useStore((s) => s.settings)!;
@@ -75,6 +85,20 @@ export default function SettingsPane() {
   const pages = useStore((s) => s.pages);
   const [form, setForm] = useState<Settings>(settings);
   const [saved, setSaved] = useState(false);
+  const [modelMsg, setModelMsg] = useState("");
+  // Which chat models are downloaded, so switching to an un-downloaded one fetches it first (a switch to a
+  // missing model would otherwise just fail — the server can only load a GGUF that's on disk).
+  const [present, setPresent] = useState<Record<string, boolean>>({});
+  const [switchingModel, setSwitchingModel] = useState(false);
+  const [dlPct, setDlPct] = useState<number | null>(null);
+  const [tunedNudgeDismissed, setTunedNudgeDismissed] = useState(
+    () => typeof localStorage !== "undefined" && localStorage.getItem("pushin:tunedNudgeDismissed") === "1",
+  );
+  const [icsSubs, setIcsSubs] = useState<IcsSubscription[]>([]);
+  const [icsName, setIcsName] = useState("");
+  const [icsUrl, setIcsUrl] = useState("");
+  const [icsBusy, setIcsBusy] = useState(false);
+  const [icsMsg, setIcsMsg] = useState("");
   const [googleMsg, setGoogleMsg] = useState("");
   const [googleBusy, setGoogleBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
@@ -111,7 +135,36 @@ export default function SettingsPane() {
   const [installPct, setInstallPct] = useState<number | null>(null);
 
   useEffect(() => {
+    api.listIcsSubscriptions().then(setIcsSubs).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
+  // Track which chat models are on disk (drives the "not downloaded" hint + download-on-switch).
+  const models = llm?.models ?? [];
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const map: Record<string, boolean> = {};
+      for (const m of models) map[m.id] = await api.modelPresent(m.id);
+      if (!cancelled) setPresent(map);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [llm?.models?.length]);
+
+  // Live download progress while switching to a not-yet-downloaded model.
+  useEffect(() => {
+    const un = listen<{ downloaded: number; total: number }>("model-download-progress", (e) => {
+      const { downloaded, total } = e.payload;
+      setDlPct(total ? Math.round((downloaded / total) * 100) : 0);
+    });
+    return () => {
+      un.then((f) => f());
+    };
   }, []);
 
   const checkUpdates = async () => {
@@ -153,9 +206,101 @@ export default function SettingsPane() {
   const toggleDay = (n: number) =>
     update({ workDays: form.workDays.includes(n) ? form.workDays.filter((d) => d !== n) : [...form.workDays, n].sort() });
 
-  const save = async () => {
-    await saveSettings(form);
+  // Persist `next`, then — if the model changed — download it if missing and restart the server on it.
+  // Persisting settings only writes model_id to the DB; the running llama-server keeps serving the OLD
+  // model until restarted. Shared by the Save button and the "switch to the tuned model" nudge.
+  const persistAndMaybeSwitch = async (next: Settings) => {
+    const modelChanged = next.modelId !== settings.modelId;
+    await saveSettings(next);
     setSaved(true);
+    if (modelChanged) {
+      setSwitchingModel(true);
+      try {
+        const modelName = models.find((m) => m.id === next.modelId)?.name ?? next.modelId;
+        if (!present[next.modelId]) {
+          setDlPct(0);
+          setModelMsg(`Downloading ${modelName}…`);
+          await api.downloadModel(next.modelId);
+          setPresent((p) => ({ ...p, [next.modelId]: true }));
+          setDlPct(null);
+        }
+        setModelMsg(`Switching to ${modelName}…`);
+        await api.restartInference();
+        setModelMsg(`Now running ${modelName}.`);
+      } catch (e) {
+        setModelMsg(`Couldn't switch model: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setDlPct(null);
+        setSwitchingModel(false);
+        useStore.getState().refreshLlm();
+      }
+    }
+  };
+
+  const save = () => persistAndMaybeSwitch(form);
+
+  // One-time nudge for users still on a vanilla base model → offer the tuned equivalent (keyed off the
+  // SAVED model, not the unsaved form). Dismissal is remembered so it never nags.
+  const suggestTunedId = TUNED_FOR_BASE[settings.modelId];
+  const tunedName = models.find((m) => m.id === suggestTunedId)?.name ?? "Pushin's tuned model";
+  const showTunedNudge = !!suggestTunedId && !tunedNudgeDismissed && !switchingModel;
+  const switchToTuned = async () => {
+    if (!suggestTunedId) return;
+    const next = { ...form, modelId: suggestTunedId };
+    setForm(next);
+    await persistAndMaybeSwitch(next);
+  };
+  const dismissTunedNudge = () => {
+    try {
+      localStorage.setItem("pushin:tunedNudgeDismissed", "1");
+    } catch {
+      /* private mode / no storage — just hide it for this session */
+    }
+    setTunedNudgeDismissed(true);
+  };
+
+  // Read-only .ics calendar subscriptions. After add/refresh/remove the backend reschedules around the
+  // new fixed events, so reload app data to repaint the calendar.
+  const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+  const addIcs = async () => {
+    if (!icsUrl.trim()) return;
+    setIcsBusy(true);
+    setIcsMsg("Fetching calendar…");
+    try {
+      const sub = await api.addIcsSubscription(icsName, icsUrl);
+      setIcsSubs((s) => [...s, sub]);
+      setIcsName("");
+      setIcsUrl("");
+      setIcsMsg("Added.");
+      await useStore.getState().load();
+    } catch (e) {
+      setIcsMsg(errMsg(e));
+    } finally {
+      setIcsBusy(false);
+    }
+  };
+  const refreshIcs = async () => {
+    setIcsBusy(true);
+    setIcsMsg("Refreshing…");
+    try {
+      const n = await api.refreshIcsSubscriptions();
+      setIcsSubs(await api.listIcsSubscriptions());
+      setIcsMsg(`Refreshed — ${n} event${n === 1 ? "" : "s"}.`);
+      await useStore.getState().load();
+    } catch (e) {
+      setIcsMsg(errMsg(e));
+    } finally {
+      setIcsBusy(false);
+    }
+  };
+  const removeIcs = async (id: number) => {
+    try {
+      await api.removeIcsSubscription(id);
+      setIcsSubs((s) => s.filter((x) => x.id !== id));
+      await useStore.getState().load();
+    } catch {
+      /* ignore */
+    }
   };
 
   const doConnect = async () => {
@@ -216,8 +361,8 @@ export default function SettingsPane() {
                   key={d.n}
                   onClick={() => toggleDay(d.n)}
                   className={clsx(
-                    "size-9 rounded-md text-xs",
-                    form.workDays.includes(d.n) ? "bg-indigo-500/30 text-indigo-100 border border-indigo-400/40" : "bg-white/5 text-gray-500 border border-white/10",
+                    "size-9 text-xs border",
+                    form.workDays.includes(d.n) ? "bg-white/20 text-white border-white/40" : "bg-white/5 text-[var(--ink-muted)] border-white/10 hover:bg-white/10",
                   )}
                 >
                   {d.l}
@@ -248,6 +393,29 @@ export default function SettingsPane() {
         {/* AI model */}
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Cpu className="size-4 text-fuchsia-400" /> On-device AI</h2>
+          {showTunedNudge && (
+            <div className="flex items-start gap-3 rounded-lg border border-fuchsia-400/30 bg-fuchsia-400/[0.06] p-3">
+              <Sparkles className="mt-0.5 size-4 shrink-0 text-fuchsia-300" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs text-gray-200">
+                  A more reliable on-device model is available. <span className="text-gray-100">{tunedName}</span> reads
+                  your plans more accurately at the same size — it's Pushin's own fine-tune.
+                </p>
+                <div className="mt-2 flex items-center gap-3">
+                  <button
+                    onClick={switchToTuned}
+                    disabled={switchingModel}
+                    className="rounded-md bg-white/90 px-2.5 py-1 text-[11px] font-medium text-gray-900 transition hover:bg-white disabled:opacity-50"
+                  >
+                    Switch to {tunedName}
+                  </button>
+                  <button onClick={dismissTunedNudge} className="text-[11px] text-gray-400 transition hover:text-gray-200">
+                    Not now
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
           <Field label="Model">
             <select value={form.modelId} onChange={(e) => update({ modelId: e.target.value })} className={inputCls}>
               {(llm?.models ?? [{ id: form.modelId, name: form.modelId }]).map((m) => (
@@ -255,6 +423,25 @@ export default function SettingsPane() {
               ))}
             </select>
           </Field>
+          {form.modelId !== settings.modelId && !switchingModel && (
+            <p className="text-[11px] text-amber-400">
+              {present[form.modelId] === false
+                ? `Not downloaded yet — Save will download it (~${Math.round((models.find((m) => m.id === form.modelId)?.sizeMb ?? 0) / 10) / 100} GB), then restart the AI on it.`
+                : "Save to load this model — the AI restarts on the new model."}
+            </p>
+          )}
+          {dlPct !== null && (
+            <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+              <div className="h-full bg-indigo-400 transition-all" style={{ width: `${dlPct}%` }} />
+            </div>
+          )}
+          {modelMsg && (
+            <p className="text-[11px] text-gray-400 flex items-center gap-1.5">
+              {switchingModel && <Loader2 className="size-3 animate-spin" />}
+              {modelMsg}
+              {dlPct !== null && ` ${dlPct}%`}
+            </p>
+          )}
           <Field label="Local inference server URL">
             <input value={form.llmBaseUrl} onChange={(e) => update({ llmBaseUrl: e.target.value })} placeholder="http://127.0.0.1:8080" className={inputCls} />
           </Field>
@@ -269,6 +456,59 @@ export default function SettingsPane() {
             Powers semantic memory recall in <span className="text-gray-300">Hermes</span>. Pushin downloads a small embedding model
             (~37 MB) and runs it on-device automatically — no setup. Leave blank to use keyword-only recall.
           </p>
+          <Field label="Unload the model when idle">
+            <select
+              value={String(form.idleUnloadMinutes)}
+              onChange={(e) => update({ idleUnloadMinutes: Number(e.target.value) })}
+              className={inputCls}
+            >
+              <option value="0" className="bg-[var(--raised)]">Never — keep it loaded</option>
+              <option value="5" className="bg-[var(--raised)]">After 5 minutes idle</option>
+              <option value="10" className="bg-[var(--raised)]">After 10 minutes idle</option>
+              <option value="30" className="bg-[var(--raised)]">After 30 minutes idle</option>
+            </select>
+          </Field>
+          <p className="text-[11px] text-gray-500">
+            Frees the model's memory (several GB) after you stop using AI for a while; it reloads
+            automatically the next time you plan or chat. Turn off for instant responses at all times.
+          </p>
+        </section>
+
+        {/* Subscribed calendars (read-only .ics feeds) */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold flex items-center gap-2"><Calendar className="size-4 text-sky-400" /> Subscribed calendars</h2>
+          <p className="text-[11px] text-gray-500">
+            Add a read-only iCalendar (<code>.ics</code>) feed by URL — a shared calendar, a team
+            schedule, holidays. Its events appear on your calendar and the scheduler plans around them.
+            Recurring events currently show their next occurrence.
+          </p>
+          {icsSubs.length > 0 && (
+            <div className="space-y-1.5">
+              {icsSubs.map((s) => (
+                <div key={s.id} className="flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1.5">
+                  <span className="size-2 shrink-0 rounded-full" style={{ background: s.color }} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs text-gray-200">{s.name}</div>
+                    <div className="truncate text-[10px] text-gray-500">{s.url}</div>
+                  </div>
+                  <button onClick={() => removeIcs(s.id)} className="shrink-0 text-[11px] text-gray-400 transition hover:text-red-300">Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input value={icsName} onChange={(e) => setIcsName(e.target.value)} placeholder="Name (optional)" className={clsx(inputCls, "sm:w-40")} />
+            <input value={icsUrl} onChange={(e) => setIcsUrl(e.target.value)} placeholder="https://…/calendar.ics" className={inputCls} />
+            <button onClick={addIcs} disabled={icsBusy || !icsUrl.trim()} className="shrink-0 rounded-md bg-white/90 px-3 py-1.5 text-sm font-medium text-gray-900 transition hover:bg-white disabled:opacity-50">
+              Add
+            </button>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={refreshIcs} disabled={icsBusy || icsSubs.length === 0} className="text-[11px] text-indigo-300 transition hover:text-indigo-200 disabled:opacity-40">
+              Refresh all
+            </button>
+            {icsMsg && <span className="text-[11px] text-gray-500">{icsMsg}</span>}
+          </div>
         </section>
 
         {/* Two-way markdown vault */}
@@ -337,7 +577,7 @@ export default function SettingsPane() {
 
           {form.googleConnected && (
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs px-2 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">● Connected</span>
+              <span className="text-xs px-2 py-1 bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">● Connected</span>
               <button onClick={syncNow} disabled={syncing} className="text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15 disabled:opacity-50">
                 {syncing ? "Syncing…" : "Sync now"}
               </button>
@@ -379,7 +619,7 @@ export default function SettingsPane() {
             data — tasks, notes, people, and settings live outside the app and aren't touched.
           </p>
           <div className="flex items-center gap-2 flex-wrap">
-            {appVersion && <span className="text-xs px-2 py-1 rounded-full bg-white/5 border border-white/10 text-gray-300">v{appVersion}</span>}
+            {appVersion && <span className="tnum text-xs px-2 py-1 bg-white/5 border border-white/10 text-gray-300">v{appVersion}</span>}
             {pendingUpdate ? (
               <button
                 onClick={installUpdates}
@@ -404,9 +644,9 @@ export default function SettingsPane() {
         </section>
 
         <div className="flex items-center gap-3 pt-2">
-          <button onClick={save} className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900">
-            {saved ? <Check className="size-4" /> : null}
-            {saved ? "Saved" : "Save settings"}
+          <button onClick={save} disabled={switchingModel} className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-white/90 hover:bg-white text-gray-900 disabled:opacity-50">
+            {switchingModel ? <Loader2 className="size-4 animate-spin" /> : saved ? <Check className="size-4" /> : null}
+            {switchingModel ? "Switching model…" : saved ? "Saved" : "Save settings"}
           </button>
           <span className="text-xs text-gray-500">Saving re-plans your calendar.</span>
         </div>
