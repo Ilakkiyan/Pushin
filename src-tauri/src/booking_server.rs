@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(q.get("name").map(String::as_str), Some("Intro Call"));
     }
 
-    // ---- Security tests (see SECURITY_TEST_PLAN.md) ----
+    // ---- Security tests (see docs/notes/SECURITY_TEST_PLAN.md) ----
 
     fn et_with(conn: &Connection, dur: i64) -> crate::model::EventType {
         let id = db::insert_event_type(conn, "Intro call", dur, 0, "#0ea5e9").unwrap();

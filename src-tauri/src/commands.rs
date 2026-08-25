@@ -83,10 +83,125 @@ pub fn reschedule(state: State<AppState>) -> Result<ScheduleResult, String> {
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
+/// Explain why each scheduled task block landed where it did — a "why is this here" per block for the
+/// calendar. Read-only and derived (recomputed from the current blocks/tasks/events, never stored), so
+/// it's safe to call any time the schedule is shown. Mirrors `reschedule_inner`'s fixed-event inputs.
+#[tauri::command]
+pub fn explain_schedule(state: State<AppState>) -> Result<Vec<BlockReason>, String> {
+    let conn = state.db.lock().unwrap();
+    let tasks = db::list_tasks(&conn).map_err(err)?;
+    let events = db::list_events(&conn).map_err(err)?;
+    let blocks = db::list_blocks(&conn).map_err(err)?;
+    let busy: Vec<Interval> = events
+        .iter()
+        .filter_map(|e| match (scheduler::parse_dt(&e.start), scheduler::parse_dt(&e.end)) {
+            (Some(s), Some(en)) => Some(Interval { start: s, end: en }),
+            _ => None,
+        })
+        .collect();
+    Ok(scheduler::explain_all(&blocks, &tasks, &busy)
+        .into_iter()
+        .map(|(block_id, reason)| BlockReason { block_id, reason })
+        .collect())
+}
+
 #[tauri::command]
 pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::save_settings(&conn, &settings).map_err(err)
+}
+
+// ---------- iCalendar (.ics) subscriptions (read-only feeds) ----------
+
+#[tauri::command]
+pub fn list_ics_subscriptions(state: State<AppState>) -> Result<Vec<IcsSubscription>, String> {
+    let conn = state.db.lock().unwrap();
+    db::list_ics_subscriptions(&conn).map_err(err)
+}
+
+/// Fetch one `.ics` feed and mirror its events. The DB lock is never held across the HTTP await
+/// (gotcha #8). Returns the number of events imported.
+async fn fetch_and_import_ics(state: &State<'_, AppState>, sub_id: i64, url: &str) -> Result<usize, String> {
+    let text = state
+        .http
+        .get(url)
+        .header("User-Agent", "pushin-app")
+        .send()
+        .await
+        .map_err(|e| format!("couldn't fetch the calendar feed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("calendar feed error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("couldn't read the calendar feed: {e}"))?;
+    let events = crate::calendar::ics::parse_ics(&text);
+    let n = events.len();
+    let mut conn = state.db.lock().unwrap();
+    db::replace_ics_events(&mut conn, sub_id, &events).map_err(err)?;
+    Ok(n)
+}
+
+/// Re-plan so tasks flow around the (fixed) subscription events.
+fn reschedule_after_ics(state: &State<'_, AppState>) {
+    let mut conn = state.db.lock().unwrap();
+    if let Ok(settings) = db::get_settings(&conn) {
+        let _ = reschedule_inner(&mut conn, &settings);
+    }
+}
+
+#[tauri::command]
+pub async fn add_ics_subscription(
+    state: State<'_, AppState>,
+    name: String,
+    url: String,
+    color: Option<String>,
+) -> Result<IcsSubscription, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("Enter a calendar feed URL.".into());
+    }
+    let name = if name.trim().is_empty() { "Subscribed calendar".to_string() } else { name.trim().to_string() };
+    let color = color.unwrap_or_else(|| "#64748b".into());
+    let id = {
+        let conn = state.db.lock().unwrap();
+        db::insert_ics_subscription(&conn, &name, &url, &color).map_err(err)?
+    };
+    // Best-effort first import — if the feed is unreachable the subscription still exists so the user
+    // can fix the URL and refresh.
+    let _ = fetch_and_import_ics(&state, id, &url).await;
+    reschedule_after_ics(&state);
+    let conn = state.db.lock().unwrap();
+    db::list_ics_subscriptions(&conn)
+        .map_err(err)?
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| "subscription was not saved".to_string())
+}
+
+#[tauri::command]
+pub async fn refresh_ics_subscriptions(state: State<'_, AppState>) -> Result<usize, String> {
+    let subs = {
+        let conn = state.db.lock().unwrap();
+        db::list_ics_subscriptions(&conn).map_err(err)?
+    };
+    let mut total = 0;
+    for s in &subs {
+        if let Ok(n) = fetch_and_import_ics(&state, s.id, &s.url).await {
+            total += n;
+        }
+    }
+    reschedule_after_ics(&state);
+    Ok(total)
+}
+
+#[tauri::command]
+pub fn remove_ics_subscription(state: State<AppState>, id: i64) -> Result<(), String> {
+    let mut conn = state.db.lock().unwrap();
+    db::delete_ics_subscription(&conn, id).map_err(err)?;
+    if let Ok(settings) = db::get_settings(&conn) {
+        let _ = reschedule_inner(&mut conn, &settings);
+    }
+    Ok(())
 }
 
 /// Mirror a vault page to `<vault_dir>/<rel_path>.md` (two-way markdown vault). No-op if the user
@@ -796,6 +911,29 @@ pub async fn download_model(app: AppHandle, state: State<'_, AppState>, id: Stri
         .map_err(err)
 }
 
+/// Poll a just-spawned `llama-server` until it answers `/health`, then kick off a detached warmup so
+/// the user's first real prompt isn't cold. Backs off from a tight initial interval (a GPU spawn is
+/// often ready in ~1s, and the old flat 1s poll could leave it waiting up to a full second past ready)
+/// up to a ~60s total budget. Returns true once the server is reachable. The warmup runs OFF this path
+/// (spawned, not awaited) so "AI ready" still flips the moment health is green.
+async fn await_ready_and_warm(client: &reqwest::Client, base_url: &str, model: &str) -> bool {
+    let budget = std::time::Duration::from_secs(60);
+    let mut delay = std::time::Duration::from_millis(100);
+    let mut elapsed = std::time::Duration::ZERO;
+    while elapsed < budget {
+        tokio::time::sleep(delay).await;
+        elapsed += delay;
+        if llm::health(client, base_url).await {
+            let (c, b, m) = (client.clone(), base_url.to_string(), model.to_string());
+            tokio::spawn(async move { llm::warmup(&c, &b, &m).await });
+            return true;
+        }
+        // Exponential backoff capped at 1s: snappy if the model loads fast, gentle if it's slow.
+        delay = (delay * 2).min(std::time::Duration::from_millis(1000));
+    }
+    false
+}
+
 /// Try to make local inference available: detect a running server, else spawn one.
 /// Returns a human-readable status string.
 #[tauri::command]
@@ -837,16 +975,73 @@ pub async fn ensure_inference(app: AppHandle, state: State<'_, AppState>) -> Res
         Ok(child) => {
             *state.server.lock().unwrap() = Some(child);
             // The model can take a little while to load on first run.
-            for _ in 0..60 {
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                if llm::health(&state.http, &base_url).await {
-                    let _ = app.emit("inference-status", "AI is ready.");
-                    return Ok("AI is ready.".into());
-                }
+            if await_ready_and_warm(&state.http, &base_url, &model_to_use).await {
+                let _ = app.emit("inference-status", "AI is ready.");
+                return Ok("AI is ready.".into());
             }
             Err("The model is taking a while to load — give it a moment and try again.".into())
         }
         Err(e) => Err(format!("Couldn't start the inference server: {e}")),
+    }
+}
+
+/// Restart the local inference server on the currently-configured model. `ensure_inference` early-returns
+/// when a server is already healthy, so switching models in Settings otherwise keeps serving the OLD model
+/// until a full app restart — this kills the running server and respawns on the new one.
+#[tauri::command]
+pub async fn restart_inference(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let (base_url, model_id) = {
+        let conn = state.db.lock().unwrap();
+        let s = db::get_settings(&conn).map_err(err)?;
+        (s.llm_base_url.clone(), s.model_id.clone())
+    };
+
+    // An explicit switch must load exactly the chosen model. NOT falling back to another downloaded model
+    // (that would silently keep the old model while reporting success) — the caller downloads it first.
+    if !model_manager::is_model_present(&app, &model_id) {
+        return Err(format!(
+            "The selected model isn't downloaded yet. Download it first, then switch. ({model_id})"
+        ));
+    }
+    let model_to_use = model_id.clone();
+
+    // Kill the server we spawned (serving the old model) and let the OS release the port before rebinding.
+    if let Some(mut child) = state.server.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    model_manager::ensure_server_binary(&app, &state.http)
+        .await
+        .map_err(err)?;
+
+    let _ = app.emit("inference-status", "Switching model…");
+    match model_manager::spawn_server(&app, &model_to_use, &base_url) {
+        Ok(child) => {
+            *state.server.lock().unwrap() = Some(child);
+            if await_ready_and_warm(&state.http, &base_url, &model_to_use).await {
+                let _ = app.emit("inference-status", "AI is ready.");
+                return Ok("AI is ready.".into());
+            }
+            Err("The model is taking a while to load — give it a moment.".into())
+        }
+        Err(e) => Err(format!("Couldn't start the inference server: {e}")),
+    }
+}
+
+/// Idle-unload: kill the chat `llama-server` to free its RAM/VRAM (gigabytes for a 7B/14B). The next
+/// AI request respawns it via `ensure_inference` (the frontend calls that before each AI action), so
+/// this is transparent apart from a one-time reload. No-op if nothing is running. The embeddings
+/// server is left alone — it's tiny and already lazy.
+#[tauri::command]
+pub async fn sleep_inference(state: State<'_, AppState>) -> Result<bool, String> {
+    let child = state.server.lock().unwrap().take();
+    match child {
+        Some(mut c) => {
+            let _ = c.kill();
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
@@ -1791,7 +1986,7 @@ pub(crate) async fn ensure_engine(app: AppHandle, state: &AppState) -> Result<Ar
         return Err("This device hasn't joined a sync network yet.".into());
     }
     let use_relay = { sync::state::use_relay(&*state.db.lock().map_err(err)?) };
-    let engine = SyncEngine::start(state.db.clone(), app, use_relay).await.map_err(err)?;
+    let engine = SyncEngine::start(state.db.clone(), app, state.http.clone(), use_relay).await.map_err(err)?;
     *state.sync_engine.lock().map_err(err)? = Some(engine.clone());
     Ok(engine)
 }

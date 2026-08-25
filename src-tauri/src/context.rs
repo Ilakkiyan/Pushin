@@ -1,6 +1,6 @@
 //! The Context Engine — the shared retrieval/assembly layer every feature calls so the on-device
 //! LLM always has the relevant slice of the user's whole knowledge base loaded (see
-//! CONTEXT_ENGINE_PLAN.md). Step 1 ships the deterministic foundations: how each entity projects to
+//! docs/notes/CONTEXT_ENGINE_PLAN.md). Step 1 ships the deterministic foundations: how each entity projects to
 //! embeddable text, and a stable content hash so reindexing skips unchanged rows. Ranking lives in
 //! `hermes` (`rank_items`); the reindex pipeline and assembler land in later steps.
 

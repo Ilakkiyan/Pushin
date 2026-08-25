@@ -1,4 +1,4 @@
--- Cross-entity recall substrate for the Context Engine (see CONTEXT_ENGINE_PLAN.md).
+-- Cross-entity recall substrate for the Context Engine (see docs/notes/CONTEXT_ENGINE_PLAN.md).
 -- One polymorphic row per indexed entity, mirroring entity_labels/entity_links. Lets recall span
 -- tasks/events/pages (and later people/goals) through a single query and a single embedding store.
 CREATE TABLE IF NOT EXISTS entity_index (

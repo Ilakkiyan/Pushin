@@ -11,10 +11,41 @@
 use crate::model::{ContextItem, EntityKind, Note};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Mutex;
+
+/// A registered "borrow a peer's embed server" callback: `input -> vector`. Set by the sync engine;
+/// used only when the local embed server is unreachable (mobile borrowing a desktop over the mesh).
+pub type PeerEmbed = Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Vec<f32>>> + Send>> + Send + Sync>;
+static PEER_EMBED: Mutex<Option<PeerEmbed>> = Mutex::new(None);
+
+/// Register (or replace) the peer-embedding fallback. The engine calls this on start/restart.
+pub fn register_peer_embed(f: PeerEmbed) {
+    *PEER_EMBED.lock().unwrap() = Some(f);
+}
+
+/// Try the registered peer-embed fallback for `input` (None if no peer is registered).
+async fn peer_embed(input: &str) -> Option<Result<Vec<f32>>> {
+    let fut = {
+        let guard = PEER_EMBED.lock().unwrap();
+        guard.as_ref().map(|f| f(input.to_string()))
+    };
+    match fut {
+        Some(fut) => Some(fut.await),
+        None => None,
+    }
+}
 
 /// Embed `input` via an OpenAI-compatible `/v1/embeddings` endpoint. Returns the vector, or an
-/// error if the backend has no embeddings support (the caller treats that as "not indexed").
+/// error if the backend has no embeddings support (the caller treats that as "not indexed"). When the
+/// local embed server is unreachable, falls back to a paired desktop over the mesh (mobile bridge).
 pub async fn embed_text(client: &reqwest::Client, base_url: &str, model: &str, input: &str) -> Result<Vec<f32>> {
+    if !crate::llm::health(client, base_url).await {
+        if let Some(res) = peer_embed(input).await {
+            return res;
+        }
+    }
     let base = base_url.trim_end_matches('/');
     let resp = client
         .post(format!("{base}/v1/embeddings"))
@@ -38,6 +69,19 @@ pub async fn embed_text(client: &reqwest::Client, base_url: &str, model: &str, i
 /// Embed several inputs in one request (the OpenAI API accepts an array). Results are placed by the
 /// response's `index` field so order matches `inputs`. Used to embed the few-shot exemplar bank once.
 pub async fn embed_batch(client: &reqwest::Client, base_url: &str, model: &str, inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
+    // Mobile bridge: no local embed server → embed each input via a paired desktop (one at a time; the
+    // infer protocol is single-input). Heavier than a real batch, but it's a background index sweep.
+    if !crate::llm::health(client, base_url).await && PEER_EMBED.lock().unwrap().is_some() {
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match peer_embed(input).await {
+                Some(Ok(v)) => out.push(v),
+                Some(Err(e)) => return Err(e),
+                None => bail!("peer embed unavailable"),
+            }
+        }
+        return Ok(out);
+    }
     let base = base_url.trim_end_matches('/');
     let resp = client
         .post(format!("{base}/v1/embeddings"))
