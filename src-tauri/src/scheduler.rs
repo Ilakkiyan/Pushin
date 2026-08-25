@@ -7,7 +7,7 @@
 //!
 //! `free_slots` is `pub` and reused by the booking module.
 
-use crate::model::{Block, Conflict, ScheduleResult, Settings, Task, DT_FMT};
+use crate::model::{Block, Conflict, PlacementReason, ScheduleResult, Settings, Task, DT_FMT};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -417,6 +417,243 @@ pub fn estimation_factor(samples: &[(i64, i64)]) -> f64 {
     let mid = ratios.len() / 2;
     let median = if ratios.len() % 2 == 0 { (ratios[mid - 1] + ratios[mid]) / 2.0 } else { ratios[mid] };
     median.clamp(0.6, 1.8)
+}
+
+/// Derive the dominant reason a task's block landed at `block_start` — the "why is this here" the
+/// calendar shows on a scheduled block. Pure + deterministic: recomputed from the finished schedule
+/// (blocks + tasks + fixed events), never stored or synced. Precedence, most-specific first:
+/// a continued slice → after a prerequisite → held to an earliest-start → around a fixed commitment →
+/// to meet a deadline → simply the earliest free slot.
+///
+/// `chunk_part`/`chunk_total` are 1-based (this block's position among the task's blocks, ordered by
+/// start). `dep_end` = the latest prerequisite's `(end, title)`, if any. `abuts_commitment` = a fixed
+/// event or another block ends exactly at `block_start` (so the task couldn't start any earlier here).
+pub fn explain_block(
+    block_start: NaiveDateTime,
+    task: &Task,
+    chunk_part: usize,
+    chunk_total: usize,
+    dep_end: Option<(NaiveDateTime, String)>,
+    abuts_commitment: bool,
+) -> PlacementReason {
+    // A later sitting of a split task — this is about the split, not the start time.
+    if chunk_total > 1 && chunk_part > 1 {
+        return PlacementReason::Continuation { part: chunk_part, of: chunk_total };
+    }
+    // Gated by a prerequisite: the block starts exactly when the latest dependency finished. (If a
+    // commitment pushed it past the dep end, `block_start != dep_end` and we fall through to
+    // AroundCommitment — "couldn't start right after the prereq" — which is the truer story.)
+    if let Some((de, title)) = dep_end {
+        if block_start == de {
+            return PlacementReason::AfterDependency { dep_title: title };
+        }
+    }
+    // Held until the user's earliest-start for the task.
+    if let Some(es) = task.earliest_start.as_deref().and_then(parse_dt) {
+        if block_start == es {
+            return PlacementReason::NotBefore { earliest_start: fmt_dt(es) };
+        }
+    }
+    // Couldn't start sooner because a fixed commitment sat right before this slot.
+    if abuts_commitment {
+        return PlacementReason::AroundCommitment;
+    }
+    // No hard gate — a deadline is why it earned an early slot (EDF ordering).
+    if let Some(dl) = task.deadline.as_deref().and_then(parse_dt) {
+        return PlacementReason::ForDeadline { deadline: fmt_dt(dl) };
+    }
+    PlacementReason::Earliest
+}
+
+/// Derive a placement reason for every task block in a finished schedule. Pure: recomputed from the
+/// stored `blocks`, `tasks`, and the `busy` intervals (fixed events + habits). Groups a task's blocks
+/// into ordered chunks, resolves each task's latest-finishing dependency, and detects when a block
+/// butts up against a commitment or another task's block. Returns `(block_id, reason)`, sorted by id.
+pub fn explain_all(blocks: &[Block], tasks: &[Task], busy: &[Interval]) -> Vec<(i64, PlacementReason)> {
+    let task_by_id: HashMap<i64, &Task> = tasks.iter().map(|t| (t.id, t)).collect();
+
+    // This task's blocks, grouped and sorted by start: (block_id, start, end).
+    let mut by_task: HashMap<i64, Vec<(i64, NaiveDateTime, NaiveDateTime)>> = HashMap::new();
+    for b in blocks {
+        if let (Some(s), Some(e)) = (parse_dt(&b.start), parse_dt(&b.end)) {
+            by_task.entry(b.task_id).or_default().push((b.id, s, e));
+        }
+    }
+    for v in by_task.values_mut() {
+        v.sort_by_key(|(_, s, _)| *s);
+    }
+
+    // Every "end" instant that could butt up against a block's start, tagged with its owner: an event
+    // (None) or a task's block (Some(task_id)). A task's OWN slices don't count as its commitment.
+    let mut ends: Vec<(NaiveDateTime, Option<i64>)> = busy.iter().map(|iv| (iv.end, None)).collect();
+    for b in blocks {
+        if let Some(e) = parse_dt(&b.end) {
+            ends.push((e, Some(b.task_id)));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (tid, group) in &by_task {
+        let Some(task) = task_by_id.get(tid) else { continue };
+        let total = group.len();
+        // The latest-finishing dependency's (end, title) — what a first chunk could be gated behind.
+        let dep_end = task
+            .depends_on
+            .iter()
+            .filter_map(|d| {
+                let last = by_task.get(d)?.iter().map(|(_, _, e)| *e).max()?;
+                let title = task_by_id.get(d).map(|t| t.title.clone()).unwrap_or_default();
+                Some((last, title))
+            })
+            .max_by_key(|(e, _)| *e);
+        for (idx, (bid, bstart, _)) in group.iter().enumerate() {
+            let abuts = ends.iter().any(|(e, owner)| *e == *bstart && *owner != Some(*tid));
+            let reason = explain_block(*bstart, task, idx + 1, total, dep_end.clone(), abuts);
+            out.push((*bid, reason));
+        }
+    }
+    out.sort_by_key(|(id, _)| *id);
+    out
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    fn task(id: i64) -> Task {
+        Task {
+            id,
+            project_id: None,
+            title: format!("Task {id}"),
+            notes: String::new(),
+            estimated_minutes: 60,
+            deadline: None,
+            earliest_start: None,
+            priority: 2,
+            min_chunk_minutes: 30,
+            max_chunk_minutes: 120,
+            status: "todo".into(),
+            created_at: String::new(),
+            depends_on: vec![],
+        }
+    }
+    fn dt(s: &str) -> NaiveDateTime {
+        parse_dt(s).unwrap()
+    }
+
+    #[test]
+    fn continuation_wins_for_later_chunks() {
+        let r = explain_block(dt("2026-07-20T14:00:00"), &task(1), 2, 3, None, false);
+        assert_eq!(r, PlacementReason::Continuation { part: 2, of: 3 });
+    }
+
+    #[test]
+    fn first_chunk_is_not_a_continuation() {
+        // part 1 of a multi-chunk task still gets a real start reason, not Continuation.
+        let r = explain_block(dt("2026-07-20T09:00:00"), &task(1), 1, 3, None, false);
+        assert_eq!(r, PlacementReason::Earliest);
+    }
+
+    #[test]
+    fn after_dependency_when_block_starts_at_dep_end() {
+        let de = dt("2026-07-20T10:00:00");
+        let r = explain_block(de, &task(1), 1, 1, Some((de, "Draft outline".into())), false);
+        assert_eq!(r, PlacementReason::AfterDependency { dep_title: "Draft outline".into() });
+    }
+
+    #[test]
+    fn dependency_pushed_by_commitment_reads_as_around_commitment() {
+        // Block placed later than the dep end (a meeting occupied the slot) → not AfterDependency.
+        let de = dt("2026-07-20T10:00:00");
+        let r = explain_block(dt("2026-07-20T11:00:00"), &task(1), 1, 1, Some((de, "Draft".into())), true);
+        assert_eq!(r, PlacementReason::AroundCommitment);
+    }
+
+    #[test]
+    fn not_before_earliest_start() {
+        let mut t = task(1);
+        t.earliest_start = Some("2026-07-20T09:00:00".into());
+        let r = explain_block(dt("2026-07-20T09:00:00"), &t, 1, 1, None, false);
+        assert_eq!(r, PlacementReason::NotBefore { earliest_start: "2026-07-20T09:00:00".into() });
+    }
+
+    #[test]
+    fn around_commitment_when_abutting_and_no_gate() {
+        let r = explain_block(dt("2026-07-20T13:00:00"), &task(1), 1, 1, None, true);
+        assert_eq!(r, PlacementReason::AroundCommitment);
+    }
+
+    #[test]
+    fn for_deadline_when_deadline_and_no_stronger_reason() {
+        let mut t = task(1);
+        t.deadline = Some("2026-07-25T17:00:00".into());
+        let r = explain_block(dt("2026-07-20T09:00:00"), &t, 1, 1, None, false);
+        assert_eq!(r, PlacementReason::ForDeadline { deadline: "2026-07-25T17:00:00".into() });
+    }
+
+    #[test]
+    fn earliest_is_the_default() {
+        let r = explain_block(dt("2026-07-20T09:00:00"), &task(1), 1, 1, None, false);
+        assert_eq!(r, PlacementReason::Earliest);
+    }
+
+    #[test]
+    fn dependency_precedes_deadline_and_commitment() {
+        let mut t = task(1);
+        t.deadline = Some("2026-07-25T17:00:00".into());
+        let de = dt("2026-07-20T10:00:00");
+        let r = explain_block(de, &t, 1, 1, Some((de, "Prereq".into())), true);
+        assert_eq!(r, PlacementReason::AfterDependency { dep_title: "Prereq".into() });
+    }
+
+    fn blk(id: i64, task_id: i64, start: &str, end: &str) -> Block {
+        Block {
+            id,
+            task_id,
+            start: start.into(),
+            end: end.into(),
+            locked: false,
+            provider: None,
+            external_id: None,
+            sync_state: None,
+        }
+    }
+
+    #[test]
+    fn explain_all_groups_chunks_of_one_task() {
+        let t = task(1);
+        let blocks = vec![
+            blk(10, 1, "2026-07-20T09:00:00", "2026-07-20T10:00:00"),
+            blk(11, 1, "2026-07-20T13:00:00", "2026-07-20T14:00:00"),
+        ];
+        let reasons: HashMap<i64, PlacementReason> = explain_all(&blocks, &[t], &[]).into_iter().collect();
+        assert_eq!(reasons[&10], PlacementReason::Earliest, "first slice gets a start reason");
+        assert_eq!(reasons[&11], PlacementReason::Continuation { part: 2, of: 2 }, "second slice is a continuation");
+    }
+
+    #[test]
+    fn explain_all_detects_dependency_chain() {
+        let a = task(1); // "Task 1"
+        let mut b = task(2);
+        b.depends_on = vec![1];
+        // A finishes 10:00; B starts exactly then.
+        let blocks = vec![
+            blk(10, 1, "2026-07-20T09:00:00", "2026-07-20T10:00:00"),
+            blk(20, 2, "2026-07-20T10:00:00", "2026-07-20T11:00:00"),
+        ];
+        let reasons: HashMap<i64, PlacementReason> = explain_all(&blocks, &[a, b], &[]).into_iter().collect();
+        assert_eq!(reasons[&20], PlacementReason::AfterDependency { dep_title: "Task 1".into() });
+    }
+
+    #[test]
+    fn explain_all_flags_a_block_abutting_an_event() {
+        let t = task(1);
+        // A meeting ends at 13:00; the task's block starts right then.
+        let busy = vec![Interval { start: dt("2026-07-20T12:00:00"), end: dt("2026-07-20T13:00:00") }];
+        let blocks = vec![blk(10, 1, "2026-07-20T13:00:00", "2026-07-20T14:00:00")];
+        let reasons: HashMap<i64, PlacementReason> = explain_all(&blocks, &[t], &busy).into_iter().collect();
+        assert_eq!(reasons[&10], PlacementReason::AroundCommitment);
+    }
 }
 
 /// Schedule all non-done tasks. `fixed` = immovable events; `locked` = pinned blocks

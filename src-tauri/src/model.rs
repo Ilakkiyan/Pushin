@@ -599,3 +599,38 @@ pub struct ScheduleResult {
     pub blocks: Vec<Block>,
     pub conflicts: Vec<Conflict>,
 }
+
+/// Why the deterministic scheduler placed a task block where it did — a plain-language "why is this
+/// here" the UI can show on a scheduled block. **Derived** from the finished schedule (never stored,
+/// never synced): the scheduler is deterministic, so the reason is recomputed from blocks + tasks +
+/// fixed events on demand. One dominant reason per block, in precedence order (see
+/// `scheduler::explain_block`). The frontend formats the copy from the structured fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PlacementReason {
+    /// A later slice of a task split across multiple sittings (`part` of `of`, 1-based).
+    #[serde(rename_all = "camelCase")]
+    Continuation { part: usize, of: usize },
+    /// Starts right after a prerequisite task finished.
+    #[serde(rename_all = "camelCase")]
+    AfterDependency { dep_title: String },
+    /// Held until the task's earliest allowed start (`earliest_start`).
+    #[serde(rename_all = "camelCase")]
+    NotBefore { earliest_start: String },
+    /// Couldn't start sooner — slotted right after a fixed commitment.
+    AroundCommitment,
+    /// Given an early slot to meet its deadline.
+    #[serde(rename_all = "camelCase")]
+    ForDeadline { deadline: String },
+    /// Simply placed at the earliest free time.
+    Earliest,
+}
+
+/// A scheduled block paired with why it landed where it did (see `PlacementReason`). Returned by the
+/// `explain_schedule` command so the calendar can show a "why here" on each task block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockReason {
+    pub block_id: i64,
+    pub reason: PlacementReason,
+}
