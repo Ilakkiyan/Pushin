@@ -218,6 +218,15 @@ export default function App() {
     };
   }, [load]);
 
+  // Subscribed .ics feeds refresh on a background timer. The backend only emits when a feed actually
+  // changed (and has already re-planned around it), so this is a plain reload, not a poll.
+  useEffect(() => {
+    const un = listen("ics-refreshed", () => load());
+    return () => {
+      un.then((f) => f());
+    };
+  }, [load]);
+
   // Two-way vault: when an external editor changes a `.md` file, fold it into the DB and refresh the
   // page tree. Best-effort — a malformed file is skipped, never crashes the app.
   useEffect(() => {

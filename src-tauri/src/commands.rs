@@ -121,7 +121,7 @@ pub fn list_ics_subscriptions(state: State<AppState>) -> Result<Vec<IcsSubscript
 
 /// Fetch one `.ics` feed and mirror its events. The DB lock is never held across the HTTP await
 /// (gotcha #8). Returns the number of events imported.
-async fn fetch_and_import_ics(state: &State<'_, AppState>, sub_id: i64, url: &str) -> Result<usize, String> {
+async fn fetch_and_import_ics(state: &AppState, sub_id: i64, url: &str) -> Result<(usize, bool), String> {
     let text = state
         .http
         .get(url)
@@ -137,12 +137,12 @@ async fn fetch_and_import_ics(state: &State<'_, AppState>, sub_id: i64, url: &st
     let events = crate::calendar::ics::parse_ics(&text);
     let n = events.len();
     let mut conn = state.db.lock().unwrap();
-    db::replace_ics_events(&mut conn, sub_id, &events).map_err(err)?;
-    Ok(n)
+    let changed = db::replace_ics_events(&mut conn, sub_id, &events).map_err(err)?;
+    Ok((n, changed))
 }
 
 /// Re-plan so tasks flow around the (fixed) subscription events.
-fn reschedule_after_ics(state: &State<'_, AppState>) {
+fn reschedule_after_ics(state: &AppState) {
     let mut conn = state.db.lock().unwrap();
     if let Ok(settings) = db::get_settings(&conn) {
         let _ = reschedule_inner(&mut conn, &settings);
@@ -168,8 +168,8 @@ pub async fn add_ics_subscription(
     };
     // Best-effort first import — if the feed is unreachable the subscription still exists so the user
     // can fix the URL and refresh.
-    let _ = fetch_and_import_ics(&state, id, &url).await;
-    reschedule_after_ics(&state);
+    let _ = fetch_and_import_ics(state.inner(), id, &url).await;
+    reschedule_after_ics(state.inner());
     let conn = state.db.lock().unwrap();
     db::list_ics_subscriptions(&conn)
         .map_err(err)?
@@ -178,19 +178,46 @@ pub async fn add_ics_subscription(
         .ok_or_else(|| "subscription was not saved".to_string())
 }
 
+/// Fetch every subscription in turn. Returns (events imported, whether any feed actually changed).
+/// The DB lock is only taken inside `fetch_and_import_ics`, after its await — never held across one.
+async fn refresh_each(state: &AppState, subs: &[crate::model::IcsSubscription]) -> (usize, bool) {
+    let mut total = 0;
+    let mut changed = false;
+    for s in subs {
+        if let Ok((n, c)) = fetch_and_import_ics(state, s.id, &s.url).await {
+            total += n;
+            changed |= c;
+        }
+    }
+    (total, changed)
+}
+
+/// Refresh every .ics feed once, re-planning ONLY if a feed actually changed. Drives the background
+/// timer in `lib.rs`; a feed that hasn't moved must not reshuffle the user's day. Returns whether
+/// anything changed, so the caller can decide to tell the UI.
+pub(crate) async fn refresh_ics_once(state: &AppState) -> bool {
+    let subs = match state.db.lock() {
+        Ok(conn) => db::list_ics_subscriptions(&conn).unwrap_or_default(),
+        Err(_) => return false,
+    };
+    if subs.is_empty() {
+        return false;
+    }
+    let (_, changed) = refresh_each(state, &subs).await;
+    if changed {
+        reschedule_after_ics(state);
+    }
+    changed
+}
+
 #[tauri::command]
 pub async fn refresh_ics_subscriptions(state: State<'_, AppState>) -> Result<usize, String> {
     let subs = {
         let conn = state.db.lock().unwrap();
         db::list_ics_subscriptions(&conn).map_err(err)?
     };
-    let mut total = 0;
-    for s in &subs {
-        if let Ok(n) = fetch_and_import_ics(&state, s.id, &s.url).await {
-            total += n;
-        }
-    }
-    reschedule_after_ics(&state);
+    let (total, _) = refresh_each(state.inner(), &subs).await;
+    reschedule_after_ics(state.inner());
     Ok(total)
 }
 

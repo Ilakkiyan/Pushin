@@ -24,9 +24,14 @@ mod vault;
 
 use commands::AppState;
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, RunEvent};
+use tauri::{Emitter, Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// How often subscribed .ics feeds are re-fetched in the background. Feeds are slow-moving and each
+/// tick is a network round trip per feed, so this is deliberately unhurried; the user can still force
+/// one from Settings ▸ Calendar subscriptions.
+const ICS_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -68,6 +73,25 @@ pub fn run() {
             // when unset; never blocks startup.
             if let Some(state) = handle.try_state::<AppState>() {
                 commands::start_vault_watch(handle, state.inner());
+            }
+
+            // Keep .ics feeds current. Until now a feed only ever updated when the user opened
+            // Settings and pressed Refresh, so a subscribed calendar could sit stale indefinitely —
+            // and a device that received a feed over the mesh showed it with no events at all.
+            // Refresh on launch, then on a timer. `refresh_ics_once` re-plans ONLY when a feed
+            // actually changed, so an unmoving feed never reshuffles the user's day.
+            {
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        if let Some(state) = handle.try_state::<AppState>() {
+                            if commands::refresh_ics_once(state.inner()).await {
+                                let _ = handle.emit("ics-refreshed", ());
+                            }
+                        }
+                        tokio::time::sleep(ICS_REFRESH_INTERVAL).await;
+                    }
+                });
             }
 
             // If this device has already joined a sync network, bring the mesh engine up in the

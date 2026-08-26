@@ -825,8 +825,33 @@ pub fn delete_ics_subscription(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Replace a subscription's mirrored events with the freshly-fetched set (read-only feeds are a full
-/// mirror — simplest correct refresh). Stamps `last_synced`.
-pub fn replace_ics_events(conn: &mut Connection, sub_id: i64, events: &[crate::calendar::ics::IcsEvent]) -> Result<()> {
+/// mirror — simplest correct refresh). Stamps `last_synced`. Returns whether anything actually
+/// changed.
+///
+/// The no-change fast path matters: feeds refresh on a background timer now, and the mirror is a
+/// DELETE-everything-then-INSERT. Without this, an unchanged feed would still churn every one of its
+/// event rows on every tick — and each churn triggers a re-plan, so the user's task blocks would
+/// shuffle themselves every refresh interval for no reason.
+pub fn replace_ics_events(conn: &mut Connection, sub_id: i64, events: &[crate::calendar::ics::IcsEvent]) -> Result<bool> {
+    let current: Vec<(String, String, String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT title, start, end, external_id FROM events WHERE ics_sub_id = ?1 ORDER BY start, external_id",
+        )?;
+        let rows = stmt.query_map(params![sub_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut incoming: Vec<(String, String, String, Option<String>)> = events
+        .iter()
+        .map(|e| (e.title.clone(), e.start.clone(), e.end.clone(), Some(e.uid.clone())))
+        .collect();
+    incoming.sort_by(|a, b| (&a.1, &a.3).cmp(&(&b.1, &b.3)));
+
+    if current == incoming {
+        // Nothing to mirror — just record that we looked.
+        conn.execute("UPDATE ics_subscriptions SET last_synced = ?2 WHERE id = ?1", params![sub_id, now_iso()])?;
+        return Ok(false);
+    }
+
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM events WHERE ics_sub_id = ?1", params![sub_id])?;
     for e in events {
@@ -838,9 +863,8 @@ pub fn replace_ics_events(conn: &mut Connection, sub_id: i64, events: &[crate::c
     }
     tx.execute("UPDATE ics_subscriptions SET last_synced = ?2 WHERE id = ?1", params![sub_id, now_iso()])?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
-
 /// Insert an event pulled from Google.
 pub fn insert_google_event(conn: &Connection, title: &str, start: &str, end: &str, external_id: &str, etag: Option<&str>) -> Result<i64> {
     conn.execute(
@@ -2114,6 +2138,54 @@ pub(crate) fn test_conn() -> Connection {
 
 #[cfg(test)]
 mod tests {
+
+    /// A feed that hasn't moved must be a no-op. Feeds refresh on a background timer, and the mirror
+    /// is a DELETE-everything-then-INSERT — so without this, every tick would churn every event row
+    /// and trigger a re-plan, shuffling the user's task blocks on a timer for no reason.
+    #[test]
+    fn an_unchanged_ics_feed_is_a_no_op_but_still_records_the_check() {
+        let mut conn = test_conn();
+        conn.execute(
+            "INSERT INTO ics_subscriptions(name, url, color, created_at) VALUES('Team','https://e/t.ics','#38bdf8','t')",
+            [],
+        ).unwrap();
+        let sub = conn.last_insert_rowid();
+        let feed = vec![
+            crate::calendar::ics::IcsEvent {
+                uid: "a@e".into(), title: "Standup".into(),
+                start: "2026-09-01T09:00:00".into(), end: "2026-09-01T09:15:00".into(),
+            },
+            crate::calendar::ics::IcsEvent {
+                uid: "b@e".into(), title: "Retro".into(),
+                start: "2026-09-01T16:00:00".into(), end: "2026-09-01T17:00:00".into(),
+            },
+        ];
+
+        assert!(replace_ics_events(&mut conn, sub, &feed).unwrap(), "first import is a change");
+        let ids: Vec<i64> = {
+            let mut st = conn.prepare("SELECT id FROM events WHERE ics_sub_id = ?1 ORDER BY id").unwrap();
+            st.query_map(params![sub], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(ids.len(), 2);
+
+        // Same feed again: no change, and crucially the SAME rows survive (no delete/reinsert churn).
+        assert!(!replace_ics_events(&mut conn, sub, &feed).unwrap(), "an unchanged feed reports no change");
+        let ids2: Vec<i64> = {
+            let mut st = conn.prepare("SELECT id FROM events WHERE ics_sub_id = ?1 ORDER BY id").unwrap();
+            st.query_map(params![sub], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(ids, ids2, "rows are untouched, so nothing re-plans");
+        // ...but we still record that we looked, so the UI can show a fresh "last checked".
+        let synced: Option<String> = conn
+            .query_row("SELECT last_synced FROM ics_subscriptions WHERE id = ?1", params![sub], |r| r.get(0))
+            .unwrap();
+        assert!(synced.is_some(), "last_synced is stamped even when nothing changed");
+
+        // A real edit is still detected.
+        let mut moved = feed.clone();
+        moved[1].start = "2026-09-01T17:00:00".into();
+        assert!(replace_ics_events(&mut conn, sub, &moved).unwrap(), "a moved event is a change");
+    }
     use super::*;
 
     fn mem() -> Connection {
