@@ -32,6 +32,19 @@ function tally(out, passRe, failRe) {
   return parts.join(", ");
 }
 
+/** What to show for a FAILING step. `parse` describes the happy path (the build one just says
+ *  "clean"), so trusting it on a failure prints "clean ✗" — a row that argues with its own verdict.
+ *  Prefer a parse result that already names failures, else the exit code plus the first real error
+ *  line, so the summary alone is enough to tell whether the failure is yours. */
+function failureDetail(out, code, parsed) {
+  if (parsed && /FAILED|failed/.test(parsed)) return `${parsed} · exit ${code}`;
+  const line = out
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => /^(error|Error|error TS|✘|FAIL|panicked)/.test(l) || /error TS\d+/.test(l));
+  return line ? `exit ${code} — ${line.slice(0, 120)}` : `exit ${code}`;
+}
+
 /** @typedef {{name:string, label:string, cmd:string, tier:"fast"|"full"|"live", live?:boolean, retryOnce?:boolean, parse?:(o:string)=>string|null}} Step */
 
 /** @type {Step[]} */
@@ -55,6 +68,9 @@ const STEPS = [
     label: "Type-check + production build",
     cmd: "npm run build",
     tier: "full",
+    // Flaky in a shared working tree: `tsc` reading a file another session is mid-write fails the
+    // whole step. Retry once so a genuine break still fails but a transient one surfaces as "~".
+    retryOnce: true,
     parse: (o) => (o.match(/built in ([\d.]+m?s)/) ?? [])[1] ? `clean (${o.match(/built in ([\d.]+m?s)/)[1]})` : "clean",
   },
   {
@@ -176,14 +192,15 @@ async function main() {
     }
     writeFileSync(join(OUT_DIR, `${step.name}.log`), r.out);
 
-    const summary = step.parse?.(r.out) ?? null;
+    const parsed = step.parse?.(r.out) ?? null;
+    const summary = r.code === 0 ? (parsed ?? "ok") : failureDetail(r.out, r.code, parsed);
     // A live eval that ran is reported on its score; only a crashed process is a failure, and even
     // then it never gates unless --gate-live. Scores bounce run-to-run; a red build must mean a bug.
     const failed = r.code !== 0 && (!step.live || gateLive);
     results.push({
       step,
       status: failed ? "fail" : r.code !== 0 ? "warn" : retried ? "flaky" : "pass",
-      detail: summary ?? (r.code === 0 ? "ok" : `exit ${r.code}`),
+      detail: summary,
       ms: r.ms,
     });
     const mark = failed ? "✗" : retried ? "~" : r.code !== 0 ? "!" : "✓";
