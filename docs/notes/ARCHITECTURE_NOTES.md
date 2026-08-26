@@ -38,6 +38,43 @@ ground for humans; this file is the terse, hard-won engineering detail.
 
 ---
 
+## Missed-task rollover (`schedule_service::sweep_missed`, migration `0021_task_missed`)
+Work whose planned time came and went, deterministically kicked to the next available slot. No model
+involved — the LLM never touches this path.
+
+- **Staleness is per-day, not per-moment.** A block is stale once it ends before **midnight of today**.
+  A block you blew past at 9am is therefore *kept* until the day turns over — the calendar never
+  rearranges itself under you mid-day. `reschedule_inner`'s "sticky" cutoff was moved from `now` to
+  `today_start` to match, so today's already-passed blocks still hold their slot AND still count
+  against their task's estimate (via `locked_min`), which is what stops the task being re-placed twice.
+- **What the sweep does:** delete the stale blocks, `db::mark_task_missed` (once per local date — the
+  `last_missed_on < ?` guard is what keeps the count honest across the dozens of reschedules a normal
+  day fires), and let the scheduler pass that follows re-place the freed minutes from `now` forward.
+- **Pinned blocks roll too, and lose the pin.** A pin means "do it at *this* time"; a day later there
+  is no such time left to hold. This is the one caller allowed to delete a locked block, hence
+  `db::delete_blocks` alongside `replace_unlocked_blocks` (which deliberately can't).
+- **Scope is deliberately narrow.** Only *active* tasks. A missed meeting is history, not work to
+  re-plan; habits have their own occurrence/streak logic that rolling a miss forward would corrupt;
+  and a done/archived task keeps its past blocks as the record of when the work happened.
+- **Triggering.** The sweep runs inside `reschedule_inner`, so every existing reschedule path gets it
+  for free. But nothing calls reschedule when time merely *passes* — so `App.tsx` holds a day-rollover
+  watcher: once on open (the app may have been shut for days), then a 60s tick comparing
+  `new Date().toDateString()`, which resolves sleep/wake, timezone changes and DST correctly without
+  timer arithmetic.
+- **`missed_count` is surfaced**, not just stored: a "↻ N×" chip on the task row (`TaskListPane`) and
+  on the Today pane's due chips. Cleared when the task is marked done, so the nag can't outlive the work.
+
+### The passed-deadline trap (`scheduler::schedule_one`)
+The bug that made rollover moot, and worth remembering: placement was capped at the task's deadline
+(`place(..., latest = deadline)`). Once that deadline was **behind** `now`, the cap left a zero-width
+window, `place` returned nothing, and the task got **no block at all** — overdue work silently fell off
+the calendar precisely when it most needed to be seen. Now the cap is `deadline.filter(|d| *d > earliest)`:
+a blown deadline can't be honoured by any placement, so it stops acting as a constraint and the task is
+planned into the next free slot. The `DeadlineMiss` conflict still fires (there's a second arm for the
+"it all fit, but past a deadline that had already blown" case), so it reads as late rather than lost.
+
+---
+
 ## Google Calendar sync (`calendar/google.rs`)
 - **OAuth2 + PKCE via system browser + loopback `TcpListener`** (Desktop client → no redirect URI to register). Token refresh implemented.
 - **Pull** incremental via `syncToken` (full-window fallback on 410). **Push** local `source='manual'` events (insert/patch by `external_id`) + task blocks (reconciled, see below).
@@ -72,7 +109,8 @@ Run Pushin on multiple devices and keep them in sync **without a cloud**: data f
 - ⚠️ **`ensure_engine` rebuilds when the mesh secret changes.** An engine caches the secret it bound with; joining another device's network replaces that secret, so a previously-started engine (this device had made its own network) kept presenting the OLD one and failed the peer's mesh authentication. `sync_join` is also bounded by a **45s timeout** with an actionable error — it used to be able to spin indefinitely with no feedback.
 - ⚠️ **Iroh is pinned to `0.90`, not `1.0`.** iroh 1.0's `netwatch` forces `windows-core 0.62`, whose `wmi 0.18.4` won't compile against the `windows-core 0.61` Tauri 2.11 uses (a real Windows build break). iroh 0.90's chain is self-consistent. Needs rusqlite `functions` + `data-encoding`. See memory `device-sync`.
 - **Known follow-ups:** scalar-HLC watermark can re-ship a foreign-authored row once (idempotent); field-level LWW; smarter block handling; persisting full NodeAddr per peer.
-- ⚠️ **Open bug — `events.ics_sub_id` is an unsynced FK.** `events` syncs but `ics_subscriptions` does not, so a peer receives a raw *local* rowid that may point at a different feed on that device — and the column's `ON DELETE CASCADE` means removing an unrelated subscription can cascade-delete a synced event. Shipped with the .ics feature in v0.8.0 and still open: the fix forks three ways (sync the subscriptions table, strip the column on the wire, or drop the cascade), and each changes that feature's semantics, so it wants a human decision rather than a silent change.
+- ⚠️ **`events.ics_sub_id` was an unsynced FK that broke sync outright** (fixed `9ae15ce`; shipped v0.8.0, live through v0.8.1). `events` syncs but `ics_subscriptions` does not, and the column was neither declared in the events `TableSpec::fks` (so never rewritten to a uuid) nor in `skip` (so never dropped) — it went on the wire as a raw *local* rowid. With `foreign_keys = ON` (set by `db::open`), a peer holding no subscription at that id failed the apply INSERT with `FOREIGN KEY constraint failed (787)`, and that error propagates out of the batch: **the entire apply was rejected, so nothing landed on that device at all.** One .ics feed silently broke all sync to any device not sharing that rowid. The milder hazard the column also carried — `ON DELETE CASCADE`, so deleting an unrelated local feed at a colliding rowid could cascade-delete a synced event — needed the collision, and was the *lucky* case. Fix: `ics_sub_id` joins the events `skip` list, dropped on the wire rather than rewritten (the far side has no equivalent row to point at); the event still replicates, just without a feed id that would be meaningless there. Regression test: `ics_backed_event_syncs_without_dragging_its_local_feed_id_across`.
+  - **Still open (product call, not a bug):** whether .ics events should replicate between devices *at all*. They're re-derivable from the feed, so a peer subscribed to the same calendar ends up holding both its own copy and the replicated one.
 
 ---
 
@@ -140,5 +178,11 @@ The shared retrieval spine: every feature pulls context through one path. Full p
 - **Engine auto-download** spans macOS/Linux/Windows; Windows **CUDA** GPU build now auto-downloads (memory `gpu-inference`). Still TODO: bundle `llama-server` as a per-OS sidecar (offline installs); Linux CUDA; Vulkan/HIP.
 - **Public booking page** is served by a hardened local HTTP server exposed via a user-run tunnel (ngrok/cloudflared). A managed hosted relay is a follow-up.
 - No **drag-to-resize** on the calendar (only drag-to-move).
+- **Rollover vs. the Google block mirror (pre-existing, slightly widened).** The mirror's window starts
+  at `now - 1 day`, so when the rollover sweep deletes a block that ended *earlier* than that, the
+  matching Google event is outside the window and `plan_block_mirror` never sees it to retire it — it
+  lingers as a stale "Focus: X" entry. This already happened for unlocked blocks (wiped by
+  `replace_unlocked_blocks` every reschedule); the sweep merely adds pinned blocks to the set. Fixing it
+  means widening `time_min`, which costs a bigger pull on every sync — deliberately not done yet.
 - **Test gap:** the full Google `sync()` orchestrator end-to-end. PageEditor real-editing is Playwright-only (jsdom can't drive ProseMirror).
 - **Labeling system (core SHIPPED):** cross-cutting label taxonomy over tasks/events/habits/pages/projects (`0010_labels`). Built: CRUD/merge, a shared `LabelPicker`, sidebar `LabelPane`, Cmd-K label jumps, actionable scheduling (`db::resolve_task_prefs` → `scheduler::schedule_with_prefs`, a soft preference), calendar color-by-label + filter chips, AI auto-labeling (keyword → "Suggested" chips), event labeling UI. **Still TODO:** read-only "system labels"; a `#`-trigger inline label chip; scheduler batching. See memory `labeling-system-plan`.

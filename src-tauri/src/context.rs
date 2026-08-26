@@ -145,6 +145,8 @@ mod tests {
             max_chunk_minutes: 120,
             status: "todo".into(),
             created_at: "2026-01-01T00:00:00".into(),
+            missed_count: 0,
+            last_missed_on: None,
             depends_on: vec![],
         }
     }

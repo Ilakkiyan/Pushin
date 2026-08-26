@@ -345,6 +345,12 @@ fn schedule_one(
     let min_chunk = pref.and_then(|p| p.min_chunk).filter(|&m| m > 0).unwrap_or(t.min_chunk_minutes).max(1);
     // Never schedule a task past its deadline — cap placement at it.
     let deadline = t.deadline.as_deref().and_then(parse_dt);
+    // ...unless the deadline is ALREADY BEHIND US. Capping at a passed deadline leaves no window at
+    // all, so `place` placed nothing and the task fell off the calendar entirely — exactly the work
+    // you most need to see. A blown deadline can't be honoured by any placement, so stop treating it
+    // as a constraint and plan the task into the next free slot; the DeadlineMiss conflict below
+    // still fires (now against the real new end), so it's reported late rather than silently lost.
+    let cap = deadline.filter(|d| *d > earliest);
 
     // A label's preferred time-of-day window is a SOFT preference: try in-window time first (earliest
     // first), then fall back to any free slot. Done by ordering the free list window-first for `place`.
@@ -353,11 +359,11 @@ fn schedule_one(
             let (inw, outw) = partition_by_window(std::mem::take(free), ws, we);
             let mut combined = inw;
             combined.extend(outw);
-            let r = place(&mut combined, earliest, remaining, min_chunk, deadline);
+            let r = place(&mut combined, earliest, remaining, min_chunk, cap);
             *free = coalesce(combined);
             r
         }
-        None => place(free, earliest, remaining, min_chunk, deadline),
+        None => place(free, earliest, remaining, min_chunk, cap),
     };
     for p in &placed {
         blocks.push(Block {
@@ -392,6 +398,17 @@ fn schedule_one(
                 title: t.title.clone(),
                 remaining_minutes: left,
             }),
+        }
+    } else if let (Some(dld), Some(end)) = (deadline, last_end) {
+        // It all fit — but past a deadline that had already blown (the uncapped path above). Report
+        // it so an overdue task still reads as overdue instead of looking cleanly scheduled.
+        if end > dld {
+            conflicts.push(Conflict::DeadlineMiss {
+                task_id: t.id,
+                title: t.title.clone(),
+                scheduled_end: fmt_dt(end),
+                deadline: fmt_dt(dld),
+            });
         }
     }
 }
@@ -534,6 +551,8 @@ mod explain_tests {
             max_chunk_minutes: 120,
             status: "todo".into(),
             created_at: String::new(),
+            missed_count: 0,
+            last_missed_on: None,
             depends_on: vec![],
         }
     }
@@ -817,6 +836,8 @@ mod tests {
             max_chunk_minutes: 240,
             status: "todo".into(),
             created_at: String::new(),
+            missed_count: 0,
+            last_missed_on: None,
             depends_on: deps,
         }
     }

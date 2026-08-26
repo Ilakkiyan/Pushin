@@ -26,6 +26,7 @@ const MIGRATION_0017: &str = include_str!("../migrations/0017_habit_preferred_ti
 const MIGRATION_0018: &str = include_str!("../migrations/0018_note_origin.sql");
 const MIGRATION_0019: &str = include_str!("../migrations/0019_ics_subscriptions.sql");
 const MIGRATION_0020: &str = include_str!("../migrations/0020_google_link.sql");
+const MIGRATION_0021: &str = include_str!("../migrations/0021_task_missed.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -128,6 +129,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         let spec = crate::sync::schema::spec("google_link").expect("google_link is a synced table");
         conn.execute_batch(&crate::sync::schema::table_sync_sql(spec))?;
         conn.pragma_update(None, "user_version", 20)?;
+    }
+    if version < 21 {
+        // tasks.missed_count / last_missed_on — the day-rollover sweep's audit trail. Plain columns
+        // on an already-synced table, so 0015's triggers carry them to paired devices as-is.
+        conn.execute_batch(MIGRATION_0021)?;
+        conn.pragma_update(None, "user_version", 21)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -293,6 +300,8 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         max_chunk_minutes: r.get("max_chunk_minutes")?,
         status: r.get("status")?,
         created_at: r.get("created_at")?,
+        missed_count: r.get("missed_count")?,
+        last_missed_on: r.get("last_missed_on")?,
         depends_on: Vec::new(),
     })
 }
@@ -457,6 +466,38 @@ pub fn replace_unlocked_blocks(conn: &mut Connection, new_blocks: &[Block]) -> R
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Delete specific blocks by id — pinned ones included. Used only by the day-rollover sweep
+/// (`schedule_service::sweep_missed`), which is the one caller allowed to drop a *pinned* block:
+/// a pin says "do it at this time", and once that time is a day in the past the pin has nothing
+/// left to hold. `replace_unlocked_blocks` deliberately can't touch pinned rows, hence this.
+pub fn delete_blocks(conn: &Connection, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+    conn.execute(&format!("DELETE FROM blocks WHERE id IN ({placeholders})"), params_from_iter(ids.iter()))?;
+    Ok(())
+}
+
+/// Record that a task was kicked forward, at most once per local day. `on_date` is the date whose
+/// planned time was missed (YYYY-MM-DD); re-running the sweep on the same day is a no-op, which is
+/// what keeps the count honest when `reschedule` fires dozens of times between breakfast and lunch.
+pub fn mark_task_missed(conn: &Connection, id: i64, on_date: &str) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE tasks SET missed_count = missed_count + 1, last_missed_on = ?2
+         WHERE id = ?1 AND (last_missed_on IS NULL OR last_missed_on < ?2)",
+        params![id, on_date],
+    )?;
+    Ok(n > 0)
+}
+
+/// Clear a task's rollover history — it got done (or was reopened fresh), so the "rolled over N×"
+/// nag starts from zero next time.
+pub fn clear_task_missed(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("UPDATE tasks SET missed_count = 0, last_missed_on = NULL WHERE id = ?1", params![id])?;
     Ok(())
 }
 

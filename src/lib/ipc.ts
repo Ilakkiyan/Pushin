@@ -94,6 +94,11 @@ export interface Task {
   maxChunkMinutes: number;
   status: "todo" | "scheduled" | "in_progress" | "done";
   createdAt: string;
+  /** How many times this task's planned time came and went unfinished, each one kicking it to the
+   *  next available slot (see `schedule_service::sweep_missed`). 0 = never missed. */
+  missedCount: number;
+  /** Local date (YYYY-MM-DD) of the most recent rollover, or null. */
+  lastMissedOn: string | null;
   dependsOn: number[];
 }
 

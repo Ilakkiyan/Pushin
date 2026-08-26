@@ -399,6 +399,11 @@ pub fn set_task_status(state: State<AppState>, id: i64, status: String) -> Resul
     let mut conn = state.db.lock().unwrap();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::set_task_status(&conn, id, &status).map_err(err)?;
+    // Finishing it settles the score: the rollover count is a "you keep pushing this" nag, so it
+    // must not survive into a later reopen of the same task.
+    if status == "done" {
+        db::clear_task_missed(&conn, id).map_err(err)?;
+    }
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 

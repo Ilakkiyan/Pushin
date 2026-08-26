@@ -31,6 +31,14 @@ pub struct Task {
     pub max_chunk_minutes: i64,
     pub status: String, // todo|scheduled|in_progress|done
     pub created_at: String,
+    /// How many days running this task has been kicked forward by the rollover sweep (see
+    /// `schedule_service::sweep_missed`). 0 = never missed.
+    #[serde(default)]
+    pub missed_count: i64,
+    /// Local date (YYYY-MM-DD) of the most recent rollover, so a sweep can't count the same day
+    /// twice however often `reschedule` runs.
+    #[serde(default)]
+    pub last_missed_on: Option<String>,
     /// Populated on read; ids this task depends on.
     #[serde(default)]
     pub depends_on: Vec<i64>,

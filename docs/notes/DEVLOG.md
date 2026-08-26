@@ -9,6 +9,63 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-08-26
+
+### One .ics feed could block all device sync ✅
+`events.ics_sub_id` is an FK into `ics_subscriptions`, which is **not** a synced table. The column was
+neither declared in the events `TableSpec::fks` (so never rewritten to a uuid) nor in `skip` (so never
+dropped) — it went on the wire as a raw *local* rowid. With `foreign_keys = ON`, a peer holding no
+subscription at that id failed the apply INSERT with `FOREIGN KEY constraint failed (787)`, and that
+error propagates out of the batch: **the whole apply was rejected, so nothing landed on that device at
+all.** Anyone with a .ics feed had sync silently broken against any device not sharing that rowid.
+The `ON DELETE CASCADE` hazard the column also carried (deleting an unrelated local feed at a colliding
+rowid cascade-deleting a synced event) needed the collision, and was the milder case.
+- Fix: `ics_sub_id` joins the events `skip` list — dropped on the wire rather than rewritten, since the
+  far side has no equivalent row to point at. The event still replicates, just without a meaningless
+  feed id. Reproduced first; the test fails 787 against the old registry.
+- **Still open, deliberately:** whether .ics events should replicate between devices at all. They're
+  re-derivable from the feed, so a peer subscribed to the same calendar holds both copies. Product call.
+- Shipped in v0.8.0, live through v0.8.1. Found by `pushin-3a`, severity correctly re-read by
+  `pushin-f2`, fixed by `pushin-5b` in `9ae15ce`. **Verified:** Rust **325**, Vitest 101, build, E2E 10.
+
+### Missed tasks are kicked to the next available slot, deterministically ✅
+If a task's planned time passed and you hadn't done it, nothing happened — and in one case it got
+actively worse. Fixed end to end.
+
+- **The real bug underneath it:** `schedule_one` capped placement at the task's deadline. Once that
+  deadline was *behind* `now`, the cap was a zero-width window, so `place` returned nothing and an
+  overdue task got **no block at all** — it silently vanished from the calendar exactly when it most
+  needed to be seen. A blown deadline can no longer act as a constraint; the task is planned into the
+  next free slot and the `DeadlineMiss` conflict still fires so it reads as late, not lost.
+- **The sweep** (`schedule_service::sweep_missed`, migration `0021_task_missed`). A block is stale once
+  it ends before midnight of today; stale blocks are deleted, the task is counted missed once for that
+  date, and the scheduler pass that follows re-places the freed minutes. Runs inside `reschedule_inner`,
+  so every existing path gets it.
+- **Pinned blocks roll too, and drop the pin** — a pin says "do it at *this* time", and a day later
+  there is no such time left to hold. Previously a pinned block sat in the past forever with the task
+  still reading "scheduled": silently dead work. New `db::delete_blocks` is the only caller allowed to
+  delete a locked block.
+- **Nothing moves mid-day** (the user's chosen cadence). `reschedule_inner`'s sticky cutoff moved from
+  `now` to `today_start`, so a block you blew past at 9am holds its slot — and keeps counting against
+  its task's estimate — until the day is actually over.
+- **Something has to notice time passing.** Nothing called reschedule when the clock merely advanced,
+  so `App.tsx` got a day-rollover watcher: once on open (the app may have been shut for days), then a
+  60s `toDateString()` comparison, which handles sleep/wake, timezone changes and DST for free.
+- **Made visible:** `tasks.missed_count` renders as a "↻ N×" chip on the task row and the Today pane's
+  due chips, and is cleared on completion so the nag can't outlive the work.
+- Scope held deliberately narrow: only active tasks. A missed meeting is history; habits have streak
+  logic a rollover would corrupt; done tasks keep their past blocks as the record of the work.
+- **Verified:** `cargo test --lib` **324** green (8 new, incl. the passed-deadline regression and an
+  idempotency test that reschedules three times and asserts one count); Vitest **101** (2 new);
+  Playwright **10/10**; `npm run build` clean. One E2E casualty worth noting — `getByTitle("Next")`
+  substring-matched the new chip's tooltip and broke strict mode, so that locator is now `exact: true`
+  (the same class of break that shipped red in v0.8.0).
+- Known edge, documented not fixed: the Google block mirror's window starts at `now - 1 day`, so a
+  swept block older than that leaves a stale mirrored event behind. Pre-existing; the sweep only adds
+  pinned blocks to the set.
+
+---
+
 ## 2026-08-25
 
 ### v0.8.1 — one Google calendar across every paired device, and pairing that actually pairs ✅

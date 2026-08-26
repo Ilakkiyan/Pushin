@@ -85,8 +85,62 @@ fn resolve_habit_conflicts(conn: &Connection, now: NaiveDateTime) -> Result<()> 
     Ok(())
 }
 
+/// The day-rollover sweep: work whose planned time came and went, kicked forward.
+///
+/// A block is **stale** once it ends before midnight of `now`'s date — i.e. it belongs to a day that
+/// is over. Stale blocks of tasks that are still active get deleted (pinned ones included: a pin
+/// says "do it at *this* time", and a day later there is no such time left to hold), the task is
+/// counted as missed once for that day, and the scheduler pass that follows re-places the freed
+/// minutes in the next available slot. Nothing that belongs to *today* is touched, so the calendar
+/// never yanks work out from under you mid-day — a block you blew past at 9am sits there until the
+/// day turns over, then moves.
+///
+/// Deliberately narrow:
+/// - **Only tasks.** A meeting you didn't attend is history, not something to re-plan; habits have
+///   their own occurrence/streak logic that rolling a miss forward would corrupt.
+/// - **Done/archived tasks keep their blocks** — that's the record of when the work happened.
+/// - **Idempotent.** `mark_task_missed` only counts the first sweep of a given local date, so the
+///   dozens of reschedules a normal day triggers can't inflate the count.
+///
+/// Returns how many tasks were newly counted as missed.
+pub fn sweep_missed(conn: &Connection, now: NaiveDateTime) -> Result<usize> {
+    let today = now.date();
+    let day_start = today.and_hms_opt(0, 0, 0).unwrap();
+    let today_str = today.format("%Y-%m-%d").to_string();
+
+    let tasks = db::list_tasks(conn)?;
+    let blocks = db::list_blocks(conn)?;
+
+    let mut stale_ids: Vec<i64> = Vec::new();
+    let mut rolled = 0usize;
+    for t in tasks.iter().filter(|t| t.is_active()) {
+        let stale: Vec<i64> = blocks
+            .iter()
+            .filter(|b| b.task_id == t.id)
+            .filter(|b| scheduler::parse_dt(&b.end).is_some_and(|e| e <= day_start))
+            .map(|b| b.id)
+            .collect();
+        if stale.is_empty() {
+            continue;
+        }
+        stale_ids.extend(stale);
+        if db::mark_task_missed(conn, t.id, &today_str)? {
+            rolled += 1;
+        }
+    }
+    db::delete_blocks(conn, &stale_ids)?;
+    Ok(rolled)
+}
+
 /// Recompute the schedule from the current DB state and persist the new blocks.
 pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<ScheduleResult> {
+    let now = Local::now().naive_local();
+
+    // Kick unfinished work from days gone by forward FIRST — the sweep deletes stale blocks (pinned
+    // ones included), so everything below must be read after it, or this pass would plan around
+    // blocks that are about to disappear.
+    sweep_missed(conn, now)?;
+
     let mut tasks = db::list_tasks(conn)?;
     // Adaptive estimate: bias not-done task durations by what completed tasks ACTUALLY took
     // (focus-tracked). A soft input — `estimation_factor` is 1.0 (no change) until there's history,
@@ -100,7 +154,6 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
             }
         }
     }
-    let now = Local::now().naive_local();
 
     // Re-flow habits off any real event they now overlap (e.g. a just-added meeting landed on a habit)
     // BEFORE planning tasks, so both habits and tasks end up clear of fixed events.
@@ -136,11 +189,19 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
     let is_busy = |iv: &Interval| {
         fixed.iter().any(|f| f.start < iv.end && iv.start < f.end) || locked.iter().any(|(_, l)| l.start < iv.end && iv.start < l.end)
     };
+    //
+    // The cutoff is **midnight today**, not `now`: a block whose time you blew past this morning is
+    // kept (and its minutes still count against the task's estimate), so the calendar doesn't
+    // rearrange itself under you the moment a block ends. `sweep_missed` above is what eventually
+    // clears it — once the day is over.
+    let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
     let sticky: Vec<(i64, Interval)> = blocks
         .iter()
         .filter(|b| !b.locked && active_ids.contains(&b.task_id))
         .filter_map(|b| match (scheduler::parse_dt(&b.start), scheduler::parse_dt(&b.end)) {
-            (Some(s), Some(e)) if e > now && !is_busy(&Interval { start: s, end: e }) => Some((b.task_id, Interval { start: s, end: e })),
+            (Some(s), Some(e)) if e > today_start && !is_busy(&Interval { start: s, end: e }) => {
+                Some((b.task_id, Interval { start: s, end: e }))
+            }
             _ => None,
         })
         .collect();
@@ -188,6 +249,182 @@ mod tests {
     }
     fn block_start(conn: &Connection, task_id: i64) -> Option<String> {
         db::list_blocks(conn).unwrap().into_iter().find(|b| b.task_id == task_id).map(|b| b.start)
+    }
+
+    /// Put a block straight into the DB at an arbitrary (possibly past) time — the scheduler will
+    /// never produce one, so the rollover tests have to plant them by hand.
+    fn plant_block(conn: &Connection, task_id: i64, start: NaiveDateTime, mins: i64, locked: bool) -> i64 {
+        conn.execute(
+            "INSERT INTO blocks(task_id, start, end, locked) VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                task_id,
+                scheduler::fmt_dt(start),
+                scheduler::fmt_dt(start + Duration::minutes(mins)),
+                locked as i64
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn task_by_id(conn: &Connection, id: i64) -> crate::model::Task {
+        db::list_tasks(conn).unwrap().into_iter().find(|t| t.id == id).unwrap()
+    }
+
+    #[test]
+    fn a_missed_task_is_kicked_to_the_next_available_slot() {
+        // The headline behavior: yesterday's block came and went without the task being done, so the
+        // block is gone and the task is planned again — in the future, never back in the past.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let t = add_task(&conn, "Missed essay", 60);
+        plant_block(&conn, t, now - Duration::days(1), 60, false);
+
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        let blocks: Vec<Block> = db::list_blocks(&conn).unwrap().into_iter().filter(|b| b.task_id == t).collect();
+        assert_eq!(blocks.len(), 1, "exactly one block — the stale one replaced, not added to");
+        let start = scheduler::parse_dt(&blocks[0].start).unwrap();
+        assert!(start >= now, "re-placed in the future ({start}), not left in the past");
+        assert_eq!(task_by_id(&conn, t).missed_count, 1, "counted as missed once");
+    }
+
+    #[test]
+    fn a_pinned_block_that_has_passed_rolls_and_loses_its_pin() {
+        // A pin means "do it at THIS time". Once that time is a day gone there is nothing left to
+        // pin to, so the sweep is allowed to drop it — otherwise the task sits in yesterday forever
+        // looking "scheduled" while its time has quietly evaporated.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let t = add_task(&conn, "Pinned work", 60);
+        plant_block(&conn, t, now - Duration::days(1), 60, true);
+
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        let blocks: Vec<Block> = db::list_blocks(&conn).unwrap().into_iter().filter(|b| b.task_id == t).collect();
+        assert_eq!(blocks.len(), 1, "the stale pin is replaced by one fresh block");
+        assert!(!blocks[0].locked, "the re-placed block is no longer pinned");
+        assert!(scheduler::parse_dt(&blocks[0].start).unwrap() >= now, "moved forward");
+        assert_eq!(task_by_id(&conn, t).missed_count, 1);
+    }
+
+    #[test]
+    fn a_task_whose_deadline_already_passed_still_gets_scheduled() {
+        // The bug that made the whole feature moot: placement was capped at the deadline, so a task
+        // you'd already blown past had a zero-width window and got NO block at all — it vanished
+        // from the calendar precisely when you most needed to see it. It must be planned into the
+        // next free slot AND still reported as a deadline miss.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let yesterday = scheduler::fmt_dt(now - Duration::days(1));
+        let t = db::insert_task(&conn, None, "Late essay", "", 60, Some(&yesterday), 3, 30, 120, &[]).unwrap();
+
+        let r = reschedule_inner(&mut conn, &s).unwrap();
+
+        let blocks: Vec<Block> = db::list_blocks(&conn).unwrap().into_iter().filter(|b| b.task_id == t).collect();
+        assert_eq!(blocks.len(), 1, "an overdue task is still put on the calendar");
+        assert!(scheduler::parse_dt(&blocks[0].start).unwrap() >= now);
+        assert!(
+            r.conflicts.iter().any(|c| matches!(c, crate::model::Conflict::DeadlineMiss { task_id, .. } if *task_id == t)),
+            "and it's still flagged as past its deadline: {:?}",
+            r.conflicts
+        );
+    }
+
+    #[test]
+    fn a_block_missed_earlier_today_does_not_move_until_the_day_is_over() {
+        // The user's chosen cadence: nothing is rearranged mid-day. A block you blew past at 9am
+        // stays sitting at 9am — the sweep only kicks work forward once the day it belonged to is
+        // actually over, so the calendar never reshuffles itself while you're looking at it.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        // A block that started at midnight and has already ended — same day, firmly in the past.
+        let start = now.date().and_hms_opt(0, 0, 0).unwrap();
+        let mins = ((now - start).num_minutes() - 5).max(1);
+        if mins < 15 {
+            return; // running within 20 minutes of midnight — no room for an already-passed block today
+        }
+        let t = add_task(&conn, "Blew past it", 60);
+        plant_block(&conn, t, start, mins, false);
+
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        let blocks: Vec<Block> = db::list_blocks(&conn).unwrap().into_iter().filter(|b| b.task_id == t).collect();
+        assert_eq!(blocks.len(), 1, "today's block is kept, not swapped for a new one");
+        assert_eq!(scheduler::parse_dt(&blocks[0].start).unwrap(), start, "and it did not move");
+        assert_eq!(task_by_id(&conn, t).missed_count, 0, "not counted as missed while its day is still running");
+    }
+
+    #[test]
+    fn sweeping_twice_in_a_day_counts_the_miss_once() {
+        // `reschedule` fires on nearly every user action, so the sweep runs dozens of times a day.
+        // The count has to track misses, not reschedules.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let t = add_task(&conn, "Missed twice over", 60);
+        plant_block(&conn, t, now - Duration::days(1), 60, false);
+
+        reschedule_inner(&mut conn, &s).unwrap();
+        reschedule_inner(&mut conn, &s).unwrap();
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        assert_eq!(task_by_id(&conn, t).missed_count, 1, "three reschedules, one missed day, one count");
+    }
+
+    #[test]
+    fn a_finished_task_keeps_its_history_and_is_never_swept() {
+        // A done task's past blocks are the record of when the work happened — the sweep must leave
+        // them alone and must not mark a finished task as missed.
+        let mut conn = db::test_conn();
+        let now = Local::now().naive_local();
+        let t = add_task(&conn, "Already done", 60);
+        plant_block(&conn, t, now - Duration::days(1), 60, true);
+        db::set_task_status(&conn, t, "done").unwrap();
+
+        let rolled = sweep_missed(&conn, now).unwrap();
+
+        assert_eq!(rolled, 0);
+        assert_eq!(db::list_blocks(&conn).unwrap().len(), 1, "the completed block stays as history");
+        assert_eq!(task_by_id(&conn, t).missed_count, 0);
+    }
+
+    #[test]
+    fn repeated_misses_accumulate_across_days() {
+        // Missing it again on a later day bumps the count again — that's the "you keep pushing this
+        // one" signal. Driven through `sweep_missed` directly so two distinct days can be simulated.
+        let conn = db::test_conn();
+        let now = Local::now().naive_local();
+        let t = add_task(&conn, "Perpetually deferred", 60);
+
+        plant_block(&conn, t, now - Duration::days(3), 60, false);
+        assert_eq!(sweep_missed(&conn, now - Duration::days(2)).unwrap(), 1);
+        plant_block(&conn, t, now - Duration::days(2), 60, false);
+        assert_eq!(sweep_missed(&conn, now - Duration::days(1)).unwrap(), 1);
+
+        let task = task_by_id(&conn, t);
+        assert_eq!(task.missed_count, 2, "two separate days missed");
+        assert_eq!(task.last_missed_on, Some((now - Duration::days(1)).date().format("%Y-%m-%d").to_string()));
+    }
+
+    #[test]
+    fn a_missed_meeting_is_left_alone() {
+        // Scope guard: only tasks roll. A meeting you didn't attend is history, not work to re-plan.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let start = scheduler::fmt_dt(now - Duration::days(1));
+        let end = scheduler::fmt_dt(now - Duration::days(1) + Duration::minutes(30));
+        db::insert_event(&conn, "Standup I slept through", &start, &end, "fixed").unwrap();
+
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        let ev = db::list_events(&conn).unwrap().into_iter().find(|e| e.title.starts_with("Standup")).unwrap();
+        assert_eq!(ev.start, start, "the missed meeting stays where it was");
     }
 
     #[test]

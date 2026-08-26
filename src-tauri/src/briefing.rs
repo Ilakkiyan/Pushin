@@ -132,6 +132,8 @@ mod tests {
             max_chunk_minutes: 120,
             status: status.into(),
             created_at: String::new(),
+            missed_count: 0,
+            last_missed_on: None,
             depends_on: vec![],
         }
     }

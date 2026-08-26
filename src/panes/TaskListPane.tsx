@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Plus, Trash2, NotebookPen, Play, Square } from "lucide-react";
+import { Check, Plus, Trash2, NotebookPen, Play, Square, RotateCcw } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type FocusSession, type Task } from "../lib/ipc";
@@ -55,6 +55,15 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
           <span>{humanMinutes(task.estimatedMinutes)}</span>
           {task.deadline && <span>· due {parseLocal(task.deadline).toLocaleDateString([], { month: "short", day: "numeric" })}</span>}
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
+          {!done && task.missedCount > 0 && (
+            <span
+              title={`Its planned time passed unfinished ${task.missedCount} time${task.missedCount === 1 ? "" : "s"} — each one moved it to the next free slot`}
+              className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300"
+            >
+              <RotateCcw className="size-2.5" />
+              {task.missedCount}×
+            </span>
+          )}
           <LabelPicker kind="task" entityId={task.id} compact revealOnHover />
         </div>
       </div>

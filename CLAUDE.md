@@ -84,7 +84,9 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
     - `drop_unrequested_prep_tasks` — mentioning an activity shouldn't spawn a "Prepare for X" task unless the user said prepare/prep/get-ready.
     Follow-up clarifications survive `filter_clarifications`.
 
-13. **Measuring the model: the eval harnesses.** `tests/llm_eval.rs` (per-category scorecard) and `tests/model_battery.rs` (UI-projected pre-push gate) run the **real** parser→store_plan(→reschedule) path against a live `:8080`. Both `#[ignore]`d + self-skip with no server, so `cargo test` stays green. **Baseline ~90% of checks; the TOTAL bounces run-to-run (gotcha #1) — judge per-category.** On WSL the test exe is a Windows binary so it reaches `:8080`; if relinking `pushin.exe` fails while the app runs, run the built exe directly. See `docs/notes/ARCHITECTURE_NOTES.md` → Test suite.
+13. **A passed deadline must stop being a constraint.** `scheduler::schedule_one` caps placement at a task's deadline — correct until the deadline is *behind* `now`, when the cap becomes a zero-width window, `place` returns nothing, and the overdue task gets **no block at all** (it vanishes from the calendar exactly when you need to see it). The cap is now `deadline.filter(|d| *d > earliest)`; `DeadlineMiss` still fires so it reads as late, not lost. Related: `schedule_service::sweep_missed` kicks work whose day is over into the next free slot (pinned blocks included — they lose the pin), and the sticky-block cutoff is **midnight today**, not `now`, so the calendar never rearranges itself mid-day. See `docs/notes/ARCHITECTURE_NOTES.md` → Missed-task rollover.
+
+14. **Measuring the model: the eval harnesses.** `tests/llm_eval.rs` (per-category scorecard) and `tests/model_battery.rs` (UI-projected pre-push gate) run the **real** parser→store_plan(→reschedule) path against a live `:8080`. Both `#[ignore]`d + self-skip with no server, so `cargo test` stays green. **Baseline ~90% of checks; the TOTAL bounces run-to-run (gotcha #1) — judge per-category.** On WSL the test exe is a Windows binary so it reaches `:8080`; if relinking `pushin.exe` fails while the app runs, run the built exe directly. See `docs/notes/ARCHITECTURE_NOTES.md` → Test suite.
 
 ---
 
@@ -106,12 +108,12 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 
 ## Current status (released **v0.8.1**; `release.yml` builds installers for all platforms)
 Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `docs/notes/DEVLOG.md`. Headline:
-- **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
+- **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, **missed-task rollover** (a task whose day passed unfinished is kicked to the next free slot; pinned blocks included), tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
 - **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified).
 - **Context Engine + execution loop:** `entity_index` recall spine feeding planner auto-recall + `vault_ask`; People/CRM; keyword auto-labeling; Daily Briefing + Cmd-K "Run" bar; Focus timer + adaptive scheduler; Meeting Companion; hardened public booking page.
 - **Device sync (pairing proven on loopback, cross-machine still unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. `two_real_iroh_endpoints_pair_and_converge` runs a real ticket→dial→session between two endpoints in one process; only NAT traversal is untested. Iroh pinned **0.90**.
 - **Shell polish:** frameless `TitleBar`, opening animation, in-app auto-update (v0.5.0+, signed).
-- **Tested:** Rust `cargo test --lib` (**304**) + httpmock, Vitest (**80**, 19 files) + IPC/bridge contract tests, Playwright E2E (**4**), live `llm_eval`/`model_battery` (~90%, manual).
+- **Tested:** Rust `cargo test --lib` (**325**) + httpmock, Vitest (**101**, 20 files) + IPC/bridge contract tests, Playwright E2E (**10**), live `llm_eval`/`model_battery` (~90%, manual).
 - **Repo:** GitHub `Ilakkiyan/Pushin`; `main` default; releases are version tags.
 
 ## Working style with this user

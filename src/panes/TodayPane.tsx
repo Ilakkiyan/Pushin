@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, CalendarDays, Clock, ListChecks, Loader2, Send } from "lucide-react";
+import { ArrowRight, CalendarDays, Clock, ListChecks, Loader2, RotateCcw, Send } from "lucide-react";
 import { useStore } from "../state/store";
 import StaleTasks from "../components/StaleTasks";
 import { api, type Briefing, type CalEvent, type PlanOutcome } from "../lib/ipc";
@@ -169,8 +169,17 @@ export default function TodayPane() {
               <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)] mb-1.5">Due</div>
               <div className="flex flex-wrap gap-1.5">
                 {due.slice(0, 8).map((t) => (
-                  <span key={t.id} className="inline-flex items-center border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-200">
+                  <span key={t.id} className="inline-flex items-center gap-1 border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-200">
                     {t.title}
+                    {t.missedCount > 0 && (
+                      <span
+                        title={`Pushed to a later slot ${t.missedCount} time${t.missedCount === 1 ? "" : "s"}`}
+                        className="tnum inline-flex items-center gap-0.5 text-[10px] text-amber-400/80"
+                      >
+                        <RotateCcw className="size-2.5" />
+                        {t.missedCount}
+                      </span>
+                    )}
                   </span>
                 ))}
                 {due.length > 8 && <span className="tnum px-1 text-[11px] text-[var(--ink-faint)]">+{due.length - 8} more</span>}

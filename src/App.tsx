@@ -114,6 +114,26 @@ export default function App() {
     load();
   }, [load]);
 
+  // Day-rollover sweep. Everything a missed task needs happens inside `reschedule` (the Rust
+  // `sweep_missed` drops blocks whose day is over and re-plans that work into the next free slot) —
+  // but nothing calls `reschedule` when time merely *passes*. So: once when the app opens (it may
+  // have been shut for days), then whenever the local date turns over on a long-running window.
+  // `toDateString()` is the comparison rather than a timer arithmetic, so waking from sleep, a
+  // timezone change, and DST all resolve to "is it a different day than last tick" correctly.
+  const lastDayRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!loaded) return;
+    const sweep = () => {
+      const today = new Date().toDateString();
+      if (lastDayRef.current === today) return;
+      lastDayRef.current = today;
+      useStore.getState().reschedule().catch(() => {});
+    };
+    sweep(); // on open
+    const id = setInterval(sweep, 60_000);
+    return () => clearInterval(id);
+  }, [loaded]);
+
   // Resolve the AI boot gate (see `aiLoading`): ready once the server is reachable (model in memory);
   // skip when no model is downloaded; safety timeout so a stuck/slow load never traps the loading screen.
   useEffect(() => {

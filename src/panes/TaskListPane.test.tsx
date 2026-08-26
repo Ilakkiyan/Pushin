@@ -53,4 +53,24 @@ describe("TaskListPane", () => {
     await userEvent.click(screen.getByLabelText("Delete task"));
     await waitFor(() => expect(api.deleteTask).toHaveBeenCalledWith(1));
   });
+
+  it("shows a rollover chip only once a task has actually been missed", async () => {
+    // The visible half of the day-rollover sweep: a task whose planned time came and went carries a
+    // "pushed forward N times" mark, so a task you keep sliding is obvious rather than silently
+    // reappearing at a new time each morning.
+    const { unmount } = render(<TaskListPane />);
+    expect(screen.queryByText("2×")).not.toBeInTheDocument();
+    unmount();
+
+    useStore.setState({ tasks: [{ ...task, missedCount: 2 }] as never });
+    render(<TaskListPane />);
+    await waitFor(() => expect(screen.getByText("2×")).toBeInTheDocument());
+  });
+
+  it("hides the rollover chip on a finished task", async () => {
+    // Done is done — the nag must not outlive the work.
+    useStore.setState({ tasks: [{ ...task, status: "done", missedCount: 3 }] as never });
+    render(<TaskListPane />);
+    expect(screen.queryByText("3×")).not.toBeInTheDocument();
+  });
 });
