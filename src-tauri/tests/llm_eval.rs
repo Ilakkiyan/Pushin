@@ -223,6 +223,28 @@ fn single_task_estimate_180(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bo
     let est = db::list_tasks(c).ok().and_then(|t| t.first().map(|t| t.estimated_minutes));
     vec![chk("task estimate ≈ 3h", near(est, 180))]
 }
+fn deadline_task_due_today(o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // "due EOD today" is a DEADLINE, not a slot: one task due at the end of today, nothing on the
+    // calendar. The model files this as a fixed event; `demote_deadline_work_to_task` corrects it.
+    let today = Local::now().naive_local().date();
+    let tasks = db::list_tasks(c).unwrap_or_default();
+    let due_today = tasks.iter().any(|t| t.deadline.as_deref().and_then(parse).map(|d| d.date()) == Some(today));
+    vec![
+        chk("no calendar block fabricated", o.created_event_titles.is_empty()),
+        chk("exactly one task", o.created_task_ids.len() == 1),
+        chk("due end of today", due_today),
+    ]
+}
+fn deadline_task_no_block(o: &PlanOutcome, _c: &Connection) -> Vec<(String, bool)> {
+    vec![
+        chk("no calendar block fabricated", o.created_event_titles.is_empty()),
+        chk("≥1 task", !o.created_task_ids.is_empty()),
+    ]
+}
+fn deadline_appointment_stays_an_event(o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    // The veto side: a thing you ATTEND is still an event, deadline wording around it or not.
+    vec![chk("dentist stayed an event", ev_exists(c, "dent") || title_in(o, "dent"))]
+}
 fn all_tasks_have_deadline(_o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
     let tasks = db::list_tasks(c).unwrap_or_default();
     let ok = !tasks.is_empty() && tasks.iter().all(|t| t.deadline.is_some());
@@ -324,6 +346,31 @@ fn cases() -> Vec<Case> {
             seed: &[],
             prompt: "I need to study for my chemistry final, about 3 hours.",
             expect: E { tasks: Some(1), custom: Some(single_task_estimate_180), ..Default::default() },
+        },
+        // ---- deadlines: "due X" is when work must be FINISHED, never a calendar slot ----
+        Case {
+            name: "work due EOD today is a task, not an event",
+            category: "deadline",
+            history: &[],
+            seed: &[],
+            prompt: "I need to test some stuff for my job due EOD today",
+            expect: E { custom: Some(deadline_task_due_today), ..Default::default() },
+        },
+        Case {
+            name: "deliverable due by a weekday is a task",
+            category: "deadline",
+            history: &[],
+            seed: &[],
+            prompt: "I have to send the client invoices by friday",
+            expect: E { custom: Some(deadline_task_no_block), ..Default::default() },
+        },
+        Case {
+            name: "an appointment with deadline wording stays an event",
+            category: "deadline",
+            history: &[],
+            seed: &[],
+            prompt: "I need to see the dentist friday at 2pm",
+            expect: E { custom: Some(deadline_appointment_stays_an_event), ..Default::default() },
         },
         // ---- multi-task projects ----
         Case {

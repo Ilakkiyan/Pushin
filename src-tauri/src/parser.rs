@@ -6,7 +6,7 @@ use crate::model::{Event, Settings};
 use crate::scheduler::{fmt_dt, parse_dt};
 use crate::{hermes, llm, model_manager};
 use anyhow::Result;
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -355,6 +355,7 @@ user: make the sleepover 8pm to 8am → {\"updateEvents\":[{\"match\":\"sleepove
 user: make the meeting today 2 hours instead of 1 → {\"updateEvents\":[{\"match\":\"Meeting\",\"durationMinutes\":120}]}\n\
 user: practice violin every day from 4pm to 5pm → {\"habits\":[{\"name\":\"Violin practice\",\"durationMinutes\":60}]}\n\
 user: exercise daily → {\"habits\":[{\"name\":\"Exercise\",\"durationMinutes\":30}]}\n\
+user: send the invoices, due by friday → {\"projects\":[{\"name\":\"Invoices\",\"tasks\":[{\"title\":\"Send the invoices\",\"estimated_minutes\":30,\"priority\":\"high\"}]}]}\n\
 user: plan a blog - pick platform, write posts → {\"projects\":[{\"name\":\"Blog\",\"tasks\":[{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"high\"}]}]}";
 
 fn system_prompt(events: &[Event], settings: &Settings, memory: &[String], examples: &str) -> String {
@@ -383,6 +384,9 @@ event's title, plus only the fields that change. Do NOT also create it. To chang
 \"remove all sleepovers\" → removeEvents: [\"sleepover\"]. Do NOT create anything.\n\
 - TASKS (work to do: write, design, build, study, plan) → `projects[].tasks` with `estimated_minutes`, \
 `priority`, `depends_on`. NEVER put work as an event.\n\
+- A DEADLINE — \"due …\", \"by friday\", \"deadline\", \"EOD\" — says when work must be FINISHED, \
+not when it HAPPENS, so it is a TASK, never an event. Only an explicit clock time (\"at 3\", \"12-2\") \
+makes an event.\n\
 - RECURRING routines done regularly (\"every day\", \"daily\", \"each morning\", \"every night\") → \
 `habits` with `name` and `durationMinutes`. NOT an event, NOT a task. Don't ask which weekdays.\n\
 Rules:\n\
@@ -731,6 +735,60 @@ fn ask_when_ambiguous_command(plan: &mut ParsedPlan, text: &str) {
 /// the model made a "Meeting" event). When the message is dominantly a removal (a cancel/delete verb
 /// and NO create verb), reclassify any created events as removals by title. Chunking isolates a
 /// "cancel …" clause from an "add …" clause, so per-chunk this stays a pure removal.
+/// **An edit verb means edit, however the model routed it.** "Move lunch to 1pm and add a coffee break
+/// at 3pm" comes back as TWO creates — the model re-creates the thing it was told to move (sometimes
+/// under a title parroted from the few-shot examples, "Lunch with mom"), so the real lunch never moves
+/// and a duplicate appears. `store_plan` already reconciles a create whose title matches an existing
+/// event EXACTLY; this catches the rest by working from the user's own words instead: a clause LED by
+/// an edit verb, and a created event that clause is about, is an edit. Converting it to an
+/// `updateEvents` entry hands it to `best_update_target`, which matches fuzzily and picks one event.
+/// The sibling create from a different clause ("add a coffee break at 3pm") is untouched.
+fn route_edit_verb_creates_to_updates(plan: &mut ParsedPlan, text: &str) {
+    if plan.events.is_empty() {
+        return;
+    }
+    const EDIT: &[&str] = &["move ", "reschedule ", "push ", "shift ", "rename ", "change "];
+    const LEADIN: &[&str] = &["and ", "then ", "but ", "also ", "plus "];
+    let edit_clauses: Vec<String> = split_clauses(text)
+        .into_iter()
+        .map(|c| {
+            let t = c.trim().to_string();
+            let lc = t.to_lowercase();
+            match LEADIN.iter().find(|w| lc.starts_with(**w)) {
+                Some(w) => t[w.len()..].trim().to_string(),
+                None => t,
+            }
+        })
+        .filter(|c| {
+            let lc = c.to_lowercase();
+            EDIT.iter().any(|v| lc.starts_with(v))
+        })
+        .collect();
+    if edit_clauses.is_empty() {
+        return;
+    }
+    let mut kept: Vec<ParsedEvent> = Vec::with_capacity(plan.events.len());
+    for ev in std::mem::take(&mut plan.events) {
+        let is_edit = edit_clauses.iter().any(|c| shares_significant_word(c, &ev.title));
+        if is_edit {
+            plan.update_events.push(UpdateEvent {
+                target: ev.title,
+                title: None,
+                day: ev.day,
+                start_time: ev.start_time,
+                end_time: ev.end_time,
+                duration_minutes: ev.duration_minutes,
+                date: ev.date,
+                span_days: ev.span_days,
+                shift_minutes: None,
+            });
+        } else {
+            kept.push(ev);
+        }
+    }
+    plan.events = kept;
+}
+
 fn remove_verb_creates_become_removes(plan: &mut ParsedPlan, text: &str) {
     // (a) An event whose TITLE begins with a cancellation verb ("Cancel Meetings Friday") is always a
     // mis-routed removal — reclassify it, stripping the verb for the match needle. Catches the case
@@ -752,8 +810,24 @@ fn remove_verb_creates_become_removes(plan: &mut ParsedPlan, text: &str) {
     const REMOVE: &[&str] = &["cancel", "delete", "get rid of", "remove "];
     const ADD: &[&str] = &["add ", "schedule ", "create ", "put ", "book ", "set up", "new ", "move ", "reschedule"];
     if REMOVE.iter().any(|r| lc.contains(r)) && !ADD.iter().any(|a| lc.contains(a)) {
-        for ev in plan.events.drain(..) {
-            plan.remove_events.push(ev.title);
+        // …but only the events the removal is actually ABOUT. In a multi-intent brain-dump ("dentist
+        // Monday at 9am, finish the budget report by Wednesday, … and cancel the old standup") the
+        // absence of an add-verb says nothing — a lone "cancel" clause was swallowing the unrelated
+        // creates, silently deleting the dentist appointment. With one clause the old blanket rule
+        // still holds ("cancel all my meetings friday"); with several, match clause to event.
+        let clauses = split_clauses(text);
+        let removal_clauses: Vec<&String> =
+            clauses.iter().filter(|c| { let l = c.to_lowercase(); REMOVE.iter().any(|r| l.contains(r)) }).collect();
+        let mut i = 0;
+        while i < plan.events.len() {
+            let about_removal =
+                clauses.len() <= 1 || removal_clauses.iter().any(|c| shares_significant_word(c, &plan.events[i].title));
+            if about_removal {
+                let ev = plan.events.remove(i);
+                plan.remove_events.push(ev.title);
+            } else {
+                i += 1;
+            }
         }
     }
 }
@@ -878,6 +952,92 @@ fn recover_crammed_times(plan: &mut ParsedPlan) {
     }
 }
 
+/// **The model duplicates a create it already made** — the same title twice in one plan ("Project
+/// Review" today 2pm AND "Project Review" tomorrow 2pm, for a single "schedule a project review in two
+/// weeks at 2pm"). `store_plan` converges to one event per title anyway, so the copy changes nothing
+/// there — but it makes the plan look multi-event, which switches OFF the single-subject date/range/
+/// span backfill in `backfill_event_fields` and loses the date the user actually stated. Fold the
+/// duplicate into the first, filling only fields the first left unset. Exact-title only: two genuinely
+/// distinct events in one message never share an identical title.
+fn fold_duplicate_creates(plan: &mut ParsedPlan) {
+    let mut kept: Vec<ParsedEvent> = Vec::with_capacity(plan.events.len());
+    for ev in std::mem::take(&mut plan.events) {
+        match kept.iter_mut().find(|k| k.title.trim().eq_ignore_ascii_case(ev.title.trim())) {
+            Some(first) => {
+                // Only an ABSENT field is filled — never one the model set, even if it looks odd
+                // ("24:00"), so the text-driven backfill still gets to correct it.
+                if first.start_time.is_none() {
+                    first.start_time = ev.start_time.clone();
+                }
+                if first.end_time.is_none() {
+                    first.end_time = ev.end_time.clone();
+                }
+                if first.day.is_none() {
+                    first.day = ev.day.clone();
+                }
+                if first.date.is_none() {
+                    first.date = ev.date.clone();
+                }
+                first.duration_minutes = first.duration_minutes.or(ev.duration_minutes);
+                first.span_days = first.span_days.or(ev.span_days);
+            }
+            None => kept.push(ev),
+        }
+    }
+    plan.events = kept;
+}
+
+/// **Recover a cancellation the model dropped.** When one message both cancels and creates ("Cancel the
+/// old sync and schedule a team lunch Friday at noon"), the small model reliably keeps the create and
+/// forgets the removal entirely. The removal is stated in plain words, so take it from the text: a
+/// clause LED by a cancel/delete verb names its target right there. Only fires when the plan carries no
+/// removal yet and the clause names something concrete — "cancel it" is too vague to act on, and a
+/// needle matching no event removes nothing downstream.
+fn recover_dropped_removals(plan: &mut ParsedPlan, text: &str) {
+    const VERBS: &[&str] = &["cancel ", "delete ", "remove ", "get rid of ", "drop "];
+    const LEAD: &[&str] = &["the", "my", "our", "all", "any", "that", "this"];
+    const LEADIN: &[&str] = &["and ", "then ", "but ", "also ", "plus ", "And ", "Then ", "But ", "Also ", "Plus "];
+    for clause in split_clauses(text) {
+        // `split_clauses` splits on ", " before " and ", so a trailing clause can arrive still wearing
+        // its conjunction ("and cancel the old standup") — strip it before looking for the verb.
+        let trimmed = clause.trim().trim_start_matches('&').trim();
+        let trimmed = LEADIN.iter().fold(trimmed, |t, w| t.strip_prefix(w).map(str::trim_start).unwrap_or(t));
+        let lc = trimmed.to_lowercase();
+        let Some(v) = VERBS.iter().find(|v| lc.starts_with(**v)) else {
+            continue;
+        };
+        // Strip the verb, then leading determiners, keeping the rest as the match needle.
+        let mut words: Vec<&str> = trimmed[v.len()..].split_whitespace().collect();
+        while words.first().map_or(false, |w| LEAD.contains(&w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()))) {
+            words.remove(0);
+        }
+        let needle = words.join(" ");
+        let concrete = needle.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).len() >= 3)
+            && !matches!(needle.to_lowercase().trim(), "it" | "them" | "those" | "thing" | "things" | "one");
+        if !concrete || is_placeholder_title(&needle) {
+            continue;
+        }
+        if plan.remove_events.is_empty() {
+            plan.remove_events.push(needle.clone());
+        }
+        // "Cancel ALL my sleepovers" asks for a sweep — but the model reads the calendar listing and
+        // names ONE of them ("Sleepover at Jake's"), a needle that then matches only that one event.
+        // The user's own head noun is the right needle, so add it: every sleepover goes, as asked.
+        let lc_clause = trimmed.to_lowercase();
+        if lc_clause.contains("all ") || lc_clause.contains("every ") {
+            let head = needle.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
+            let bare = match head.to_lowercase() {
+                h if h.ends_with("ies") && h.len() > 4 => format!("{}y", &head[..head.len() - 3]),
+                h if h.ends_with('s') && !h.ends_with("ss") && h.len() > 3 => head[..head.len() - 1].to_string(),
+                _ => head.to_string(),
+            };
+            if bare.len() >= 3 && !plan.remove_events.iter().any(|r| r.eq_ignore_ascii_case(&bare)) {
+                plan.remove_events.push(bare);
+            }
+        }
+    }
+}
+
 pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) {
     // PUSHIN_PLAN_DEBUG=1 → dump the RAW model plan (pre-recovery) so we can see exactly what the
     // model emitted vs. what recovery does to it. Diagnostic only; no effect when unset.
@@ -897,16 +1057,20 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     }
     unescape_plan(plan);
     recover_crammed_times(plan);
+    fold_duplicate_creates(plan); // before the backfills: a duplicate title hides the single subject
     resolve_task_deadlines(plan);
+    demote_deadline_work_to_task(plan, user_text, today); // before the backfill, so the task gets the deadline
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
+    merge_split_event_fragments(plan); // before the backfill: a fabricated sibling hides the single subject
     backfill_event_fields(plan, user_text, today);
     clamp_absurd_event_durations(plan, user_text);
-    merge_split_event_fragments(plan);
     promote_timed_work_to_block(plan, user_text);
     collapse_unrequested_decomposition(plan, user_text);
     drop_unrequested_prep_tasks(plan, user_text);
     route_recurring_to_habits(plan, user_text);
+    recover_dropped_removals(plan, user_text); // before the reclassifier, which bails once a removal exists
+    route_edit_verb_creates_to_updates(plan, user_text);
     remove_verb_creates_become_removes(plan, user_text);
     dedup_same_time_and_habits(plan); // after backfill fills starts + route_recurring adds habits
     apply_lone_duration_to_lone_event(plan, user_text); // after cancels/dups settle to a lone event
@@ -954,6 +1118,21 @@ fn merge_split_event_fragments(plan: &mut ParsedPlan) {
             || matches!(l.as_str(), "tbd" | "n/a" | "event" | "title" | "untitled event")
     }
 
+    // A bookkeeping non-event the model tacks onto a real one: "Movie Night" + "Movie Night End Time
+    // Clarification", "Passport Renewal" + "Passport Renewal Follow-Up". These are notes to itself, not
+    // things the user asked for — and the second one carries away a time slot (and, worse, makes the
+    // plan multi-event, which disables the single-subject date backfill). Only counts as junk when it
+    // also shares a significant word with a real sibling, so a genuine "Reminder: take the forms"
+    // alongside an unrelated event survives.
+    fn is_junk_addendum(title: &str) -> bool {
+        let l = title.to_lowercase();
+        const JUNK: &[&str] = &[
+            "clarification", "follow-up", "follow up", "followup", "end time", "start time",
+            "part 2", "continued", "confirmation", "placeholder", "reminder", "to be confirmed",
+        ];
+        JUNK.iter().any(|j| l.contains(j))
+    }
+
     // A fabricated sub-event the model appends to a real one, derived from its title with a separator:
     // "Team Sync" → also "Team Sync - Break Time"; "Movie Night" → "Movie Night: Part 2".
     fn is_derivative_of(child: &str, parent: &str) -> bool {
@@ -970,7 +1149,8 @@ fn merge_split_event_fragments(plan: &mut ParsedPlan) {
     let mut kept: Vec<ParsedEvent> = Vec::with_capacity(plan.events.len());
     for (idx, ev) in std::mem::take(&mut plan.events).into_iter().enumerate() {
         let derivative = all_titles.iter().enumerate().any(|(j, other)| j != idx && is_derivative_of(&ev.title, other));
-        let spurious = derivative || ((is_fragment(&ev.title) || is_fabricated(&ev.title)) && !kept.is_empty());
+        let addendum = is_junk_addendum(&ev.title) && kept.iter().any(|k| shares_significant_word(&k.title, &ev.title));
+        let spurious = derivative || addendum || ((is_fragment(&ev.title) || is_fabricated(&ev.title)) && !kept.is_empty());
         if spurious {
             // Fold time the fragment carries into the preceding real event where the real one lacks it.
             if let Some(prev) = kept.last_mut() {
@@ -1323,6 +1503,7 @@ const EXEMPLARS: &[Exemplar] = &[
     Exemplar { intent: Intent::CreateEvent, text: "lunch with mom friday 12-2 and a graduation party from 6-10", output: "{\"events\":[{\"title\":\"Lunch with mom\",\"day\":\"friday\",\"startTime\":\"12:00\",\"endTime\":\"14:00\"},{\"title\":\"Graduation party\",\"day\":\"friday\",\"startTime\":\"18:00\",\"endTime\":\"22:00\"}]}" },
     // createTask — single activity → ONE task; explicit steps decompose; sequential → depends_on.
     Exemplar { intent: Intent::CreateTask, text: "study for the exam, about 4 hours", output: "{\"projects\":[{\"name\":\"Exam\",\"tasks\":[{\"title\":\"Study for the exam\",\"estimated_minutes\":240,\"priority\":\"high\"}]}]}" },
+    Exemplar { intent: Intent::CreateTask, text: "i need to test some stuff for work, due EOD today", output: "{\"projects\":[{\"name\":\"Work\",\"tasks\":[{\"title\":\"Test stuff for work\",\"estimated_minutes\":60,\"priority\":\"high\"}]}]}" },
     Exemplar { intent: Intent::CreateTask, text: "plan a blog - pick platform, write 3 posts", output: "{\"projects\":[{\"name\":\"Blog\",\"tasks\":[{\"title\":\"Pick platform\",\"estimated_minutes\":60,\"priority\":\"medium\"},{\"title\":\"Write 3 posts\",\"estimated_minutes\":180,\"priority\":\"medium\"}]}]}" },
     Exemplar { intent: Intent::CreateTask, text: "to launch the app I need to fix the login bug, then write tests, then deploy", output: "{\"projects\":[{\"name\":\"Launch\",\"tasks\":[{\"title\":\"Fix the login bug\",\"estimated_minutes\":60,\"priority\":\"high\"},{\"title\":\"Write tests\",\"estimated_minutes\":60,\"priority\":\"high\",\"depends_on\":[\"Fix the login bug\"]},{\"title\":\"Deploy\",\"estimated_minutes\":30,\"priority\":\"high\",\"depends_on\":[\"Write tests\"]}]}]}" },
     Exemplar { intent: Intent::CreateTask, text: "write the report, about 90 minutes, and email it, 10 minutes", output: "{\"projects\":[{\"name\":\"Report\",\"tasks\":[{\"title\":\"Write the report\",\"estimated_minutes\":90,\"priority\":\"medium\"},{\"title\":\"Email the report\",\"estimated_minutes\":10,\"priority\":\"medium\"}]}]}" },
@@ -1924,7 +2105,18 @@ fn route_recurring_to_habits(plan: &mut ParsedPlan, user_text: &str) {
                 }
             }
 
-            if subjects.len() == 1 {
+            // The cue must belong to THIS subject. "Book a haircut Saturday at 11am, and remind me
+            // to stretch every morning" emits one subject (Haircut) while "every morning" belongs to
+            // the stretch clause — collapsing there turned the appointment into a habit AND lost the
+            // routine. When the recurring clause isn't about the lone subject, recover per clause.
+            let clauses = split_clauses(user_text);
+            let cue_is_the_subject = subjects.len() == 1
+                && (clauses.len() <= 1
+                    || clauses.iter().any(|c| recurrence(c).is_some() && shares_significant_word(c, &subjects[0])));
+
+            if subjects.len() == 1 && !cue_is_the_subject {
+                recover_recurring_clauses(plan, user_text);
+            } else if subjects.len() == 1 {
                 // One recurring subject (possibly split across event/update/task) → one habit.
                 let name = plan
                     .events
@@ -2015,7 +2207,7 @@ fn find_weekday_span(text: &str, today: NaiveDate) -> Option<(NaiveDate, i64)> {
 fn word_number(w: &str) -> Option<i64> {
     Some(match w {
         "a" | "an" | "one" => 1,
-        "two" => 2,
+        "couple" | "two" => 2,
         "three" => 3,
         "four" => 4,
         "five" => 5,
@@ -2337,7 +2529,12 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
     // several self-updates of the same event, which makes the single-event span logic below bail.
     // Collapse to one all-day spanning event and drop the redundant updates. (Named-weekday ranges
     // are handled by the block above; this covers numeric spans with an explicit/own date.)
-    if let Some(sp) = span.filter(|_| single_subject && weekday_span.is_none()) {
+    // A trip is ONE subject even when the model names it twice slightly differently ("Staying in
+    // Vietnam" beside "Stay in Vietnam") — which `distinct_titles` counts as two, disabling the span.
+    let one_trip_named_twice = plan.events.len() >= 2
+        && plan.update_events.is_empty()
+        && plan.events.iter().skip(1).all(|e| shares_significant_word(&e.title, &plan.events[0].title));
+    if let Some(sp) = span.filter(|_| (single_subject || one_trip_named_twice) && weekday_span.is_none()) {
         if !plan.events.is_empty() {
             let title = {
                 let ev = &mut plan.events[0];
@@ -2345,10 +2542,21 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
                 if let Some(d) = &date_str {
                     ev.date = Some(d.clone());
                 }
+                // A multi-day span the user gave NO clock time for is an all-day block. The model
+                // still invents one ("18:00–23:59"), and a span carrying a time of day is read
+                // downstream as a daily window — `expand_daily_span` turned a two-week trip into 14
+                // evening slots. Drop the invented time; a genuinely windowed span ("competition,
+                // 3 days, 8am–5pm") states its hours, so `range` is Some and this leaves it alone.
+                if range.is_none() && !mentions_clock_time(user_text) {
+                    ev.start_time = None;
+                    ev.end_time = None;
+                }
                 ev.title.clone()
             };
             let mut seen = HashSet::new();
             plan.events.retain(|e| seen.insert(e.title.to_lowercase()));
+            // The model's re-wording of the same trip is not a second event.
+            plan.events.retain(|e| e.title == title || !shares_significant_word(&e.title, &title));
             plan.update_events.retain(|u| !event_matches(&title, &u.target));
         }
     }
@@ -2398,11 +2606,19 @@ fn backfill_event_fields(plan: &mut ParsedPlan, user_text: &str, today: NaiveDat
             ev.span_days = span; // multi-day trip → all-day, overriding any bogus end time
         }
         if let Some((start_norm, end_raw)) = range {
-            if unset(&ev.start_time) {
+            // The user WROTE a range, so it is authoritative — Rust owns the clock the same way it
+            // owns dates. The model routinely emits times that parse cleanly but bear no relation to
+            // what was typed ("11pm to 1am" → 23:48–23:59, "8pm-11pm" → 20:00–23:59, "12-130" →
+            // 12:00–13:00). This is a lone create, so there is no other event the range could mean.
+            // Only replace on genuine DISAGREEMENT: when the model already says the same clock, its
+            // (normalised, PM-recovered) values are kept exactly as they are.
+            let base = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap().and_time(start_norm);
+            let agrees = ev.start_time.as_deref().and_then(parse_hm) == Some(start_norm)
+                && ev.end_time.as_deref().map(|e| compute_end(base, Some(e))) == Some(compute_end(base, Some(&end_raw)));
+            if !agrees {
                 ev.start_time = Some(start_norm.format("%H:%M").to_string());
-            }
-            if unset(&ev.end_time) {
                 ev.end_time = Some(end_raw);
+                ev.duration_minutes = None; // an invented length must not outrank the stated range
             }
         } else if let Some(d) = duration {
             // An explicit length in the text ("quick 15 minute call", "2 hour meeting at 3pm") is
@@ -2566,12 +2782,20 @@ fn find_deadline_dates(text: &str, today: NaiveDate) -> Vec<NaiveDate> {
         if !matches!(*tok, "due" | "by" | "before" | "deadline") {
             continue;
         }
-        // Look a few tokens ahead for the first day word or explicit date.
+        // Look a few tokens ahead for the first day word or explicit date. An end-of-day marker
+        // ("EOD", "COB", "tonight") counts as today, but only when the window names no actual day —
+        // "due EOD tomorrow" is tomorrow, not today.
+        let (mut dated, mut eod) = (false, false);
         for t in toks.iter().skip(i + 1).take(4) {
             if let Some(d) = resolve_day(today, t).or_else(|| find_explicit_date(t, today)) {
                 out.push(d);
+                dated = true;
                 break;
             }
+            eod |= matches!(*t, "eod" | "cob" | "tonight" | "midnight");
+        }
+        if !dated && eod {
+            out.push(today);
         }
     }
     // Relative deadlines: "in 3 weeks", "within 5 days", "in a week".
@@ -2666,6 +2890,187 @@ fn backfill_task_fields(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
     }
 }
 
+/// **A deadline is not a start time.** "I need to test some stuff for my job due EOD today" says when
+/// work must be FINISHED; the small model reads the day word as a slot and files a fixed event ("Job
+/// Testing"), which — having no real time — lands at our noon default and then gets bumped a whole day
+/// because noon has already passed. Deadline language is the most reliable *deterministic* signal that
+/// something is a task, so classify on it in Rust rather than hoping the model does.
+///
+/// Fires only on the unambiguous shape: a deadline cue + work/obligation language + NO clock time
+/// anywhere + no appointment noun + exactly one plain create (no edits/removes/habits/spans). Then
+/// either demote the fabricated event to a task, or — when the model already emitted the matching task
+/// too — just drop the redundant block. Runs before `backfill_task_fields`, which resolves the
+/// deadline date from the same text. The exact inverse of `promote_timed_work_to_block`: a stated
+/// clock range makes a block, a stated deadline makes a task.
+fn demote_deadline_work_to_task(plan: &mut ParsedPlan, text: &str, today: NaiveDate) {
+    if !plan.remove_events.is_empty() || !plan.habits.is_empty() {
+        return; // a delete or a routine is a different intent entirely
+    }
+    // A clock time makes it a real appointment ("test the build at 4"), whatever else the text says.
+    if mentions_clock_time(text) || !find_time_ranges(text).is_empty() {
+        return;
+    }
+    if !has_deadline_cue(text, today) || !mentions_work(text) || mentions_appointment(text) {
+        return;
+    }
+
+    // --- Shape A: the model filed the deliverable as a fixed block. ---
+    if plan.events.len() == 1 && plan.update_events.is_empty() {
+        // A multi-day span is a trip, not a deliverable.
+        if plan.events[0].span_days.filter(|d| *d >= 1).is_some() {
+            return;
+        }
+        let ev_title = plan.events[0].title.clone();
+        // A deadline-MARKER event for a named deliverable ("Get MIT Hacks application done") belongs
+        // to `collapse_unrequested_decomposition`, which drops it AND asks how long the work will
+        // take. Leave that shape alone so the follow-up question still gets asked.
+        if plan.projects.iter().any(|p| !is_placeholder_title(&p.name) && is_deadline_marker(&ev_title, &p.name)) {
+            return;
+        }
+        // The model sometimes emits BOTH the fabricated block and the real task. Then the block is
+        // simply redundant — keep the task (it carries the estimate/priority) and drop the event.
+        let already_a_task = plan
+            .projects
+            .iter()
+            .flat_map(|p| p.tasks.iter())
+            .any(|t| shares_significant_word(&t.title, &ev_title) || event_matches(&ev_title, &t.title));
+        plan.events.clear();
+        if !already_a_task {
+            push_lone_task(plan, ev_title);
+        }
+        return;
+    }
+
+    // --- Shape B: the model routed the deliverable as a phantom EDIT. ---
+    // "I have to send the client invoices by friday" → `updateEvents:[{match:"Send Client Invoices"}]`
+    // with not one field to change: it edits an event that doesn't exist, `store_plan` finds no
+    // target, and the user's work vanishes silently (observed live on the 7B). An edit that changes
+    // NOTHING is never a real edit — in a deadline-shaped message it is the task, mis-routed.
+    if plan.events.is_empty() && plan.update_events.len() == 1 && plan.projects.iter().all(|p| p.tasks.is_empty()) {
+        let up = &plan.update_events[0];
+        let changes_nothing = up.title.is_none()
+            && up.day.is_none()
+            && up.date.is_none()
+            && up.start_time.is_none()
+            && up.end_time.is_none()
+            && up.duration_minutes.is_none()
+            && up.span_days.is_none()
+            && up.shift_minutes.is_none();
+        if changes_nothing && !is_placeholder_title(&up.target) {
+            let title = up.target.clone();
+            plan.update_events.clear();
+            push_lone_task(plan, title);
+        }
+    }
+}
+
+/// File one recovered task, without fabricating a project header for it — `<NAME>` is the placeholder
+/// `store_plan` files under "No project".
+fn push_lone_task(plan: &mut ParsedPlan, title: String) {
+    let task = ParsedTask { title, ..Default::default() };
+    match plan.projects.first_mut() {
+        Some(proj) => proj.tasks.push(task),
+        None => plan.projects.push(ParsedProject { name: "<NAME>".into(), tasks: vec![task] }),
+    }
+}
+
+/// True when the text names a DEADLINE — when something must be done BY — rather than when it happens.
+/// Deliberately narrow so ordinary prepositions don't trip it: the bare markers ("due", "deadline",
+/// "EOD", "ASAP") count on their own, while "by"/"before" counts only when the next *meaningful* word
+/// is a time reference ("by friday", "by the 15th", "before end of day") — which keeps "picnic by the
+/// lake tomorrow" and "coffee before class" out.
+fn has_deadline_cue(text: &str, today: NaiveDate) -> bool {
+    let lc = text.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "end of day", "end of the day", "end of business", "close of business", "end of the week",
+        "end of the month", "turn in", "hand in", "handed in", "get it in", "no later than",
+    ];
+    if PHRASES.iter().any(|p| lc.contains(p)) {
+        return true;
+    }
+    let toks: Vec<&str> = lc.split(|c: char| !c.is_ascii_alphanumeric() && c != '/').filter(|t| !t.is_empty()).collect();
+    if toks.iter().any(|t| matches!(*t, "due" | "deadline" | "deadlines" | "overdue" | "eod" | "cob" | "asap")) {
+        return true;
+    }
+    // Words that may sit between "by"/"before" and the time reference ("by the end of next friday").
+    const FILLER: &[&str] = &["the", "this", "that", "next", "coming", "end", "of", "close", "start", "my", "our"];
+    for (i, t) in toks.iter().enumerate() {
+        if !matches!(*t, "by" | "before") {
+            continue;
+        }
+        for w in toks.iter().skip(i + 1).take(4) {
+            if FILLER.contains(w) {
+                continue;
+            }
+            let is_time_ref = resolve_day(today, w).is_some()
+                || find_explicit_date(w, today).is_some()
+                || parse_ordinal(w).is_some()
+                || matches!(*w, "eod" | "cob" | "tonight" | "midnight" | "noon" | "week" | "weekend" | "month" | "then");
+            if is_time_ref {
+                return true;
+            }
+            break; // the first meaningful word after "by" wasn't a time — not a deadline
+        }
+    }
+    false
+}
+
+/// Work/obligation language — the other half of the deterministic task signal. A deadline cue alone is
+/// not enough ("stop by tomorrow"); paired with something the user has to DO, the pair is decisive.
+fn mentions_work(text: &str) -> bool {
+    let lc = text.to_lowercase();
+    const PHRASES: &[&str] = &[
+        "need to", "needs to", "have to", "has to", "gotta", "got to", "must ", "should ", "want to",
+        "trying to", "supposed to", "work on", "working on", "get done", "done with", "finish up",
+        "take care of", "deal with", "knock out",
+    ];
+    if PHRASES.iter().any(|p| lc.contains(p)) {
+        return true;
+    }
+    // A deliverable verb or noun. Kept to words that name work, never a thing you attend.
+    const WORDS: &[&str] = &[
+        "test", "tests", "testing", "write", "writing", "finish", "finishing", "submit", "submitting",
+        "send", "sending", "build", "building", "fix", "fixing", "review", "reviewing", "study",
+        "studying", "draft", "drafting", "complete", "completing", "file", "filing", "email",
+        "emailing", "apply", "application", "report", "assignment", "homework", "essay", "paper",
+        "slides", "deck", "code", "debug", "refactor", "deploy", "ship", "pack", "packing", "clean",
+        "cleaning", "read", "reading", "research", "outline", "edit", "editing", "print", "printing",
+        "task", "tasks", "chore", "chores", "errand", "errands", "stuff", "work",
+    ];
+    lc.split(|c: char| !c.is_ascii_alphabetic()).any(|w| WORDS.contains(&w))
+}
+
+/// Nouns that name something you ATTEND at a time rather than work you finish. Their presence vetoes
+/// the demotion — "I need to see the dentist by friday" is still an appointment, not a task block.
+fn mentions_appointment(text: &str) -> bool {
+    let lc = text.to_lowercase();
+    const NOUNS: &[&str] = &[
+        "meeting", "meet ", "meet with", "lunch", "dinner", "breakfast", "brunch", "coffee",
+        "appointment", "appt", "party", "class", "lecture", "seminar", "interview", "flight",
+        "train", "doctor", "dentist", "wedding", "funeral", "concert", "movie", "game", "practice",
+        "rehearsal", "sleepover", "hangout", "exam", "ceremony", "reservation", "visit", "trip",
+        "call with", "standup", "stand-up", "1:1", "one on one", "birthday", "session with",
+    ];
+    NOUNS.iter().any(|n| lc.contains(n))
+}
+
+/// The next :00/:30 boundary at or after `t` — where an event the user never gave a time for lands
+/// when our own noon default has already passed on the day they DID state.
+fn next_half_hour(t: NaiveDateTime) -> NaiveDateTime {
+    let hour = t.date().and_hms_opt(t.hour(), 0, 0).unwrap();
+    // Measure the whole elapsed part of the hour, seconds included: at 21:00:30 the next boundary is
+    // 21:30, not 21:00. Rounding on `minute()` alone returned a time already in the past, and the
+    // caller's "still before now?" bump then moved the event a whole day.
+    let elapsed = t - hour;
+    if elapsed.is_zero() {
+        hour
+    } else if elapsed <= Duration::minutes(30) {
+        hour + Duration::minutes(30)
+    } else {
+        hour + Duration::hours(1)
+    }
+}
+
 /// **Explicitly-timed work is a committed block, not a floating task.** "Work on X from A to B" (or
 /// "study X 2–4pm") names a specific slot, so the user is committing that time — it must become a
 /// fixed calendar block, never a task the auto-scheduler can drift to the start of the work day. The
@@ -2696,18 +3101,25 @@ fn promote_timed_work_to_block(plan: &mut ParsedPlan, text: &str) {
     // verb (already matched above) + a part-of-day word + NO digit anywhere (so any time the model set
     // is certainly invented) + a single plain create with no tasks/edits/removes.
     const PART_OF_DAY: &[&str] = &["morning", "afternoon", "evening", "night", "weekend"];
+    let vague_window = !text.chars().any(|c| c.is_ascii_digit()) && PART_OF_DAY.iter().any(|w| lc.contains(w));
+    // The same thing said with a LENGTH instead of a window: "work on the essay for a couple hours
+    // tomorrow" says how LONG, not WHEN. That is a flexible task with an estimate — but the model
+    // files it as a fixed block at a time it invented (14:32). No clock time in the user's words
+    // means there is no slot to honour, so demote and keep the length as the estimate.
+    let stated_length = find_duration_minutes(text);
+    let duration_only = !mentions_clock_time(text) && stated_length.is_some();
     if ranges.is_empty()
-        && !text.chars().any(|c| c.is_ascii_digit())
-        && PART_OF_DAY.iter().any(|w| lc.contains(w))
+        && (vague_window || duration_only)
         && plan.events.len() == 1
         && plan.update_events.is_empty()
         && plan.remove_events.is_empty()
         && plan.projects.iter().all(|p| p.tasks.is_empty())
     {
         let title = plan.events.remove(0).title;
+        let task = ParsedTask { title: title.clone(), estimated_minutes: stated_length.unwrap_or(60), ..Default::default() };
         match plan.projects.first_mut() {
-            Some(p) => p.tasks.push(ParsedTask { title, ..Default::default() }),
-            None => plan.projects.push(ParsedProject { name: title.clone(), tasks: vec![ParsedTask { title, ..Default::default() }] }),
+            Some(p) => p.tasks.push(task),
+            None => plan.projects.push(ParsedProject { name: title, tasks: vec![task] }),
         }
         return;
     }
@@ -3014,6 +3426,57 @@ fn parse_time_at(chars: &[char], start: usize) -> Option<TimeTok> {
 /// Each is (start normalized to 24h, the verbatim end slice). The end is returned raw so the
 /// existing `compute_end` PM-recovery still handles "12-2" → 14:00, overnight, etc. Both ends of
 /// a matched range are consumed, so "lunch 12-2 and a party 6-10" yields two distinct ranges.
+/// A clock time written compactly, without a colon — "130" = 1:30, "1130" = 11:30. Deliberately NOT
+/// part of `parse_time_at`: a bare 3–4 digit number usually isn't a time at all ("1500 words to
+/// write", "the 2026 season"). It is only unambiguous as the far end of an explicit range, which is
+/// the only place this is called from. `raw` comes back already normalised, since a compact token has
+/// no PM ambiguity left to recover downstream.
+fn parse_compact_time_at(chars: &[char], start: usize) -> Option<TimeTok> {
+    let mut j = start;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    let digits: String = chars[start..j].iter().collect();
+    if !(3..=4).contains(&digits.len()) {
+        return None;
+    }
+    let split = digits.len() - 2;
+    let hour: u32 = digits[..split].parse().ok()?;
+    let minute: u32 = digits[split..].parse().ok()?;
+    if minute > 59 {
+        return None;
+    }
+    // An optional meridian right after it ("130pm").
+    let mut m = j;
+    while m < chars.len() && chars[m] == ' ' {
+        m += 1;
+    }
+    let mut meridian: Option<bool> = None;
+    if m + 1 < chars.len() {
+        let (c0, c1) = (chars[m].to_ascii_lowercase(), chars[m + 1].to_ascii_lowercase());
+        if (c0 == 'a' || c0 == 'p') && c1 == 'm' {
+            meridian = Some(c0 == 'p');
+            m += 2;
+        }
+    }
+    let end = if meridian.is_some() { m } else { j };
+    let valid = match meridian {
+        Some(_) => (1..=12).contains(&hour),
+        None => hour <= 23,
+    };
+    if !valid {
+        return None;
+    }
+    let h24 = match meridian {
+        Some(true) => if hour == 12 { 12 } else { hour + 12 },
+        Some(false) => if hour == 12 { 0 } else { hour },
+        // Same "assume PM for an ambiguous hour" convention as `parse_time_at`.
+        None => if (1..=11).contains(&hour) { hour + 12 } else { hour },
+    };
+    let norm = NaiveTime::from_hms_opt(h24, minute, 0)?;
+    Some(TimeTok { start, end, norm, raw: norm.format("%H:%M").to_string() })
+}
+
 fn find_time_ranges(text: &str) -> Vec<(NaiveTime, String)> {
     let chars: Vec<char> = strip_iso_dates(text).chars().collect();
     let mut toks: Vec<TimeTok> = Vec::new();
@@ -3024,6 +3487,19 @@ fn find_time_ranges(text: &str) -> Vec<(NaiveTime, String)> {
                 i = tok.end;
                 toks.push(tok);
                 continue;
+            }
+            // Colon-less shorthand, but ONLY directly after a range gap that follows a real time
+            // ("lunch 12-130"). Anywhere else a 3–4 digit number is not a clock time.
+            let after_gap = toks
+                .last()
+                .map(|prev| is_range_gap(&chars[prev.end..i].iter().collect::<String>()))
+                .unwrap_or(false);
+            if after_gap {
+                if let Some(tok) = parse_compact_time_at(&chars, i) {
+                    i = tok.end;
+                    toks.push(tok);
+                    continue;
+                }
             }
         }
         i += 1;
@@ -3630,10 +4106,27 @@ pub fn store_plan(conn: &Connection, settings: &Settings, plan: &ParsedPlan) -> 
         }
         match resolve_event(now, ev) {
             Some((mut start, mut end)) => {
-                // No past scheduling: if a timed event resolved to a moment already gone (the model
-                // mis-dated it — e.g. "today 1pm" when it's already the evening), bump it to the next
-                // day at the same time so it lands somewhere the user can actually act on it.
-                while start < now {
+                // No past scheduling. If the user gave a real clock time and it has already gone
+                // (the model mis-dated it — "today 1pm" when it's already evening), bump whole days so
+                // it lands somewhere they can act on. But when the time is OURS — the noon default for
+                // an event the user never timed — moving it a day silently overrides the day they DID
+                // state, which is how an untimed "today" item ended up tomorrow at noon. Keep their
+                // day and slide to the next half hour instead.
+                let user_timed = ev.start_time.as_deref().and_then(parse_hm).is_some();
+                let stated = |s: &Option<String>| s.as_deref().map_or(false, |v| !v.trim().is_empty() && !v.eq_ignore_ascii_case("null"));
+                let all_day = ev.span_days.filter(|d| *d >= 1).is_some();
+                // `date` is only ever set from the user's OWN words (Rust resolves it; the model's
+                // dates are never trusted), so it is not a guess we may overrule.
+                let user_dated = stated(&ev.date);
+                if start < now && !user_timed && !all_day && (user_dated || stated(&ev.day)) {
+                    let dur = end - start;
+                    start = next_half_hour(now);
+                    end = start + dur;
+                }
+                // Bumping only rescues a RELATIVE placement (a day word, or no day at all). "Renew my
+                // passport on the 25th at 10am", said at 8pm on the 25th, must stay on the 25th —
+                // moving it to the 26th silently contradicts the date the user typed.
+                while start < now && !user_dated {
                     start += Duration::days(1);
                     end += Duration::days(1);
                 }
@@ -4149,13 +4642,24 @@ mod tests {
         backfill_event_fields(&mut plan, "meeting friday 2pm to 4pm", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
         assert_eq!(dur(&plan.events[0]), 120);
 
-        // A correct endTime from the model is never overwritten.
+        // A model endTime that CONTRADICTS the typed range loses to the text: "12-2" is 12:00–14:00
+        // however the model ended it. (It used to win, which is how "11pm to 1am" became 23:48–23:59
+        // and "8pm-11pm" became 20:00–23:59 — times that parse cleanly and are pure invention.)
         let mut plan = ParsedPlan {
             events: vec![ev("friday", Some("12:00"), Some("13:00"))],
             ..Default::default()
         };
         backfill_event_fields(&mut plan, "lunch friday 12-2", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
-        assert_eq!(plan.events[0].end_time.as_deref(), Some("13:00"));
+        assert_eq!(dur(&plan.events[0]), 120, "the typed range wins");
+
+        // A model endTime that AGREES with the text is left exactly as it is — no churn, and its
+        // normalised form (not the raw "2") is preserved.
+        let mut plan = ParsedPlan {
+            events: vec![ev("friday", Some("12:00"), Some("14:00"))],
+            ..Default::default()
+        };
+        backfill_event_fields(&mut plan, "lunch friday 12-2", NaiveDate::from_ymd_opt(2026, 6, 8).unwrap());
+        assert_eq!(plan.events[0].end_time.as_deref(), Some("14:00"));
 
         // No range in the text → nothing changes (still the 60-min default).
         let mut plan = ParsedPlan {
@@ -5096,6 +5600,490 @@ mod tests {
         assert!(plan.events.is_empty(), "fabricated-time event removed");
         assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "became one task");
         assert!(plan.projects[0].tasks[0].title.to_lowercase().contains("garage"), "keeps the chore title");
+    }
+
+    #[test]
+    fn deadline_work_becomes_a_task_not_an_event() {
+        // The reported miss: "due EOD today" says when the work must be FINISHED. The model filed a
+        // fixed "Job Testing" event instead — untimed, so it took the noon default and then got bumped
+        // a whole day. It must come out as one task due at the end of today, nothing on the calendar.
+        let conn = crate::db::test_conn();
+        let mut e = ev("today", None, None);
+        e.title = "Job Testing".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "I need to test some stuff for my job due EOD today", d());
+        assert!(plan.events.is_empty(), "no fabricated calendar block");
+        let tasks: Vec<&ParsedTask> = plan.projects.iter().flat_map(|p| p.tasks.iter()).collect();
+        assert_eq!(tasks.len(), 1, "exactly one task");
+        assert_eq!(tasks[0].deadline.as_deref(), Some("2026-06-12T23:59:00"), "due end of today");
+        let out = store_plan(&conn, &Settings::default(), &plan).unwrap();
+        assert!(out.created_event_ids.is_empty(), "nothing on the calendar");
+        assert_eq!(out.created_task_ids.len(), 1, "one task stored");
+        assert!(out.project_names.is_empty(), "no fabricated project header for a lone task");
+    }
+
+    #[test]
+    fn bare_eod_with_no_day_word_means_today() {
+        // "by EOD" names no day — the end of day it means is today's.
+        let task = ParsedTask { title: "Send the report".into(), ..Default::default() };
+        let mut plan =
+            ParsedPlan { projects: vec![ParsedProject { name: "<NAME>".into(), tasks: vec![task] }], ..Default::default() };
+        apply_recovery(&mut plan, "i need to send the report by EOD", d());
+        let dl = plan.projects[0].tasks[0].deadline.clone().unwrap_or_default();
+        assert!(dl.starts_with("2026-06-12T23:59"), "due end of today: {dl}");
+    }
+
+    #[test]
+    fn eod_never_overrides_a_stated_day() {
+        // "due EOD tomorrow" is tomorrow's end of day, not today's — the day word wins over the marker.
+        let task = ParsedTask { title: "Send the report".into(), ..Default::default() };
+        let mut plan =
+            ParsedPlan { projects: vec![ParsedProject { name: "<NAME>".into(), tasks: vec![task] }], ..Default::default() };
+        apply_recovery(&mut plan, "i need to send the report due EOD tomorrow", d());
+        let dl = plan.projects[0].tasks[0].deadline.clone().unwrap_or_default();
+        assert!(dl.starts_with("2026-06-13T23:59"), "due end of tomorrow: {dl}");
+    }
+
+    #[test]
+    fn deadline_demotion_skips_an_explicit_clock_time() {
+        // "by 3pm" names a slot the user committed to — that stays a real block.
+        let mut e = ev("friday", Some("15:00"), None);
+        e.title = "Submit the report".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "I need to submit the report friday by 3pm", d());
+        assert_eq!(plan.events.len(), 1, "an explicit clock time keeps the event");
+    }
+
+    #[test]
+    fn deadline_demotion_skips_an_appointment() {
+        // A thing you ATTEND is an event even with deadline wording around it.
+        let mut e = ev("friday", None, None);
+        e.title = "Dentist".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "I need to see the dentist by friday", d());
+        assert_eq!(plan.events.len(), 1, "an appointment stays an event");
+    }
+
+    #[test]
+    fn by_the_lake_is_not_a_deadline() {
+        // "by" is only a deadline when a TIME follows it — a place must not trip the classifier.
+        assert!(!has_deadline_cue("picnic by the lake tomorrow", d()));
+        assert!(has_deadline_cue("finish the essay by the 15th", d()));
+        assert!(has_deadline_cue("get the slides in by next friday", d()));
+        assert!(has_deadline_cue("i need to test some stuff due EOD today", d()));
+    }
+
+    #[test]
+    fn redundant_deadline_block_drops_when_the_task_exists() {
+        // The model emitted BOTH the block and the real task — keep the task, drop the block.
+        let mut e = ev("today", None, None);
+        e.title = "Job Testing".into();
+        let task = ParsedTask { title: "Test stuff for my job".into(), ..Default::default() };
+        let proj = ParsedProject { name: "<NAME>".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { events: vec![e], projects: vec![proj], ..Default::default() };
+        apply_recovery(&mut plan, "I need to test some stuff for my job due EOD today", d());
+        assert!(plan.events.is_empty(), "redundant block dropped");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 1, "the real task survives");
+    }
+
+    #[test]
+    fn phantom_edit_of_a_deadline_deliverable_becomes_a_task() {
+        // Observed live on the 7B: it routes "send the invoices by friday" as an edit of an event that
+        // does not exist, changing nothing — store_plan finds no target and the work vanishes.
+        let up = UpdateEvent {
+            target: "Send Client Invoices".into(),
+            title: None,
+            day: None,
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+            shift_minutes: None,
+        };
+        let mut plan = ParsedPlan { update_events: vec![up], ..Default::default() };
+        apply_recovery(&mut plan, "I have to send the client invoices by friday", d());
+        assert!(plan.update_events.is_empty(), "the phantom edit is gone");
+        let tasks: Vec<&ParsedTask> = plan.projects.iter().flat_map(|p| p.tasks.iter()).collect();
+        assert_eq!(tasks.len(), 1, "recovered as a task");
+        assert!(tasks[0].deadline.as_deref().unwrap_or_default().starts_with("2026-06-12T23:59"), "due friday");
+    }
+
+    #[test]
+    fn a_real_edit_is_never_turned_into_a_task() {
+        // The same shape but the edit actually CHANGES something — that's a genuine edit, hands off.
+        let up = UpdateEvent {
+            target: "Client sync".into(),
+            title: None,
+            day: Some("friday".into()),
+            start_time: None,
+            end_time: None,
+            duration_minutes: None,
+            date: None,
+            span_days: None,
+            shift_minutes: None,
+        };
+        let mut plan = ParsedPlan { update_events: vec![up], ..Default::default() };
+        apply_recovery(&mut plan, "i need to move the client sync to before friday", d());
+        assert_eq!(plan.update_events.len(), 1, "a real edit survives");
+        assert_eq!(plan.projects.iter().map(|p| p.tasks.len()).sum::<usize>(), 0, "no task fabricated");
+    }
+
+    #[test]
+    fn duplicate_create_folds_so_the_relative_date_applies() {
+        // The 7B emitted "Project Review" twice (today 2pm and tomorrow 2pm). Two events switched off
+        // the single-subject backfill, so "in two weeks" never landed. One subject → +14 days.
+        let mut a = ev("today", Some("14:00"), None);
+        a.title = "Project Review".into();
+        let mut b = ev("tomorrow", Some("14:00"), None);
+        b.title = "Project Review".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "Schedule a project review in two weeks at 2pm.", d());
+        assert_eq!(plan.events.len(), 1, "the duplicate folded away");
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-26"), "two weeks out");
+    }
+
+    #[test]
+    fn overnight_range_survives_a_duplicated_create() {
+        // "Sleepover Saturday 8pm to 8am" — the model crammed the JSON into startTime AND duplicated
+        // the event; the second copy used to overwrite the first through store_plan's merge.
+        let mut a = ev("saturday", Some("20:00','endTime':'24:00"), None);
+        a.title = "Sleepover".into();
+        let mut b = ev("sunday", Some("13:59','endTime':'23:59"), None);
+        b.title = "Sleepover".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "Sleepover Saturday 8pm to 8am.", d());
+        assert_eq!(plan.events.len(), 1, "one sleepover");
+        let (s, e) = resolve_event(Local::now().naive_local(), &plan.events[0]).unwrap();
+        assert_eq!((e - s).num_minutes(), 720, "8pm→8am is 12h");
+    }
+
+    #[test]
+    fn junk_addendum_event_is_dropped_and_its_time_folded() {
+        // "Movie night tonight 11pm to 1am" → the model split the end time into a second "…End Time
+        // Clarification" event. That's a note to itself: drop it, keep its 1am end on the real event.
+        let mut a = ev("today", Some("23:00"), None);
+        a.title = "Movie Night".into();
+        let mut b = ev("today", None, Some("01:00"));
+        b.title = "Movie Night End Time Clarification".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "Movie night tonight 11pm to 1am.", d());
+        assert_eq!(plan.events.len(), 1, "the clarification note is not an event");
+        let (s, e) = resolve_event(Local::now().naive_local(), &plan.events[0]).unwrap();
+        assert_eq!((e - s).num_minutes(), 120, "11pm→1am is 2h");
+    }
+
+    #[test]
+    fn follow_up_addendum_drops_and_the_date_backfills() {
+        // "Renew my passport on the 25th at 10am" → a fabricated "…Follow-Up" sibling. While it stood,
+        // the plan looked multi-event and "the 25th" never reached the real event.
+        let mut a = ev("today", Some("10:00"), None);
+        a.title = "Passport Renewal".into();
+        let mut b = ev("tomorrow", Some("14:30"), None);
+        b.title = "Passport Renewal Follow-Up".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "Renew my passport on the 25th at 10am.", d());
+        assert_eq!(plan.events.len(), 1, "no fabricated follow-up");
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-25"), "lands on the 25th");
+    }
+
+    #[test]
+    fn a_reminder_event_unrelated_to_its_sibling_survives() {
+        // The junk-addendum rule needs a shared subject — an unrelated "Reminder…" is a real event.
+        let mut a = ev("friday", Some("14:00"), None);
+        a.title = "Dentist".into();
+        let mut b = ev("friday", Some("09:00"), None);
+        b.title = "Reminder to take the forms".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "Dentist friday at 2pm and a reminder to take the forms at 9.", d());
+        assert_eq!(plan.events.len(), 2, "both events kept");
+    }
+
+    #[test]
+    fn a_cancel_clause_does_not_swallow_unrelated_creates() {
+        // The brain-dump miss: one "cancel …" clause was reclassifying EVERY create as a removal,
+        // silently deleting the dentist appointment the user had just asked for.
+        let mut dentist = ev("monday", Some("09:00"), None);
+        dentist.title = "Dentist".into();
+        let task = ParsedTask { title: "Finish the budget report".into(), ..Default::default() };
+        let proj = ParsedProject { name: "<NAME>".into(), tasks: vec![task] };
+        let mut plan = ParsedPlan { events: vec![dentist], projects: vec![proj], ..Default::default() };
+        apply_recovery(
+            &mut plan,
+            "Ok my week: dentist Monday at 9am, finish the budget report (about 3 hours) by Wednesday, go for a run every morning, and cancel the old standup.",
+            d(),
+        );
+        assert_eq!(plan.events.len(), 1, "the dentist survives the cancel clause");
+        assert!(plan.events[0].title.to_lowercase().contains("dent"), "and it's still the dentist");
+        assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("standup")), "the standup is removed");
+        assert!(plan.habits.iter().any(|h| h.name.to_lowercase().contains("run")), "the run habit is recovered");
+    }
+
+    #[test]
+    fn a_pure_cancellation_still_reclassifies_creates() {
+        // The single-clause blanket rule must survive the scoping fix.
+        let mut e = ev("friday", Some("10:00"), None);
+        e.title = "Meeting".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "cancel all my meetings friday", d());
+        assert!(plan.events.is_empty(), "nothing created by a pure cancellation");
+        assert!(!plan.remove_events.is_empty(), "reclassified as a removal");
+    }
+
+    #[test]
+    fn dropped_cancellation_is_recovered_from_the_text() {
+        // "Cancel the old sync and schedule a team lunch Friday at noon" — the model keeps the create
+        // and forgets the removal. The clause names its target in plain words, so take it from there.
+        let mut lunch = ev("friday", Some("12:00"), None);
+        lunch.title = "Team Lunch".into();
+        let mut plan = ParsedPlan { events: vec![lunch], ..Default::default() };
+        apply_recovery(&mut plan, "Cancel the old sync and schedule a team lunch Friday at noon.", d());
+        assert_eq!(plan.events.len(), 1, "the lunch is still created");
+        assert!(plan.remove_events.iter().any(|r| r.to_lowercase().contains("old sync")), "removal recovered: {:?}", plan.remove_events);
+    }
+
+    #[test]
+    fn a_vague_cancel_is_not_turned_into_a_removal() {
+        // "cancel it" names nothing — inventing a needle from that would be a guess.
+        let mut plan = ParsedPlan::default();
+        apply_recovery(&mut plan, "cancel it", d());
+        assert!(plan.remove_events.is_empty(), "no needle invented");
+    }
+
+    #[test]
+    fn recurrence_cue_in_another_clause_does_not_convert_the_event() {
+        // "Book a haircut Saturday at 11am, and remind me to stretch every morning" — the "every
+        // morning" belongs to the stretch clause. Collapsing on it turned the haircut into a habit
+        // and lost the routine entirely.
+        let mut haircut = ev("saturday", Some("11:00"), None);
+        haircut.title = "Haircut".into();
+        let mut plan = ParsedPlan { events: vec![haircut], ..Default::default() };
+        apply_recovery(&mut plan, "Book a haircut Saturday at 11am, and remind me to stretch every morning.", d());
+        assert_eq!(plan.events.len(), 1, "the haircut is still an appointment");
+        assert!(plan.events[0].title.to_lowercase().contains("haircut"), "and still a haircut");
+        assert!(plan.habits.iter().any(|h| h.name.to_lowercase().contains("stretch")), "the stretch habit is recovered: {:?}", plan.habits);
+    }
+
+    #[test]
+    fn a_single_recurring_subject_still_collapses_to_one_habit() {
+        // The guard must not break the ordinary case: the cue IS about the only subject.
+        let mut e = ev("today", Some("16:00"), Some("17:00"));
+        e.title = "Practice violin".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "practice violin every day from 4pm to 5pm", d());
+        assert!(plan.events.is_empty(), "the one-off is folded into the habit");
+        assert_eq!(plan.habits.len(), 1, "exactly one habit");
+    }
+
+    #[test]
+    fn one_trip_named_twice_is_a_single_span() {
+        // The model named the same trip two ways ("Staying in Vietnam" / "Stay in Vietnam"), which read
+        // as two subjects and disabled the multi-day span.
+        let mut a = ev("today", Some("18:00','endTime':'23:59"), None);
+        a.title = "Staying in Vietnam".into();
+        let mut b = ev("tomorrow", Some("6:00','endTime':'7:45"), None);
+        b.title = "Stay in Vietnam".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "From 6/12 I'll be staying in Vietnam for two weeks.", d());
+        assert_eq!(plan.events.len(), 1, "one trip");
+        assert_eq!(plan.events[0].span_days, Some(14), "two weeks");
+        assert_eq!(plan.events[0].date.as_deref(), Some("2026-06-12"), "starting 6/12");
+    }
+
+    #[test]
+    fn a_timeless_trip_span_is_all_day_not_fourteen_evenings() {
+        // The model invents "18:00–23:59" for a trip it was given no hours for. A span carrying a time
+        // of day is read as a DAILY window, so the two-week trip came out as 14 evening slots.
+        let conn = crate::db::test_conn();
+        let mut a = ev("today", Some("18:00','endTime':'23:59"), None);
+        a.title = "Staying in Vietnam".into();
+        let mut b = ev("tomorrow", Some("18:00','endTime':'23:59"), None);
+        b.title = "Stay in Vietnam".into();
+        let mut plan = ParsedPlan { events: vec![a, b], ..Default::default() };
+        apply_recovery(&mut plan, "From 6/12 I'll be staying in Vietnam for two weeks.", d());
+        assert_eq!(plan.events.len(), 1, "one trip");
+        assert_eq!(plan.events[0].span_days, Some(14), "two weeks");
+        assert!(plan.events[0].start_time.is_none(), "the invented time is gone");
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let stored = crate::db::list_events(&conn).unwrap();
+        assert_eq!(stored.len(), 1, "one all-day block, not one per day: {stored:?}");
+        let (s, e) = (parse_dt(&stored[0].start).unwrap(), parse_dt(&stored[0].end).unwrap());
+        assert_eq!((e - s).num_days(), 14, "spans two weeks");
+    }
+
+    #[test]
+    fn a_windowed_multi_day_event_keeps_its_hours() {
+        // The other side: when the user DOES state the hours, the daily window must survive.
+        let mut e = ev("today", Some("08:00"), Some("17:00"));
+        e.title = "Robotics competition".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "Robotics competition for 3 days, 8am to 5pm.", d());
+        assert_eq!(plan.events[0].span_days, Some(3), "three days");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("08:00"), "stated hours kept");
+    }
+
+    #[test]
+    fn an_explicit_date_is_never_bumped_off_that_date() {
+        // "on the 25th at 10am" said late on the 25th used to slide to the 26th, contradicting the
+        // date the user typed. A stated date is theirs; only a relative placement may be rescued.
+        let conn = crate::db::test_conn();
+        let today = Local::now().naive_local().date();
+        let mut e = ev("today", Some("00:05"), None); // a time that is past for all but 5 minutes a day
+        e.title = "Passport Renewal".into();
+        e.date = Some(today.format("%Y-%m-%d").to_string());
+        e.day = None;
+        let plan = ParsedPlan { events: vec![e], ..Default::default() };
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let stored = crate::db::list_events(&conn).unwrap().into_iter().next().unwrap();
+        assert!(stored.start.starts_with(&today.format("%Y-%m-%d").to_string()), "stayed on the stated date: {}", stored.start);
+    }
+
+    #[test]
+    fn an_edit_verb_create_becomes_an_edit() {
+        // "Move lunch to 1pm and add a coffee break at 3pm" → the model emits TWO creates, so the real
+        // lunch never moves and a duplicate appears. The move clause names its subject: that's an edit.
+        let mut lunch = ev("today", Some("13:00"), None);
+        lunch.title = "Lunch with mom".into(); // the title parroted from the few-shot examples
+        let mut coffee = ev("today", Some("15:00"), None);
+        coffee.title = "Coffee Break".into();
+        let mut plan = ParsedPlan { events: vec![lunch, coffee], ..Default::default() };
+        apply_recovery(&mut plan, "Move lunch to 1pm and add a coffee break at 3pm.", d());
+        assert_eq!(plan.update_events.len(), 1, "the move became an edit");
+        assert_eq!(plan.update_events[0].start_time.as_deref(), Some("13:00"), "carrying the new time");
+        assert_eq!(plan.events.len(), 1, "the coffee break is still a create");
+        assert!(plan.events[0].title.to_lowercase().contains("coffee"), "and it's the coffee break");
+    }
+
+    #[test]
+    fn a_plain_create_is_not_turned_into_an_edit() {
+        // No edit verb leading a clause → nothing is reclassified.
+        let mut e = ev("friday", Some("14:00"), None);
+        e.title = "Dentist".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "Dentist friday at 2pm.", d());
+        assert_eq!(plan.events.len(), 1, "still a create");
+        assert!(plan.update_events.is_empty(), "no edit invented");
+    }
+
+    #[test]
+    fn cancel_all_of_a_kind_sweeps_every_instance() {
+        // The model answers "Cancel all my sleepovers" by naming ONE off the calendar listing, whose
+        // needle then matches only that event. "all" means all — add the user's own noun as a needle.
+        let mut plan = ParsedPlan { remove_events: vec!["Sleepover at Jake's".into()], ..Default::default() };
+        apply_recovery(&mut plan, "Cancel all my sleepovers.", d());
+        assert!(
+            plan.remove_events.iter().any(|r| r.eq_ignore_ascii_case("sleepover")),
+            "the bare noun sweeps them all: {:?}",
+            plan.remove_events
+        );
+    }
+
+    #[test]
+    fn a_named_single_cancellation_is_not_widened() {
+        // Without "all"/"every" the user named ONE thing — never broaden that into a sweep.
+        let mut plan = ParsedPlan { remove_events: vec!["Sleepover at Jake's".into()], ..Default::default() };
+        apply_recovery(&mut plan, "Cancel the sleepover at Jake's.", d());
+        assert_eq!(plan.remove_events.len(), 1, "still just the one: {:?}", plan.remove_events);
+    }
+
+    #[test]
+    fn a_written_range_overrides_the_models_invented_times() {
+        // "movie night tonight 11pm to 1am" came back as 23:48–23:59 — times that parse cleanly and
+        // are pure invention. What the user typed wins.
+        let mut e = ev("today", Some("23:48"), Some("23:59"));
+        e.title = "Movie Night".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "movie night tonight 11pm to 1am", d());
+        let (s, en) = resolve_event(Local::now().naive_local(), &plan.events[0]).unwrap();
+        assert_eq!((en - s).num_minutes(), 120, "11pm→1am is 2h");
+        assert_eq!(s.format("%H:%M").to_string(), "23:00", "starts at 11pm");
+    }
+
+    #[test]
+    fn a_written_range_survives_emoji_and_shorthand() {
+        // "8pm-11pm" → the model ended it at 23:59; "12-130" → it ended at 13:00.
+        let mut party = ev("saturday", Some("20:00"), Some("23:59"));
+        party.title = "Birthday Party".into();
+        let mut plan = ParsedPlan { events: vec![party], ..Default::default() };
+        apply_recovery(&mut plan, "🎉 birthday party 🎂 saturday 8pm-11pm at my place 🍕", d());
+        let (s, en) = resolve_event(Local::now().naive_local(), &plan.events[0]).unwrap();
+        assert_eq!((en - s).num_minutes(), 180, "8pm→11pm is 3h");
+
+        let mut lunch = ev("friday", Some("12:00"), Some("13:00"));
+        lunch.title = "Lunch with Bri".into();
+        let mut plan2 = ParsedPlan { events: vec![lunch], ..Default::default() };
+        apply_recovery(&mut plan2, "lunch w bri fri 12-130", d());
+        let (s2, e2) = resolve_event(Local::now().naive_local(), &plan2.events[0]).unwrap();
+        assert_eq!((e2 - s2).num_minutes(), 90, "12:00→1:30 is 90m");
+    }
+
+    #[test]
+    fn a_stated_length_with_no_clock_time_is_a_task() {
+        // "work on the essay for a couple hours tomorrow" says how long, not when — a task estimated
+        // at 120 minutes, not a fixed block at a time the model made up.
+        let mut e = ev("tomorrow", Some("14:32"), Some("16:32"));
+        e.title = "Essay Work".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "work on the essay for a couple hours tomorrow", d());
+        assert!(plan.events.is_empty(), "no invented block");
+        let tasks: Vec<&ParsedTask> = plan.projects.iter().flat_map(|p| p.tasks.iter()).collect();
+        assert_eq!(tasks.len(), 1, "one task");
+        assert_eq!(tasks[0].estimated_minutes, 120, "a couple hours");
+    }
+
+    #[test]
+    fn a_stated_length_with_a_clock_time_stays_a_block() {
+        // "2 hour meeting at 3pm" names a slot — that is still a real calendar block.
+        let mut e = ev("today", Some("15:00"), None);
+        e.title = "Work on the deck".into();
+        let mut plan = ParsedPlan { events: vec![e], ..Default::default() };
+        apply_recovery(&mut plan, "work on the deck for 2 hours at 3pm today", d());
+        assert_eq!(plan.events.len(), 1, "a stated clock time keeps the block");
+    }
+
+    #[test]
+    fn compact_range_ends_parse_but_bare_numbers_do_not() {
+        // "12-130" is 12:00–1:30. A 3–4 digit number anywhere else is not a clock time.
+        assert_eq!(find_time_ranges("lunch w bri fri 12-130").len(), 1);
+        let (s, e) = find_time_ranges("lunch w bri fri 12-130").remove(0);
+        assert_eq!(s.format("%H:%M").to_string(), "12:00");
+        assert_eq!(e, "13:30", "1:30pm, normalised");
+        // Compact tokens follow the SAME "assume PM for an ambiguous hour" convention as every other
+        // time in the parser — "9-1130" is an evening range, exactly as "9-11:30" already was.
+        assert_eq!(find_time_ranges("9-1130").remove(0).1, "23:30");
+        assert_eq!(find_time_ranges("9-1130am").remove(0).1, "11:30", "an explicit meridian wins");
+        assert!(find_time_ranges("i have 1500 words to write").is_empty(), "a bare number is not a time");
+        assert!(find_time_ranges("the 2026 season").is_empty(), "nor is a year");
+    }
+
+    #[test]
+    fn next_half_hour_rounds_up() {
+        let dt = |h, m| NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(h, m, 0).unwrap();
+        let sec = |h, m, s| NaiveDate::from_ymd_opt(2026, 6, 12).unwrap().and_hms_opt(h, m, s).unwrap();
+        assert_eq!(next_half_hour(dt(14, 0)), dt(14, 0));
+        assert_eq!(next_half_hour(sec(14, 0, 30)), dt(14, 30), "seconds count: never round back into the past");
+        assert_eq!(next_half_hour(sec(14, 30, 1)), dt(15, 0));
+        assert_eq!(next_half_hour(dt(14, 1)), dt(14, 30));
+        assert_eq!(next_half_hour(dt(14, 30)), dt(14, 30));
+        assert_eq!(next_half_hour(dt(14, 31)), dt(15, 0));
+    }
+
+    #[test]
+    fn untimed_today_event_stays_on_today() {
+        // The user stated the day but no time, so the noon start is OURS. Once noon passes, slide to
+        // the next half hour — never silently move their event to tomorrow.
+        let now = Local::now().naive_local();
+        if now.hour() >= 23 {
+            return; // within the last hour of the day the next free half hour genuinely is tomorrow
+        }
+        let conn = crate::db::test_conn();
+        let mut e = ev("today", None, None);
+        e.title = "Open enrollment".into();
+        let plan = ParsedPlan { events: vec![e], ..Default::default() };
+        store_plan(&conn, &Settings::default(), &plan).unwrap();
+        let stored = crate::db::list_events(&conn).unwrap().into_iter().next().unwrap();
+        let today = now.format("%Y-%m-%d").to_string();
+        assert!(stored.start.starts_with(&today), "stayed on today: {}", stored.start);
     }
 
     #[test]
