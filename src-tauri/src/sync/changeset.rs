@@ -268,6 +268,13 @@ fn build_fields(conn: &Connection, spec: &TableSpec, row: &HashMap<String, Value
         }
         map.insert(col.clone(), value_to_json(val));
     }
+    // Keychain-backed fields have no column: read them from the OS keychain and attach them to the
+    // payload. Absent (or an unavailable keychain) simply means "nothing to share" — never an error.
+    for (field, kc_key) in spec.secrets {
+        if let Some(v) = crate::secrets::get(kc_key) {
+            map.insert((*field).to_string(), Json::from(v));
+        }
+    }
     Ok(map)
 }
 
@@ -372,6 +379,13 @@ fn apply_delete(conn: &Connection, ch: &Change) -> Result<bool> {
         Some(rh) if rh.as_str() >= ch.hlc.as_str() => Ok(false), // a newer local update wins
         Some(_) => {
             conn.execute(&format!("DELETE FROM {table} WHERE uuid = ?1"), params![ch.uuid])?;
+            // Deleting the row must also drop any keychain-backed secret it carried, otherwise
+            // disconnecting Google on one device would leave the refresh token on every other.
+            if let Some(spec) = schema::spec(table) {
+                for (_, kc_key) in spec.secrets {
+                    crate::secrets::clear(kc_key);
+                }
+            }
             Ok(true)
         }
         None => Ok(false), // nothing to delete locally; tombstone recorded for any future upsert
@@ -422,6 +436,15 @@ fn apply_upsert(conn: &Connection, ch: &Change, force: bool) -> Result<Option<bo
     let mut cols: Vec<String> = Vec::new();
     let mut vals: Vec<Value> = Vec::new();
     for (col, jval) in &ch.fields {
+        // Keychain-backed field: write it to the OS keychain, never to a column. Reached only after
+        // the LWW checks above, so an older peer can't clobber a secret we already hold.
+        if let Some((_, kc_key)) = spec.secrets.iter().find(|(f, _)| f == col) {
+            match jval.as_str() {
+                Some(v) => { crate::secrets::set(kc_key, v); }
+                None => crate::secrets::clear(kc_key),
+            }
+            continue;
+        }
         // Simple FK.
         if let Some((_, ref_table)) = spec.fks.iter().find(|(c, _)| c == col) {
             match resolve_ref(conn, ref_table, jval)? {
@@ -534,6 +557,146 @@ mod tests {
         ).unwrap();
         conn.last_insert_rowid()
     }
+    /// Pairing a second device must carry the whole Google setup across — including the refresh
+    /// token, which has no SQLite column and travels via the OS keychain (`TableSpec::secrets`).
+    #[test]
+    fn pairing_a_device_carries_the_google_link_and_its_refresh_token() {
+        let _guard = crate::secrets::test_store::exclusive();
+        let a = db::test_conn();
+        let b = db::test_conn();
+
+        // Device A connects Google: the link row + the token in A's keychain.
+        db::save_google_link(&a, &crate::model::GoogleLink {
+            email: "me@example.com".into(),
+            calendar_id: "primary".into(),
+            client_id: "cid.apps.googleusercontent.com".into(),
+            client_secret: "csecret".into(),
+        }).unwrap();
+        crate::secrets::set(db::KC_REFRESH, "refresh-abc");
+
+        let mut clock = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        let link = changes.iter().find(|c| c.table == "google_link").expect("link is synced");
+        assert_eq!(link.fields["email"], json!("me@example.com"));
+        assert_eq!(link.fields["client_secret"], json!("csecret"));
+        assert_eq!(link.fields["refresh_token"], json!("refresh-abc"), "token rides the changeset");
+
+        // The token must never have been read from — or written to — a column.
+        assert!(
+            !a.prepare("SELECT * FROM google_link").unwrap()
+                .column_names().contains(&"refresh_token"),
+            "the refresh token has no SQLite column",
+        );
+
+        // Device B applies. Clear the keychain first so we prove B *receives* the token.
+        crate::secrets::clear(db::KC_REFRESH);
+        let mut clock_b = HlcState::default();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).unwrap();
+
+        let got = db::get_google_link(&b).unwrap().expect("B has the link");
+        assert_eq!(got.email, "me@example.com");
+        assert_eq!(got.client_id, "cid.apps.googleusercontent.com");
+        assert_eq!(crate::secrets::get(db::KC_REFRESH).as_deref(), Some("refresh-abc"));
+
+        // …and B is now genuinely connected, with its OWN empty pull cursor.
+        assert!(db::adopt_google_link(&b).unwrap(), "adoption changed local state");
+        let acct = db::get_google_account(&b).unwrap().expect("B has an account");
+        assert_eq!(acct.email, "me@example.com");
+        assert_eq!(acct.sync_token, None, "B does its own first full pull");
+        assert!(db::get_settings(&b).unwrap().google_connected);
+        assert_eq!(db::get_settings(&b).unwrap().google_client_secret, "csecret");
+        assert!(!db::adopt_google_link(&b).unwrap(), "adoption is idempotent");
+    }
+
+    /// Disconnecting Google on one device must not leave the token sitting on the others.
+    #[test]
+    fn disconnecting_on_one_device_retracts_the_link_everywhere() {
+        let _guard = crate::secrets::test_store::exclusive();
+        let a = db::test_conn();
+        let b = db::test_conn();
+        let link = crate::model::GoogleLink {
+            email: "me@example.com".into(),
+            calendar_id: "primary".into(),
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+        };
+        db::save_google_link(&a, &link).unwrap();
+        crate::secrets::set(db::KC_REFRESH, "refresh-abc");
+
+        let mut clock = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        let mut clock_b = HlcState::default();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).unwrap();
+        db::adopt_google_link(&b).unwrap();
+        assert!(db::get_google_account(&b).unwrap().is_some());
+
+        // A disconnects → the row is deleted → the tombstone reaches B.
+        db::delete_google_link(&a).unwrap();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 3_000).unwrap();
+        assert!(changes.iter().any(|c| c.table == "google_link" && c.op == Op::Delete));
+        apply_changes(&b, &mut clock_b, 4_000, &changes).unwrap();
+
+        assert!(db::get_google_link(&b).unwrap().is_none());
+        assert_eq!(crate::secrets::get(db::KC_REFRESH), None, "token cleared from the peer's keychain");
+        assert!(db::adopt_google_link(&b).unwrap(), "local connection is torn down to match");
+        assert!(db::get_google_account(&b).unwrap().is_none());
+        assert!(!db::get_settings(&b).unwrap().google_connected);
+    }
+
+    /// Both devices connected Google *before* they were paired, so each brought its own link row.
+    /// The session must reconcile rather than blow up, and both sides must keep the SAME link.
+    #[test]
+    fn two_independently_connected_devices_converge_on_one_link() {
+        let _guard = crate::secrets::test_store::exclusive();
+        let a = db::test_conn();
+        let b = db::test_conn();
+        let mk = |email: &str| crate::model::GoogleLink {
+            email: email.into(),
+            calendar_id: "primary".into(),
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+        };
+        db::save_google_link(&a, &mk("a@example.com")).unwrap();
+        db::save_google_link(&b, &mk("b@example.com")).unwrap();
+        crate::secrets::set(db::KC_REFRESH, "refresh-abc");
+
+        // Exchange in both directions, as a real session does.
+        let (mut ca, mut cb) = (HlcState::default(), HlcState::default());
+        let from_a = build_outbox(&a, "nodeA", &mut ca, 1_000).unwrap();
+        let from_b = build_outbox(&b, "nodeB", &mut cb, 1_100).unwrap();
+        apply_changes(&b, &mut cb, 2_000, &from_a).expect("a peer's link must not break the session");
+        apply_changes(&a, &mut ca, 2_000, &from_b).expect("a peer's link must not break the session");
+
+        db::adopt_google_link(&a).unwrap();
+        db::adopt_google_link(&b).unwrap();
+        let (la, lb) = (db::get_google_link(&a).unwrap(), db::get_google_link(&b).unwrap());
+        assert_eq!(
+            la.map(|l| l.email),
+            lb.map(|l| l.email),
+            "both devices settle on the same Google account",
+        );
+        assert_eq!(scalar_i64(&a, "SELECT COUNT(*) FROM google_link"), 1, "losers pruned");
+        assert_eq!(scalar_i64(&b, "SELECT COUNT(*) FROM google_link"), 1, "losers pruned");
+    }
+
+    /// Without the shared token there is nothing to authenticate with, so don't fake a connection.
+    #[test]
+    fn a_link_without_its_token_does_not_connect_the_device() {
+        let _guard = crate::secrets::test_store::exclusive();
+        let b = db::test_conn();
+        db::save_google_link(&b, &crate::model::GoogleLink {
+            email: "me@example.com".into(),
+            calendar_id: "primary".into(),
+            client_id: "cid".into(),
+            client_secret: "csecret".into(),
+        }).unwrap();
+
+        assert!(db::adopt_google_link(&b).unwrap(), "the OAuth client still propagates");
+        assert!(db::get_google_account(&b).unwrap().is_none(), "but no account without a token");
+        assert!(!db::get_settings(&b).unwrap().google_connected);
+        assert_eq!(db::get_settings(&b).unwrap().google_client_id, "cid");
+    }
+
     fn insert_note(conn: &Connection, content: &str, parent: Option<i64>) -> i64 {
         conn.execute(
             "INSERT INTO notes(content, parent_id, created_at, updated_at) VALUES(?1, ?2, 't', 't')",

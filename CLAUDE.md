@@ -104,14 +104,14 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 ## Local data (outside the repo, gitignored) — app-data dir `com.pushin.app/`
 `models/*.gguf` (downloaded models) · `bin/llama-server` (+libs, auto-downloaded engine) · `pushin.db` (SQLite).
 
-## Current status (released **v0.6.5**; `release.yml` builds installers for all platforms)
+## Current status (released **v0.8.1**; `release.yml` builds installers for all platforms)
 Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `docs/notes/DEVLOG.md`. Headline:
-- **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified).
+- **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
 - **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified).
 - **Context Engine + execution loop:** `entity_index` recall spine feeding planner auto-recall + `vault_ask`; People/CRM; keyword auto-labeling; Daily Briefing + Cmd-K "Run" bar; Focus timer + adaptive scheduler; Meeting Companion; hardened public booking page.
-- **Device sync (built, live-unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. Leaf logic unit-tested; live mesh only provable on two machines. Iroh pinned **0.90**.
+- **Device sync (pairing proven on loopback, cross-machine still unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. `two_real_iroh_endpoints_pair_and_converge` runs a real ticket→dial→session between two endpoints in one process; only NAT traversal is untested. Iroh pinned **0.90**.
 - **Shell polish:** frameless `TitleBar`, opening animation, in-app auto-update (v0.5.0+, signed).
-- **Tested:** Rust `cargo test --lib` (~188) + httpmock, Vitest (~71) + IPC/bridge contract tests, Playwright E2E (CI), live `llm_eval`/`model_battery` (~90%, manual).
+- **Tested:** Rust `cargo test --lib` (**304**) + httpmock, Vitest (**80**, 19 files) + IPC/bridge contract tests, Playwright E2E (**4**), live `llm_eval`/`model_battery` (~90%, manual).
 - **Repo:** GitHub `Ilakkiyan/Pushin`; `main` default; releases are version tags.
 
 ## Working style with this user

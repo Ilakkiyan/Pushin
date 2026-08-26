@@ -98,6 +98,18 @@ pub(crate) mod test_store {
     use std::sync::Mutex;
 
     static MEM: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    static GUARD: Mutex<()> = Mutex::new(());
+
+    /// Take the store for the duration of one test, starting from a clean slate.
+    ///
+    /// The store is process-global, so tests that use it must not run concurrently — without this
+    /// an [`enable`] in one test would wipe another's secrets mid-run. Hold the returned guard for
+    /// the whole test. Poison is ignored: a panicking test shouldn't wedge every later one.
+    pub fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        let g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        enable();
+        g
+    }
 
     pub fn enable() {
         *MEM.lock().unwrap() = Some(HashMap::new());
@@ -137,7 +149,7 @@ mod tests {
     // One test owns the global in-memory store for its lifetime (avoids races with parallel tests).
     #[test]
     fn store_roundtrip_clear_and_empty_value() {
-        test_store::enable();
+        let _guard = test_store::exclusive();
 
         assert_eq!(get("google_token"), None, "absent secret reads as None");
         assert!(set("google_token", "ya29.secret"), "storing a value succeeds");

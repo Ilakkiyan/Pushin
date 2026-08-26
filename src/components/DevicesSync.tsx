@@ -54,7 +54,7 @@ export default function DevicesSync() {
 
   const createInvite = async () => {
     setBusy(true);
-    setMsg("Creating an invite…");
+    setMsg("Creating an invite — finding a reachable network path…");
     try {
       const t = await api.syncCreateInvite();
       setInvite(t);
@@ -71,7 +71,7 @@ export default function DevicesSync() {
     run(async () => {
       await api.syncJoin(joinText.trim());
       setJoinText("");
-    }, "Joining the network…");
+    }, "Joining the network — reaching the other device can take up to a minute…");
 
   const copyInvite = () => {
     navigator.clipboard.writeText(invite).then(() => {

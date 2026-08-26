@@ -84,6 +84,24 @@ export default function SettingsPane() {
   const syncing = useStore((s) => s.syncing);
   const pages = useStore((s) => s.pages);
   const [form, setForm] = useState<Settings>(settings);
+  // Another of your devices can connect (or disconnect) Google for this one: device sync replicates
+  // the shared Google link and adopts it locally. Mirror just those fields back into the form when
+  // the store's copy changes, so an open Settings pane flips to "Connected" without a reload — and
+  // without clobbering edits in progress elsewhere in the form.
+  useEffect(() => {
+    setForm((f) =>
+      f.googleConnected === settings.googleConnected &&
+      f.googleClientId === settings.googleClientId &&
+      f.googleClientSecret === settings.googleClientSecret
+        ? f
+        : {
+            ...f,
+            googleConnected: settings.googleConnected,
+            googleClientId: settings.googleClientId,
+            googleClientSecret: settings.googleClientSecret,
+          },
+    );
+  }, [settings.googleConnected, settings.googleClientId, settings.googleClientSecret]);
   const [saved, setSaved] = useState(false);
   const [modelMsg, setModelMsg] = useState("");
   // Which chat models are downloaded, so switching to an un-downloaded one fetches it first (a switch to a

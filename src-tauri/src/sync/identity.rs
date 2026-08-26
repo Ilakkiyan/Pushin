@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn node_key_is_stable_and_mesh_lifecycle_works() {
-        secrets::test_store::enable();
+        let _guard = secrets::test_store::exclusive();
         // First call generates + persists; second returns the same bytes.
         let k1 = load_or_create_node_key();
         let k2 = load_or_create_node_key();

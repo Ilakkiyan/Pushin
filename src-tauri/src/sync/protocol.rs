@@ -8,8 +8,14 @@
 //!
 //! ```text
 //! initiator → responder:  Hello, Pull, Push
-//! responder → initiator:  Hello, Push, Pull
+//! responder → initiator:  Hello, Push, Pull, Bye
 //! ```
+//!
+//! The trailing `Bye` is what makes the session safe to tear down. The responder's last act would
+//! otherwise be a *read*, and the initiator closes the QUIC connection the moment `run_session`
+//! returns — a close that discards unacknowledged stream data, killing the responder's final read.
+//! Ending on a responder→initiator message means the initiator only closes once the responder has
+//! applied everything.
 //!
 //! The [`SyncStore`] trait is the seam to the database; production wires it to the SQLite changeset
 //! functions, tests wire it to two in-memory DBs to prove end-to-end convergence over a real stream.
@@ -30,6 +36,8 @@ enum Msg {
     Pull { since: String },
     /// A batch of changes, with the highest HLC contained (the receiver's new watermark).
     Push { changes: Vec<Change>, max_hlc: String },
+    /// Responder → initiator, last: "I have applied your Push; you may close the connection."
+    Bye,
 }
 
 /// The database seam the protocol drives. Implementations do short, synchronous, locked DB ops —
@@ -136,17 +144,25 @@ where
             _ => bail!("expected Pull"),
         }
     }
+    async fn recv_bye<R: AsyncRead + Unpin>(r: &mut R) -> Result<()> {
+        match read_msg(r).await? {
+            Msg::Bye => Ok(()),
+            _ => bail!("expected Bye"),
+        }
+    }
 
     if initiator {
         write_msg(&mut w, &do_pull(store)).await?; // Pull
         recv_push(store, &mut r, &peer, &mut stats).await?; // Push
         let since = recv_pull(&mut r).await?; // their Pull
         serve_pull(store, &mut w, &since, &mut stats).await?; // our Push
+        recv_bye(&mut r).await?; // they applied it — safe to close
     } else {
         let since = recv_pull(&mut r).await?; // their Pull
         serve_pull(store, &mut w, &since, &mut stats).await?; // our Push
         write_msg(&mut w, &do_pull(store)).await?; // Pull
         recv_push(store, &mut r, &peer, &mut stats).await?; // Push
+        write_msg(&mut w, &Msg::Bye).await?; // release the initiator
     }
 
     // Gracefully finish the write side so the peer's final read sees clean EOF, not a reset
@@ -266,5 +282,89 @@ mod tests {
         let (br, bw) = tokio::io::split(c2);
         let (ra, rb) = tokio::join!(run_session(&a, true, ar, aw), run_session(&b, false, br, bw));
         assert!(ra.is_err() || rb.is_err(), "mismatched mesh secret must fail the session");
+    }
+
+    /// The transport-level counterpart to the duplex test above: two REAL Iroh endpoints in one
+    /// process, paired through a real `make_ticket`/`parse_ticket`/`dial` round-trip. This is the
+    /// only test that exercises `transport.rs` end-to-end, and it is what caught the teardown race:
+    /// the initiator used to close the QUIC connection the instant its own session returned, which
+    /// discarded the responder's final read — so the *inviting* device silently failed every pair
+    /// (no peer recorded, no changes applied) while the joiner reported success. Loopback-only:
+    /// relays disabled, dialed via the ticket's direct addresses.
+    #[tokio::test]
+    async fn two_real_iroh_endpoints_pair_and_converge() {
+        use crate::sync::transport;
+        use std::time::Duration;
+
+        let ep_a = transport::bind(transport::secret_key([7u8; 32]), false).await.unwrap();
+        let ep_b = transport::bind(transport::secret_key([9u8; 32]), false).await.unwrap();
+
+        let a = TestStore::new(&ep_a.node_id().to_string(), "shared-mesh");
+        let b = TestStore::new(&ep_b.node_id().to_string(), "shared-mesh");
+        a.conn.execute("INSERT INTO tasks(title, created_at) VALUES('from A','t')", []).unwrap();
+        b.conn.execute("INSERT INTO events(title, start, end, created_at) VALUES('from B','s','e','t')", []).unwrap();
+
+        let ticket = transport::make_ticket(&ep_a, "shared-mesh", false).await.unwrap();
+        let (addr, mesh) = transport::parse_ticket(&ticket).unwrap();
+        assert_eq!(mesh, "shared-mesh", "the mesh secret survives the ticket round-trip");
+
+        // A accepts one inbound session (the inviting device).
+        let accept = async {
+            let incoming = ep_a.accept().await.expect("A got an inbound connection");
+            let conn = incoming.await.expect("A completed the handshake");
+            let (send, recv) = transport::accept_stream(&conn).await.unwrap();
+            let stats = run_session(&a, false, recv, send).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await;
+            stats
+        };
+        // B dials the ticket and drives the session (the joining device).
+        let dial = async {
+            let (conn, send, recv) = transport::dial(&ep_b, addr).await?;
+            let stats = run_session(&b, true, recv, send).await;
+            conn.close(0u32.into(), b"done");
+            stats
+        };
+
+        let (ra, rb) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(accept, dial)
+        })
+        .await
+        .expect("pairing must not hang — a stuck join is the bug this test guards");
+
+        // BOTH sides must succeed. The joiner alone succeeding is the silent-failure mode.
+        ra.expect("the inviting device's session");
+        rb.expect("the joining device's session");
+
+        assert_eq!(count(&a.conn, "SELECT count(*) FROM events"), 1, "A pulled B's event over QUIC");
+        assert_eq!(count(&b.conn, "SELECT count(*) FROM tasks"), 1, "B pulled A's task over QUIC");
+    }
+
+    /// An invite minted the instant the endpoint binds carries only local interface addresses —
+    /// direct addresses resolve in milliseconds, the home-relay handshake takes seconds. That
+    /// leaves a joiner with no path at all when the direct one is blocked (a dismissed Windows
+    /// Firewall prompt does it), so `make_ticket` waits for the relay before minting.
+    #[tokio::test]
+    async fn a_minted_ticket_carries_a_relay_url_not_just_the_lan_address() {
+        use crate::sync::transport;
+        use iroh::Watcher;
+        use std::time::Duration;
+
+        let ep = transport::bind(transport::secret_key([11u8; 32]), true).await.unwrap();
+        let ticket = transport::make_ticket(&ep, "m", true).await.unwrap();
+        let (addr, _) = transport::parse_ticket(&ticket).unwrap();
+
+        // No reachable relay (offline / CI without egress) is a legitimate outcome: the invite still
+        // carries direct addresses. Only assert the relay landed when one actually came up.
+        let have_relay = tokio::time::timeout(Duration::from_millis(50), ep.home_relay().initialized())
+            .await
+            .is_ok();
+        if !have_relay {
+            eprintln!("no home relay reachable — skipping the relay assertion");
+            return;
+        }
+        assert!(
+            addr.relay_url.is_some(),
+            "an invite must carry the relay URL as a fallback path, not just the LAN address",
+        );
     }
 }

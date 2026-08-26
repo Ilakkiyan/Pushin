@@ -26,6 +26,8 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(20);
 const INFER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cap on simultaneous *inbound* inference requests we serve, so a phone can't overwhelm a desktop.
 const MAX_INFLIGHT_INFER: usize = 2;
+/// How long a responder waits for the initiator to close before dropping the connection itself.
+const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
 pub struct SyncEngine {
     endpoint: Endpoint,
@@ -37,6 +39,8 @@ pub struct SyncEngine {
     http: reqwest::Client,
     /// Limits concurrent inbound inference we serve (see [`MAX_INFLIGHT_INFER`]).
     infer_sem: Arc<Semaphore>,
+    /// Whether this endpoint was bound with relays enabled (invite minting needs to know).
+    use_relay: bool,
 }
 
 fn now_ms() -> u64 {
@@ -63,7 +67,8 @@ impl SyncEngine {
             state::set_node_id(&conn, &node_id)?;
         }
         let infer_sem = Arc::new(Semaphore::new(MAX_INFLIGHT_INFER));
-        let engine = Arc::new(SyncEngine { endpoint, node_id, mesh, db, app, http, infer_sem });
+        let engine =
+            Arc::new(SyncEngine { endpoint, node_id, mesh, db, app, http, infer_sem, use_relay });
         engine.clone().spawn_accept_loop();
         engine.clone().spawn_periodic();
         engine.register_peer_fallbacks();
@@ -96,9 +101,15 @@ impl SyncEngine {
         }));
     }
 
+    /// The mesh secret this engine bound with. Compared against the keychain to detect that the
+    /// device has since joined a *different* network and the engine must be rebuilt.
+    pub fn mesh(&self) -> &str {
+        &self.mesh
+    }
+
     /// Mint an invite ticket for another device to join this network.
     pub async fn create_invite(&self) -> Result<String> {
-        transport::make_ticket(&self.endpoint, &self.mesh).await
+        transport::make_ticket(&self.endpoint, &self.mesh, self.use_relay).await
     }
 
     /// Dial one peer and run a full sync session.
@@ -170,6 +181,10 @@ impl SyncEngine {
         let (send, recv) = transport::accept_stream(&conn).await?;
         let stats = protocol::run_session(self, false, recv, send).await?;
         self.note_peer(&stats);
+        // We sent the closing `Bye`; the initiator closes as soon as it reads that. Wait for the
+        // close rather than returning, because dropping `conn` abandons unacknowledged stream data
+        // and would race the `Bye` off the wire.
+        let _ = tokio::time::timeout(CLOSE_WAIT, conn.closed()).await;
         Ok(())
     }
 
@@ -297,6 +312,12 @@ impl SyncStore for SyncEngine {
             let mut clock = state::load_clock(&conn)?;
             let stats = changeset::apply_changes(&conn, &mut clock, now_ms(), changes)?;
             state::save_clock(&conn, &clock)?;
+            // A peer may have just handed us the shared Google link (or retracted it). Project it
+            // onto this device's local Google state so pairing auto-applies the connection.
+            // Idempotent and cheap, so it runs unconditionally rather than sniffing the batch.
+            if let Err(e) = crate::db::adopt_google_link(&conn) {
+                eprintln!("sync: couldn't adopt the shared Google link: {e}");
+            }
             (stats.applied, stats.max_hlc)
         };
         // Tell the UI to refresh after a real change landed (lock released first).

@@ -210,6 +210,20 @@ pub struct GoogleAccount {
     pub connected_at: String,
 }
 
+/// The device-independent half of the Google Calendar setup, replicated to every paired device by
+/// `sync` so connecting Google once applies it everywhere (see `migrations/0020_google_link.sql`).
+/// The refresh token is not a field here — it lives in the OS keychain and rides the changeset as a
+/// keychain-backed secret. `GoogleAccount` keeps the per-device half (access token, expiry, cursor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleLink {
+    pub email: String,
+    pub calendar_id: String,
+    pub client_id: String,
+    #[serde(skip_serializing)]
+    pub client_secret: String,
+}
+
 /// A note in Hermes, the on-device memory layer. `indexed` = an embedding exists for semantic
 /// recall; `score` is populated only on recall results (relevance of this note to the query).
 /// The embedding vector itself stays in the DB and is never serialized to the frontend.

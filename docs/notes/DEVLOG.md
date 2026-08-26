@@ -11,6 +11,53 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ## 2026-08-25
 
+### v0.8.1 — one Google calendar across every paired device, and pairing that actually pairs ✅
+The release that makes multi-device real: connect Google once, and every device you own is connected.
+- **Shared Google link** (migration `0020_google_link`). A synced single-row table holds the account
+  + the user's OAuth client; `db::adopt_google_link` projects it onto a joining device after every
+  sync session. The **refresh token has no SQLite column** — it rides the changeset as a
+  keychain-backed secret field (`TableSpec::secrets`) into the peer's OS keychain, and is cleared
+  there when the link's tombstone lands. Disconnecting on one device tears down all of them.
+- **Google tokens moved to the OS keychain** (`secrets.rs`); `calendar_accounts` keeps only
+  non-secret metadata, with the old columns as a fallback when the keychain is unavailable.
+- **Concurrent writers on one calendar.** `events.provider`/`external_id` now sync (without them a
+  peer treats a synced event as "never pushed" and inserts a duplicate into Google); `adopt_existing`
+  matches title+start+end when an event outran its `external_id` over the mesh; and
+  `plan_block_mirror` replaces the delete-every-block-and-recreate mirror with a `uuid`-keyed diff
+  (insert/patch/delete orphans) that two devices can run at once and that self-heals a raced insert.
+- **Device pairing fixes — three real bugs, found by pairing two real Iroh endpoints in one process.**
+  The old session ended on a responder *read* while the initiator closed the connection the instant
+  it finished; a QUIC close discards unacknowledged data, so the **inviting** device's session failed
+  every single time (no peer recorded, no changes applied) while the joiner reported success. The
+  session now ends on a `Bye` the initiator waits for. Invites also carried **only the LAN address** —
+  `node_addr()` resolves on the first address and local interfaces beat the relay handshake by
+  seconds — leaving no fallback when the direct path is firewalled; `make_ticket` now waits for the
+  home relay. And `ensure_engine` rebuilds when the mesh secret changes (a device that had its own
+  network kept presenting the old secret and failed mesh auth), with `sync_join` bounded at 45s and
+  an actionable error instead of an endless spinner.
+- **A deadline is not a start time** (`d56f73a`) — ten parser misroutes, all fixed deterministically
+  and unit-tested. The headline one: "I need to test some stuff for my job due EOD today" became a
+  fixed *"Job Testing" event on the wrong day*. Now a deadline/work cue demotes to a task (skipped for
+  explicit clock times and appointments), and untimed events stop silently jumping a day. Behind it:
+  duplicate creates fold so the relative date applies, fabricated "…Follow-Up"/"Clarification" sibling
+  events are dropped, a cancel clause no longer swallows unrelated creates, mis-routed edit verbs
+  route to `updateEvents`, all-day trip spans collapse to one span, "all my X" sweeps remove properly,
+  and the user's written time range beats the model's invented one. `llm_eval` gained a `deadline`
+  category and went **91% → 100%** (175/175, three consecutive runs); `model_battery` **91% → 98%**
+  (57/58 — the one miss is the adversarial "the thing with the guy about the stuff", where asking for
+  detail instead of inventing a title is the intended behaviour).
+- **Fresh installs could not migrate** (`sync/schema.rs`). `TABLES` lists `google_link`, but
+  `migration_sql()` is the frozen `0015` generator, which runs at `user_version` 15 — before `0020`
+  creates that table. A brand-new database therefore failed with "no such table: google_link". The
+  generator now filters on `TableSpec::added_in`, and a table joining the registry after 0015 applies
+  its own columns/triggers from its own migration via `table_sync_sql`.
+- **Also in this release**, already on `main` since v0.8.0: the Playwright smoke-suite repair and the
+  crash it exposed (`01b43b1` — v0.8.0 shipped with that suite red), a month-old miss now reads as
+  stale rather than "due" plus an archive action (`cd87d58`), and the updater re-checks periodically
+  instead of only at launch (`1d5a5d0`).
+- Verified on the release SHA: `cargo test --lib` **316** green, Vitest **80** green (19 files),
+  Playwright E2E **4** green, `npm run build` clean, live `llm_eval` **175/175**, `model_battery` 57/58.
+
 ### v0.8.0 — Today landing, tuned models by default, .ics subscriptions ✅
 The release that makes Pushin open on your day and ship its own model.
 - **Two-space nav + Today pane.** The sidebar holds one space at a time — planner (Today/Calendar/

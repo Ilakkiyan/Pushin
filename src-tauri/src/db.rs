@@ -25,6 +25,7 @@ const MIGRATION_0016: &str = include_str!("../migrations/0016_vault_files.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_habit_preferred_time.sql");
 const MIGRATION_0018: &str = include_str!("../migrations/0018_note_origin.sql");
 const MIGRATION_0019: &str = include_str!("../migrations/0019_ics_subscriptions.sql");
+const MIGRATION_0020: &str = include_str!("../migrations/0020_google_link.sql");
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -119,6 +120,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         // Read-only .ics calendar subscriptions + events.ics_sub_id.
         conn.execute_batch(MIGRATION_0019)?;
         conn.pragma_update(None, "user_version", 19)?;
+    }
+    if version < 20 {
+        // The shared Google link (auto-applies the Google setup to every paired device). It joins
+        // the synced-table registry after 0015 ran, so it needs 0015's treatment applied by hand.
+        conn.execute_batch(MIGRATION_0020)?;
+        let spec = crate::sync::schema::spec("google_link").expect("google_link is a synced table");
+        conn.execute_batch(&crate::sync::schema::table_sync_sql(spec))?;
+        conn.pragma_update(None, "user_version", 20)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -423,6 +432,18 @@ pub fn list_blocks(conn: &Connection) -> Result<Vec<Block>> {
     Ok(rows)
 }
 
+/// Blocks paired with their sync `uuid` — the same id on every paired device, which is what the
+/// Google block mirror keys on so concurrent devices reconcile instead of duplicating
+/// (`calendar::google::plan_block_mirror`). Rows without a uuid yet are skipped; the `0015` insert
+/// trigger stamps one, so that is only ever a transient state inside one transaction.
+pub fn list_blocks_with_uuid(conn: &Connection) -> Result<Vec<(String, Block)>> {
+    let mut stmt = conn.prepare("SELECT * FROM blocks WHERE uuid IS NOT NULL ORDER BY start")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>("uuid")?, row_to_block(r)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
 /// Replace all unlocked blocks with freshly scheduled ones (locked blocks survive).
 pub fn replace_unlocked_blocks(conn: &mut Connection, new_blocks: &[Block]) -> Result<()> {
     let tx = conn.transaction()?;
@@ -455,7 +476,9 @@ pub fn set_block_locked(conn: &Connection, id: i64, locked: bool, start: &str, e
 // source for the one-time migration of legacy plaintext tokens in `get_google_account`).
 
 const KC_ACCESS: &str = "google-access-token";
-const KC_REFRESH: &str = "google-refresh-token";
+/// Also named by `sync::schema` — the refresh token is the one secret that travels between a
+/// user's own paired devices, as a keychain-backed field on the `google_link` changeset.
+pub(crate) const KC_REFRESH: &str = "google-refresh-token";
 
 /// Resolve a token: prefer the keychain; otherwise migrate a legacy plaintext column value into
 /// the keychain (nulling the column) or, if the keychain is unavailable, return the column value.
@@ -551,6 +574,147 @@ pub fn delete_google_account(conn: &Connection) -> Result<()> {
     crate::secrets::clear(KC_REFRESH);
     conn.execute("DELETE FROM calendar_accounts WHERE provider = 'google'", [])?;
     Ok(())
+}
+
+// ---------- Shared Google link (replicated to every paired device) ----------
+//
+// `calendar_accounts` is per-device. `google_link` is the shared half: the connected account plus
+// the user's own OAuth client, synced over the P2P mesh so a newly paired device inherits the whole
+// Google setup. The refresh token is carried alongside it in the OS keychain (see sync::schema).
+
+/// Order that picks THE link when more than one exists — most recently connected first, `uuid`
+/// breaking ties. Both sides of a mesh hold identical rows after a sync, so both pick the same one.
+const LINK_WINNER: &str = "ORDER BY updated_at DESC, uuid DESC";
+
+pub fn get_google_link(conn: &Connection) -> Result<Option<GoogleLink>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT email, calendar_id, client_id, client_secret FROM google_link \
+                 WHERE provider = 'google' {LINK_WINNER} LIMIT 1"
+            ),
+            [],
+            |r| {
+                Ok(GoogleLink {
+                    email: r.get(0)?,
+                    calendar_id: r.get(1)?,
+                    client_id: r.get(2)?,
+                    client_secret: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Upsert the shared link. Deliberately UPDATE-then-INSERT rather than DELETE+INSERT: the row's
+/// `uuid` is its identity on the wire, so replacing it would orphan peers' copies behind a tombstone.
+pub fn save_google_link(conn: &Connection, link: &GoogleLink) -> Result<()> {
+    let current: Option<String> = conn
+        .query_row(
+            &format!("SELECT uuid FROM google_link WHERE provider = 'google' {LINK_WINNER} LIMIT 1"),
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let updated = match &current {
+        Some(uuid) => conn.execute(
+            "UPDATE google_link SET email = ?1, calendar_id = ?2, client_id = ?3, \
+             client_secret = ?4, updated_at = ?5 WHERE uuid = ?6",
+            params![link.email, link.calendar_id, link.client_id, link.client_secret, now_iso(), uuid],
+        )?,
+        None => 0,
+    };
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO google_link(provider, email, calendar_id, client_id, client_secret, \
+             updated_at) VALUES('google', ?1, ?2, ?3, ?4, ?5)",
+            params![link.email, link.calendar_id, link.client_id, link.client_secret, now_iso()],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn delete_google_link(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM google_link WHERE provider = 'google'", [])?;
+    Ok(())
+}
+
+/// Reconcile this device's local Google state with the shared link — the step that makes a freshly
+/// paired device "already connected".
+///
+/// * link present, no local account → adopt it: copy the OAuth client into settings and create a
+///   `calendar_accounts` row with NO access token, expiry or `sync_token`, so the next sync mints
+///   its own access token from the shared refresh token and does its own first full pull.
+/// * link present, local account for a different email → re-adopt (the user reconnected elsewhere).
+/// * link gone but a local account remains → the user disconnected Google on another device; tear
+///   the local connection down to match.
+///
+/// Returns true when anything changed. Idempotent, so it is safe to run after every sync session.
+pub fn adopt_google_link(conn: &Connection) -> Result<bool> {
+    // Converge on ONE link: if devices connected Google independently before pairing, each brought a
+    // row. Every device picks the same winner (LINK_WINNER), so pruning here is safe — the losing
+    // rows' tombstones propagate and the mesh settles on a single link.
+    conn.execute(
+        &format!(
+            "DELETE FROM google_link WHERE provider = 'google' AND uuid NOT IN \
+             (SELECT uuid FROM google_link WHERE provider = 'google' {LINK_WINNER} LIMIT 1)"
+        ),
+        [],
+    )?;
+    let link = get_google_link(conn)?;
+    let account = get_google_account(conn)?;
+
+    let Some(link) = link else {
+        // Disconnected on a peer — mirror that here.
+        if account.is_none() {
+            return Ok(false);
+        }
+        delete_google_account(conn)?;
+        let mut s = get_settings(conn)?;
+        s.google_connected = false;
+        save_settings(conn, &s)?;
+        return Ok(true);
+    };
+
+    // The OAuth client is the user's own; keep settings in step with the link either way.
+    let mut settings = get_settings(conn)?;
+    let mut changed = false;
+    if settings.google_client_id != link.client_id || settings.google_client_secret != link.client_secret {
+        settings.google_client_id = link.client_id.clone();
+        settings.google_client_secret = link.client_secret.clone();
+        changed = true;
+    }
+
+    // Already connected to this same account? Nothing else to do — our tokens are still ours.
+    if account.as_ref().is_some_and(|a| a.email == link.email) {
+        if !settings.google_connected {
+            settings.google_connected = true;
+            changed = true;
+        }
+        if changed {
+            save_settings(conn, &settings)?;
+        }
+        return Ok(changed);
+    }
+
+    // Adopt. Without the shared refresh token there is nothing to authenticate with, so leave the
+    // device disconnected rather than creating an account that can never sync.
+    if crate::secrets::get(KC_REFRESH).is_none_or(|t| t.is_empty()) {
+        if changed {
+            save_settings(conn, &settings)?;
+        }
+        return Ok(changed);
+    }
+    conn.execute("DELETE FROM calendar_accounts WHERE provider = 'google'", [])?;
+    conn.execute(
+        "INSERT INTO calendar_accounts(provider, email, calendar_id, access_token, refresh_token, \
+         token_expiry, sync_token, connected_at) \
+         VALUES('google', ?1, ?2, NULL, NULL, NULL, NULL, ?3)",
+        params![link.email, link.calendar_id, now_iso()],
+    )?;
+    settings.google_connected = true;
+    save_settings(conn, &settings)?;
+    Ok(true)
 }
 
 // ---------- Google event sync helpers ----------

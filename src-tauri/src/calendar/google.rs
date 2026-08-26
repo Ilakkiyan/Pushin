@@ -30,6 +30,10 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar openid email";
 const API: &str = "https://www.googleapis.com/calendar/v3";
 const PUSHIN_KEY: &str = "pushinKind"; // extendedProperties.private marker on our block events
+/// The mirrored block's `uuid` — its identity across every one of the user's devices. Lets the
+/// mirror reconcile by row instead of deleting and recreating, so two devices syncing the same
+/// account converge instead of deleting each other's block events.
+const PUSHIN_REF: &str = "pushinRef";
 
 /// The Calendar API base + token endpoint, overridable in tests so httpmock can stand in for Google.
 /// Zero overhead in release (the `#[cfg(test)]` block is compiled out — it's just the const).
@@ -235,6 +239,9 @@ struct GEvent {
     cancelled: bool,
     etag: Option<String>,
     is_pushin: bool,
+    /// For a mirrored block event, the source block's `uuid` (absent on events written by a build
+    /// before the mirror was uuid-keyed — those are treated as stale and cleaned up).
+    pushin_ref: Option<String>,
 }
 
 /// Parse a Google start/end object ({dateTime,timeZone} or {date}) to a naive-local ISO.
@@ -256,14 +263,18 @@ fn to_rfc3339(iso: &str) -> String {
         .unwrap_or_else(|| iso.to_string())
 }
 
-fn event_body(title: &str, start: &str, end: &str, pushin_kind: Option<&str>) -> Value {
+fn event_body(title: &str, start: &str, end: &str, pushin_kind: Option<&str>, pushin_ref: Option<&str>) -> Value {
     let mut body = json!({
         "summary": title,
         "start": { "dateTime": to_rfc3339(start) },
         "end": { "dateTime": to_rfc3339(end) },
     });
     if let Some(kind) = pushin_kind {
-        body["extendedProperties"] = json!({ "private": { PUSHIN_KEY: kind } });
+        let mut private = json!({ PUSHIN_KEY: kind });
+        if let Some(r) = pushin_ref {
+            private[PUSHIN_REF] = json!(r);
+        }
+        body["extendedProperties"] = json!({ "private": private });
     }
     body
 }
@@ -315,6 +326,9 @@ async fn list_events(
                 cancelled: item["status"].as_str() == Some("cancelled"),
                 etag: item["etag"].as_str().map(String::from),
                 is_pushin: item["extendedProperties"]["private"][PUSHIN_KEY].is_string(),
+                pushin_ref: item["extendedProperties"]["private"][PUSHIN_REF]
+                    .as_str()
+                    .map(String::from),
             });
         }
         next_sync = v["nextSyncToken"].as_str().map(String::from).or(next_sync);
@@ -326,11 +340,12 @@ async fn list_events(
     Ok((all, next_sync))
 }
 
-async fn insert_event(http: &reqwest::Client, access: &str, cal_id: &str, title: &str, start: &str, end: &str, kind: Option<&str>) -> Result<(String, Option<String>)> {
+#[allow(clippy::too_many_arguments)]
+async fn insert_event(http: &reqwest::Client, access: &str, cal_id: &str, title: &str, start: &str, end: &str, kind: Option<&str>, reference: Option<&str>) -> Result<(String, Option<String>)> {
     let v: Value = http
         .post(format!("{}/calendars/{cal_id}/events", api_base()))
         .bearer_auth(access)
-        .json(&event_body(title, start, end, kind))
+        .json(&event_body(title, start, end, kind, reference))
         .send()
         .await?
         .error_for_status()?
@@ -343,7 +358,7 @@ async fn patch_event(http: &reqwest::Client, access: &str, cal_id: &str, ext_id:
     let resp = http
         .patch(format!("{}/calendars/{cal_id}/events/{ext_id}", api_base()))
         .bearer_auth(access)
-        .json(&event_body(title, start, end, None))
+        .json(&event_body(title, start, end, None, None))
         .send()
         .await?;
     // 404/410 → the event vanished on Google; not fatal.
@@ -361,6 +376,108 @@ async fn delete_event(http: &reqwest::Client, access: &str, cal_id: &str, ext_id
         bail!("Google delete failed ({code})");
     }
     Ok(())
+}
+
+// ---------------- Multi-device reconcilers ----------------
+//
+// Every paired device syncs with the SAME Google calendar (device sync replicates events and
+// blocks, and the shared `google_link` hands each device the same account). Both of the deterministic
+// planners below exist so that concurrency between devices is safe: they are pure functions of
+// (local rows, what Google currently holds), so two devices running them converge on the same
+// calendar instead of duplicating or deleting each other's work. Unit-tested below.
+
+/// Match a local event that has no `external_id` yet against what Google already holds.
+///
+/// Closes the multi-device push race: device A creates an event and pushes it; device B may receive
+/// the event over the P2P mesh *before* A's `external_id` reaches it, and would then insert a second
+/// copy into Google. Adopting an exact title+start+end match instead makes that a no-op. `used`
+/// carries ids already claimed earlier in this pass so two local rows can't adopt one Google event.
+fn adopt_existing(
+    title: &str,
+    start: &str,
+    end: &str,
+    window: &[GEvent],
+    used: &mut std::collections::HashSet<String>,
+) -> Option<String> {
+    window
+        .iter()
+        .find(|g| {
+            !g.is_pushin
+                && !g.cancelled
+                && g.summary == title
+                && g.start.as_deref() == Some(start)
+                && g.end.as_deref() == Some(end)
+                && !used.contains(&g.id)
+        })
+        .map(|g| {
+            used.insert(g.id.clone());
+            g.id.clone()
+        })
+}
+
+/// One block we want mirrored onto Google, keyed by the block's cross-device `uuid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirrorTarget {
+    uuid: String,
+    title: String,
+    start: String,
+    end: String,
+}
+
+/// A single step of the block mirror.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorOp {
+    /// Create the mirrored event for `targets[i]`.
+    Insert(usize),
+    /// Update the Google event `ext_id` to match `targets[i]`.
+    Patch { ext_id: String, target: usize },
+    /// Remove a mirrored event that no longer corresponds to a live block.
+    Delete(String),
+}
+
+/// Diff the blocks we want mirrored against the mirrored events Google currently holds.
+///
+/// Replaces the old "delete every Pushin block event, then recreate them all" mirror, which two
+/// devices could not run concurrently without deleting each other's work. Keyed by block `uuid`
+/// (which device sync replicates), this is idempotent: a second run over an already-correct calendar
+/// plans nothing, and a run that finds two events for one block deletes the extra — so even a true
+/// insert race self-heals on the next sync.
+fn plan_block_mirror(targets: &[MirrorTarget], existing: &[GEvent]) -> Vec<MirrorOp> {
+    use std::collections::HashMap;
+    let mut by_ref: HashMap<&str, Vec<&GEvent>> = HashMap::new();
+    let mut ops = Vec::new();
+    for g in existing.iter().filter(|g| g.is_pushin && !g.cancelled) {
+        match g.pushin_ref.as_deref() {
+            // Written before the mirror was uuid-keyed: no way to match it to a block, so retire it.
+            None => ops.push(MirrorOp::Delete(g.id.clone())),
+            Some(r) => by_ref.entry(r).or_default().push(g),
+        }
+    }
+    for (i, t) in targets.iter().enumerate() {
+        match by_ref.remove(t.uuid.as_str()) {
+            None => ops.push(MirrorOp::Insert(i)),
+            Some(mut group) => {
+                // Deterministic winner so both devices keep the same copy of a raced double-insert.
+                group.sort_by(|a, b| a.id.cmp(&b.id));
+                let keep = group.remove(0);
+                for dup in group {
+                    ops.push(MirrorOp::Delete(dup.id.clone()));
+                }
+                let stale = keep.summary != t.title
+                    || keep.start.as_deref() != Some(t.start.as_str())
+                    || keep.end.as_deref() != Some(t.end.as_str());
+                if stale {
+                    ops.push(MirrorOp::Patch { ext_id: keep.id.clone(), target: i });
+                }
+            }
+        }
+    }
+    // Whatever is left points at a block that no longer exists.
+    let mut orphans: Vec<String> =
+        by_ref.into_values().flatten().map(|g| g.id.clone()).collect();
+    orphans.sort();
+    ops.extend(orphans.into_iter().map(MirrorOp::Delete));
+    ops
 }
 
 // ---------------- Sync engine ----------------
@@ -436,7 +553,11 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
         db::update_google_sync_token(&conn, account.id, next_sync.as_deref())?;
     }
 
-    // 4. PUSH local events (source = manual) → Google.
+    // 4. Snapshot the whole window once. Both push phases below reconcile against it rather than
+    //    assuming this device is the only one writing to the calendar (see the reconcilers above).
+    let (window, _) = list_events(http, &access, &cal_id, &time_min, &time_max, None).await?;
+
+    // 5. PUSH local events (source = manual) → Google.
     let to_push: Vec<(i64, String, String, String, Option<String>)> = {
         let conn = db_mutex.lock().unwrap();
         db::list_events(&conn)?
@@ -445,10 +566,13 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
             .map(|e| (e.id, e.title, e.start, e.end, e.external_id))
             .collect()
     };
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (id, title, start, end, ext) in to_push {
+        // An event a peer pushed already exists on Google; adopt its id instead of duplicating it.
+        let ext = ext.or_else(|| adopt_existing(&title, &start, &end, &window, &mut claimed));
         match ext {
             None => {
-                let (gid, etag) = insert_event(http, &access, &cal_id, &title, &start, &end, None).await?;
+                let (gid, etag) = insert_event(http, &access, &cal_id, &title, &start, &end, None, None).await?;
                 let conn = db_mutex.lock().unwrap();
                 db::mark_event_pushed(&conn, id, &gid, etag.as_deref())?;
             }
@@ -461,26 +585,34 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
         summary.pushed += 1;
     }
 
-    // 5. PUSH task blocks (full mirror): delete our previous block events, recreate from current blocks.
-    let block_rows: Vec<(String, String, String)> = {
+    // 6. MIRROR task blocks, reconciling by block uuid so concurrent devices converge.
+    let targets: Vec<MirrorTarget> = {
         let conn = db_mutex.lock().unwrap();
         let titles: std::collections::HashMap<i64, String> = db::list_tasks(&conn)?.into_iter().map(|t| (t.id, t.title)).collect();
-        db::list_blocks(&conn)?
+        db::list_blocks_with_uuid(&conn)?
             .into_iter()
-            .map(|b| {
-                let t = titles.get(&b.task_id).cloned().unwrap_or_else(|| "Focus".into());
-                (t, b.start, b.end)
+            .map(|(uuid, b)| MirrorTarget {
+                uuid,
+                title: titles.get(&b.task_id).cloned().unwrap_or_else(|| "Focus".into()),
+                start: b.start,
+                end: b.end,
             })
             .collect()
     };
-    // Delete previously mirrored block events.
-    let (existing, _) = list_events(http, &access, &cal_id, &time_min, &time_max, None).await?;
-    for ev in existing.iter().filter(|e| e.is_pushin) {
-        delete_event(http, &access, &cal_id, &ev.id).await?;
-    }
-    for (title, start, end) in &block_rows {
-        insert_event(http, &access, &cal_id, title, start, end, Some("block")).await?;
-        summary.blocks_mirrored += 1;
+    for op in plan_block_mirror(&targets, &window) {
+        match op {
+            MirrorOp::Insert(i) => {
+                let t = &targets[i];
+                insert_event(http, &access, &cal_id, &t.title, &t.start, &t.end, Some("block"), Some(&t.uuid)).await?;
+                summary.blocks_mirrored += 1;
+            }
+            MirrorOp::Patch { ext_id, target } => {
+                let t = &targets[target];
+                patch_event(http, &access, &cal_id, &ext_id, &t.title, &t.start, &t.end).await?;
+                summary.blocks_mirrored += 1;
+            }
+            MirrorOp::Delete(ext_id) => delete_event(http, &access, &cal_id, &ext_id).await?,
+        }
     }
 
     Ok(summary)
@@ -489,6 +621,100 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gev(id: &str, summary: &str, start: &str, end: &str) -> GEvent {
+        GEvent {
+            id: id.into(),
+            summary: summary.into(),
+            start: Some(start.into()),
+            end: Some(end.into()),
+            cancelled: false,
+            etag: None,
+            is_pushin: false,
+            pushin_ref: None,
+        }
+    }
+    /// A mirrored block event as it comes back from Google.
+    fn mirrored(id: &str, block_uuid: &str, summary: &str, start: &str, end: &str) -> GEvent {
+        GEvent { is_pushin: true, pushin_ref: Some(block_uuid.into()), ..gev(id, summary, start, end) }
+    }
+    fn target(uuid: &str, title: &str, start: &str, end: &str) -> MirrorTarget {
+        MirrorTarget { uuid: uuid.into(), title: title.into(), start: start.into(), end: end.into() }
+    }
+
+    const S: &str = "2026-06-14T09:00:00";
+    const E: &str = "2026-06-14T10:00:00";
+
+    #[test]
+    fn block_mirror_is_a_no_op_when_google_already_matches() {
+        // The property that makes concurrent multi-device sync safe: a device that finds the
+        // calendar already correct must not touch it (the old mirror deleted + recreated blindly).
+        let targets = vec![target("u1", "Write essay", S, E)];
+        let existing = vec![mirrored("g1", "u1", "Write essay", S, E)];
+        assert_eq!(plan_block_mirror(&targets, &existing), vec![]);
+    }
+
+    #[test]
+    fn block_mirror_inserts_patches_and_removes_orphans() {
+        let targets = vec![
+            target("u1", "Write essay", S, E),                       // already mirrored, unchanged
+            target("u2", "Renamed", S, E),                           // mirrored under an old title
+            target("u3", "Brand new", S, E),                         // never mirrored
+        ];
+        let existing = vec![
+            mirrored("g1", "u1", "Write essay", S, E),
+            mirrored("g2", "u2", "Old title", S, E),
+            mirrored("g3", "u-gone", "Deleted block", S, E),         // block no longer exists
+        ];
+        let ops = plan_block_mirror(&targets, &existing);
+        assert!(ops.contains(&MirrorOp::Insert(2)), "u3 gets created: {ops:?}");
+        assert!(
+            ops.contains(&MirrorOp::Patch { ext_id: "g2".into(), target: 1 }),
+            "u2 is patched in place, not recreated: {ops:?}"
+        );
+        assert!(ops.contains(&MirrorOp::Delete("g3".into())), "orphan is removed: {ops:?}");
+        assert_eq!(ops.len(), 3, "u1 is left alone: {ops:?}");
+    }
+
+    #[test]
+    fn block_mirror_heals_a_raced_double_insert_and_retires_unreferenced_events() {
+        // Two devices mirroring the same block at the same instant can both insert. The next run
+        // must converge on ONE event — deterministically the same one on either device.
+        let targets = vec![target("u1", "Write essay", S, E)];
+        let existing = vec![
+            mirrored("g_b", "u1", "Write essay", S, E),
+            mirrored("g_a", "u1", "Write essay", S, E),
+            GEvent { is_pushin: true, ..gev("legacy", "Old block event", S, E) }, // pre-uuid marker
+        ];
+        let ops = plan_block_mirror(&targets, &existing);
+        assert!(ops.contains(&MirrorOp::Delete("g_b".into())), "keeps the lowest id: {ops:?}");
+        assert!(ops.contains(&MirrorOp::Delete("legacy".into())), "retires unkeyed: {ops:?}");
+        assert!(!ops.iter().any(|o| matches!(o, MirrorOp::Insert(_))), "no new copy: {ops:?}");
+        assert!(!ops.contains(&MirrorOp::Delete("g_a".into())), "survivor is kept: {ops:?}");
+    }
+
+    #[test]
+    fn adopt_existing_claims_a_peers_event_instead_of_duplicating_it() {
+        // Device A pushed "Standup"; we received it over P2P before its external_id arrived.
+        let window = vec![gev("gA", "Standup", S, E)];
+        let mut used = std::collections::HashSet::new();
+        assert_eq!(adopt_existing("Standup", S, E, &window, &mut used).as_deref(), Some("gA"));
+        // A second local row with the same title must NOT claim the same Google event.
+        assert_eq!(adopt_existing("Standup", S, E, &window, &mut used), None);
+    }
+
+    #[test]
+    fn adopt_existing_ignores_non_matches_block_mirrors_and_cancellations() {
+        let mut used = std::collections::HashSet::new();
+        let shifted = vec![gev("gA", "Standup", "2026-06-14T11:00:00", E)];
+        assert_eq!(adopt_existing("Standup", S, E, &shifted, &mut used), None, "time must match too");
+
+        let ours = vec![mirrored("gB", "u1", "Standup", S, E)];
+        assert_eq!(adopt_existing("Standup", S, E, &ours, &mut used), None, "never adopt our own block");
+
+        let gone = vec![GEvent { cancelled: true, ..gev("gC", "Standup", S, E) }];
+        assert_eq!(adopt_existing("Standup", S, E, &gone, &mut used), None, "never adopt a cancellation");
+    }
 
     #[test]
     fn pkce_s256_matches_rfc7636_vector() {
@@ -553,7 +779,7 @@ mod tests {
             w.method(POST).path("/calendars/primary/events");
             t.status(200).json_body(serde_json::json!({ "id": "new1", "etag": "\"abc\"" }));
         });
-        let (id, etag) = insert_event(&http, "acc", "primary", "Block", "2026-06-14T09:00:00", "2026-06-14T10:00:00", Some("block")).await.unwrap();
+        let (id, etag) = insert_event(&http, "acc", "primary", "Block", "2026-06-14T09:00:00", "2026-06-14T10:00:00", Some("block"), Some("blk-uuid")).await.unwrap();
         assert_eq!(id, "new1");
         assert_eq!(etag.as_deref(), Some("\"abc\""));
 

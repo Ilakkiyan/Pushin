@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, RelayMode, SecretKey, Watcher};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Application-layer protocol id for the changeset-sync channel.
 pub const ALPN: &[u8] = b"pushin-sync/0";
@@ -40,8 +41,21 @@ struct Ticket {
     mesh: String,
 }
 
+/// How long minting an invite waits for the home relay before settling for a direct-only ticket.
+const RELAY_WAIT: Duration = Duration::from_secs(10);
+
 /// Mint an invite ticket: this endpoint's reachable address + the mesh secret.
-pub async fn make_ticket(ep: &Endpoint, mesh: &str) -> Result<String> {
+///
+/// `node_addr()` resolves as soon as *any* address is known, and local interface addresses are
+/// discovered in milliseconds while the home-relay handshake takes seconds. Minting immediately
+/// therefore yields a ticket carrying only the LAN address — no relay URL and no public reflexive
+/// address — so the joiner has no path at all if the direct one is blocked (a Windows Firewall
+/// prompt that was dismissed is enough). When relays are on, wait briefly for one; timing out is
+/// fine, we just fall back to the direct-only ticket rather than failing the invite.
+pub async fn make_ticket(ep: &Endpoint, mesh: &str, use_relay: bool) -> Result<String> {
+    if use_relay {
+        let _ = tokio::time::timeout(RELAY_WAIT, ep.home_relay().initialized()).await;
+    }
     let addr = ep
         .node_addr()
         .initialized()

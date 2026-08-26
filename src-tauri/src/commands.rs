@@ -854,6 +854,18 @@ pub async fn connect_google(app: AppHandle, state: State<'_, AppState>) -> Resul
         let mut s = db::get_settings(&conn).map_err(err)?;
         s.google_connected = true;
         db::save_settings(&conn, &s).map_err(err)?;
+        // Publish the shared half so every paired device inherits this connection on its next sync
+        // (the refresh token rides along from the keychain — see sync::schema::TABLES).
+        db::save_google_link(
+            &conn,
+            &GoogleLink {
+                email: connected.email.clone(),
+                calendar_id: connected.calendar_id.clone(),
+                client_id,
+                client_secret,
+            },
+        )
+        .map_err(err)?;
     }
     Ok(connected.email)
 }
@@ -862,6 +874,9 @@ pub async fn connect_google(app: AppHandle, state: State<'_, AppState>) -> Resul
 pub fn disconnect_google(state: State<AppState>) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
     db::delete_google_account(&conn).map_err(err)?;
+    // Deleting the shared link propagates the disconnect to the user's other devices (its tombstone
+    // also clears the refresh token from their keychains).
+    db::delete_google_link(&conn).map_err(err)?;
     let mut s = db::get_settings(&conn).map_err(err)?;
     s.google_connected = false;
     db::save_settings(&conn, &s).map_err(err)?;
@@ -1992,13 +2007,25 @@ fn build_status(state: &AppState) -> Result<SyncStatus, String> {
     })
 }
 
+/// How long joining waits to reach the inviting device before giving up with an actionable error.
+/// Generous enough for relay setup + hole-punching, short enough that the UI never looks wedged.
+const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Return the running engine, starting it if the device is paired but the engine is down.
 pub(crate) async fn ensure_engine(app: AppHandle, state: &AppState) -> Result<Arc<SyncEngine>, String> {
-    if let Some(e) = state.sync_engine.lock().map_err(err)?.clone() {
-        return Ok(e);
-    }
-    if sync::identity::mesh_secret().is_none() {
+    let Some(mesh) = sync::identity::mesh_secret() else {
         return Err("This device hasn't joined a sync network yet.".into());
+    };
+    // An engine caches the mesh secret it bound with. Joining another device's network replaces that
+    // secret, so an engine started earlier (this device had its own network) would keep presenting
+    // the OLD one and fail the peer's mesh authentication. Rebuild rather than reuse.
+    let existing = state.sync_engine.lock().map_err(err)?.clone();
+    if let Some(e) = existing {
+        if e.mesh() == mesh {
+            return Ok(e);
+        }
+        *state.sync_engine.lock().map_err(err)? = None;
+        e.shutdown().await;
     }
     let use_relay = { sync::state::use_relay(&*state.db.lock().map_err(err)?) };
     let engine = SyncEngine::start(state.db.clone(), app, state.http.clone(), use_relay).await.map_err(err)?;
@@ -2027,7 +2054,17 @@ pub async fn sync_join(app: AppHandle, state: State<'_, AppState>, ticket: Strin
         return Err("Couldn't store the network key in the OS keychain.".into());
     }
     let engine = ensure_engine(app, state.inner()).await?;
-    engine.sync_with(addr).await.map_err(err)?;
+    // Bounded: an unreachable invite must surface an error the user can act on, not spin forever.
+    match tokio::time::timeout(JOIN_TIMEOUT, engine.sync_with(addr)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(format!("Couldn't sync with that device: {e:#}")),
+        Err(_) => {
+            return Err(format!(
+                "Couldn't reach that device within {}s. Check both devices are online and Pushin                  is allowed through the firewall, then create a fresh invite code — invites                  contain the inviting device's current address, which changes between networks.",
+                JOIN_TIMEOUT.as_secs()
+            ))
+        }
+    }
     build_status(state.inner())
 }
 
