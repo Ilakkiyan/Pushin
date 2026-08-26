@@ -51,10 +51,23 @@ vi.mock("@tauri-apps/api/event", () => ({
   emit: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Event bus isn't present outside the webview — stub listen/emit so components that subscribe
-// (App's sync-applied refresh, InferenceSetup's progress) don't blow up under jsdom.
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
-  once: vi.fn().mockResolvedValue(() => {}),
-  emit: vi.fn().mockResolvedValue(undefined),
-}));
+// jsdom implements neither PointerEvent nor the pointer-capture methods. The calendar drives
+// drag-to-reschedule entirely through pointer events (pointerdown on a block, then pointermove /
+// pointerup on window), so without these a drag test can't run at all. MouseEvent already carries
+// clientX/clientY, which is what the drag maths reads.
+if (typeof window.PointerEvent === "undefined") {
+  class PointerEventPolyfill extends MouseEvent {
+    readonly pointerId: number;
+    readonly pointerType: string;
+    constructor(type: string, params: PointerEventInit = {}) {
+      super(type, params);
+      this.pointerId = params.pointerId ?? 1;
+      this.pointerType = params.pointerType ?? "mouse";
+    }
+  }
+  window.PointerEvent = PointerEventPolyfill as unknown as typeof PointerEvent;
+}
+if (!Element.prototype.setPointerCapture) {
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+}

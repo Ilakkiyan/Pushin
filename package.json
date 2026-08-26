@@ -14,7 +14,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "verify": "node scripts/verify.mjs",
+    "verify:fast": "node scripts/verify.mjs --fast",
+    "verify:live": "node scripts/verify.mjs --live"
   },
   "dependencies": {
     "@blocknote/core": "^0.51.4",

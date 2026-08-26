@@ -60,10 +60,10 @@ export async function installMockBridge(page: Page) {
     const today = new Date().toISOString().slice(0, 10);
     const at = (hm: string) => `${today}T${hm}:00`;
     const seedTasks = [
-      { id: 1, projectId: null, title: "Draft outline", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
-      { id: 2, projectId: null, title: "Write thesis", notes: "", estimatedMinutes: 180, deadline: at("23:59"), earliestStart: null, priority: 3, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
-      { id: 3, projectId: null, title: "Revise draft", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [1] },
-      { id: 4, projectId: null, title: "Prep slides", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", dependsOn: [] },
+      { id: 1, projectId: null, title: "Draft outline", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [] },
+      { id: 2, projectId: null, title: "Write thesis", notes: "", estimatedMinutes: 180, deadline: at("23:59"), earliestStart: null, priority: 3, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [] },
+      { id: 3, projectId: null, title: "Revise draft", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [1] },
+      { id: 4, projectId: null, title: "Prep slides", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 2, lastMissedOn: "2026-06-26", dependsOn: [] },
     ];
     const blk = (id: number, taskId: number, s: string, e: string) => ({ id, taskId, start: at(s), end: at(e), locked: false, provider: null, externalId: null, syncState: null });
     const seedBlocks = [
@@ -94,6 +94,27 @@ export async function installMockBridge(page: Page) {
     const handlers: Record<string, (a: any) => any> = {
       load_all: () => ({ settings: state.settings, projects: [], tasks: seedTasks, events: seedEvents, blocks: seedBlocks, eventTypes: [], bookings: [] }),
       reschedule: () => ({ conflicts: [] }),
+      // Drag-to-reschedule and pin/unpin. These mutate the seed in place so the refresh that follows
+      // every mutation (store.mutate → load_all) re-renders the block at its new time — which is the
+      // whole point of the E2E: proving the move survives the round trip, not just the drag gesture.
+      lock_block: ({ id, locked, start, end }: any) => {
+        const b = seedBlocks.find((x) => x.id === id);
+        if (b) {
+          b.locked = locked;
+          if (start) b.start = start;
+          if (end) b.end = end;
+        }
+        return { conflicts: [] };
+      },
+      move_habit: ({ eventId, newStart }: any) => {
+        const e = seedEvents.find((x) => x.id === eventId);
+        if (e && newStart) {
+          const durMs = new Date(e.end).getTime() - new Date(e.start).getTime();
+          e.start = newStart;
+          e.end = new Date(new Date(newStart).getTime() + durMs).toISOString().slice(0, 19);
+        }
+        return { conflicts: [] };
+      },
       explain_schedule: () => seedReasons,
       save_settings: () => null,
       llm_status: () => ({ reachable: true, baseUrl: "http://127.0.0.1:8080", modelPresent: true, modelId: state.settings.modelId, models: tunedModels }),
