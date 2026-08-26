@@ -5,7 +5,9 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests/e2e",
   // `_*.spec.ts` are dev-only screenshot utilities (e.g. _capture.spec.ts) — not run in CI.
-  testIgnore: "**/_*.spec.ts",
+  // Naming one explicitly on the CLI (`npm run capture`) opts it back in; a bare `playwright test`,
+  // which is what CI runs, still skips them. Dependency-free so it works on every platform.
+  testIgnore: process.argv.some((a) => a.includes("_capture")) ? [] : "**/_*.spec.ts",
   timeout: 30_000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

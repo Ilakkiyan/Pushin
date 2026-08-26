@@ -832,6 +832,122 @@ fn remove_verb_creates_become_removes(plan: &mut ParsedPlan, text: &str) {
     }
 }
 
+/// Does the user's message actually name `target`? True when ANY significant word of the target
+/// (≥3 letters, not filler) appears as a word in the text — so a `match` the model invented from the
+/// calendar listing or a few-shot example can be told apart from one the user really typed.
+fn target_mentioned_in(text: &str, target: &str) -> bool {
+    let (matched, total) = title_word_overlap(text, target);
+    total == 0 || matched > 0 // nothing meaningful to check → don't drop on a technicality
+}
+
+/// (how many of `target`'s significant words appear in `text`, how many it has).
+fn title_word_overlap(text: &str, target: &str) -> (usize, usize) {
+    const FILLER: &[&str] = &["the", "and", "for", "with", "session", "time", "event", "appointment", "meeting", "class"];
+    let lc_text = text.to_lowercase();
+    let words: HashSet<&str> = lc_text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let lc_target = target.to_lowercase();
+    let significant: Vec<&str> = lc_target
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| w.len() >= 3 && !FILLER.contains(w))
+        .collect();
+    (significant.iter().filter(|w| words.contains(*w)).count(), significant.len())
+}
+
+/// Words that mean the user is changing or deleting something that already exists. Their presence
+/// makes an `updateEvents`/`removeEvents` entry plausible even when the target isn't spelled out
+/// ("move it to 9pm" names no event).
+fn mentions_edit_intent(text: &str) -> bool {
+    const EDIT: &[&str] = &[
+        "move", "moved", "reschedule", "rescheduled", "change", "changed", "rename", "renamed", "push", "pushed",
+        "shift", "shifted", "swap", "swapped", "postpone", "postponed", "update", "updated", "make", "shorten",
+        "extend", "cancel", "cancelled", "canceled", "delete", "remove", "drop", "clear", "instead", "actually",
+        "earlier", "later",
+    ];
+    // Back-references point at an earlier turn's subject, so the model legitimately supplies a target
+    // the current message never names.
+    const REF: &[&str] = &["it", "its", "that", "this", "those", "them", "they", "one", "ones", "same"];
+    let lc = text.to_lowercase();
+    let words: HashSet<&str> = lc.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    EDIT.iter().chain(REF.iter()).any(|w| words.contains(*w))
+}
+
+/// **Hallucinated-edit guard.** The union prompt always shows the model an `updateEvents` and a
+/// `removeEvents` example, and the system prompt lists the user's whole calendar — so on a plain
+/// statement of fact ("I also have physics class from 12:45 to 2 pm") the 7B sometimes tacks on an
+/// edit of an unrelated event it can see ("updated 1 event (Gym)"). That is wrong twice over: it
+/// silently rewrites an event the user never mentioned, and — because `backfill_event_fields` only
+/// applies its time recovery to an UNAMBIGUOUS single create — it also disables the deterministic
+/// end-time recovery for the event the user *did* describe, which then falls back to the 60-minute
+/// default ("to 2 pm" → a 12:45–13:45 block).
+///
+/// So: when the message carries NO edit/remove verb and NO back-reference pronoun, an update/remove
+/// whose target the user never named is a fabrication — drop it. Conservative by design: one edit
+/// word anywhere in the message (or a target the user actually typed) leaves the plan untouched, so
+/// genuine edits ("move the dentist to 3pm", "make it 2 hours") are never affected.
+fn drop_unsupported_edits(plan: &mut ParsedPlan, text: &str) {
+    if plan.update_events.is_empty() && plan.remove_events.is_empty() {
+        return;
+    }
+    if mentions_edit_intent(text) {
+        return; // the user is plausibly editing — let the model's routing stand
+    }
+    plan.update_events.retain(|u| target_mentioned_in(text, &u.target));
+    plan.remove_events.retain(|r| target_mentioned_in(text, r));
+}
+
+/// Titles that exist ONLY in the few-shot exemplars (`EXEMPLARS` / `STATIC_EXAMPLES`). The prompt
+/// tells the model not to copy them; it does anyway. Deliberately excludes bare generic words that
+/// `title_word_overlap` treats as filler ("Meeting") — those can never be dropped, the safe direction.
+const EXEMPLAR_TITLES: &[&str] = &[
+    // events
+    "gym", "gym session", "morning workout", "coffee with alex", "team sync", "lunch with mom",
+    "graduation party", "sleepover", "dentist", "lunch with dan",
+    // habits
+    "violin practice", "practice violin", "meditate", "exercise", "study us history",
+    // tasks / projects
+    "study for the exam", "pick platform", "write posts", "write 3 posts", "write blog posts",
+    "write a blog post", "fix the login bug", "write tests", "deploy", "write the report",
+    "email the report", "blog",
+];
+
+/// **Few-shot parrot guard.** The union prompt carries a worked example of every intent, and the
+/// model periodically emits one of those examples verbatim alongside (or instead of) the user's real
+/// request — a phantom "Lunch with mom" on "I also have physics class from 12:45 to 2 pm", and even
+/// on "Cancel lunch with Dan". Both live-observed on the tuned 7B.
+///
+/// Like a fabricated edit (see `drop_unsupported_edits`) this costs twice: the phantom event lands on
+/// the calendar, AND it makes the plan ambiguous, so `backfill_event_fields`' `single_create` gate
+/// skips its time recovery and the event the user *did* describe collapses to the 60-minute default.
+/// That is exactly how "physics class from 12:45 **to 2 pm**" became a 12:45–13:45 block.
+///
+/// Drop an event/habit/task whose title is a known exemplar sharing NO significant word with the
+/// message — and only while a real sibling survives, so a turn is never silently reduced to a no-op.
+///
+/// The any-word test is deliberate, not lazy. A partial overlap means the user probably DID name the
+/// thing and the model merely dressed the title up in exemplar clothing: on "Move lunch to 1pm" the
+/// model titles the user's real lunch "Lunch with mom", and `route_edit_verb_creates_to_updates` still
+/// needs it to reclassify the move. The cost is that a phantom sharing a word with the message
+/// survives (a "Lunch with mom" create beside "Cancel lunch with Dan"); that is the safe direction.
+fn drop_parroted_exemplars(plan: &mut ParsedPlan, text: &str) {
+    let is_parrot = |title: &str| {
+        let t = title.trim().to_lowercase();
+        EXEMPLAR_TITLES.contains(&t.as_str()) && !target_mentioned_in(text, title)
+    };
+    let real_events = plan.events.iter().filter(|e| !is_parrot(&e.title)).count();
+    let real_habits = plan.habits.iter().filter(|h| !is_parrot(&h.name)).count();
+    let real_tasks = plan.projects.iter().flat_map(|p| &p.tasks).filter(|t| !is_parrot(&t.title)).count();
+    // Something genuine must remain, or we'd turn a turn into a silent no-op.
+    if real_events + real_habits + real_tasks + plan.update_events.len() + plan.remove_events.len() == 0 {
+        return;
+    }
+    plan.events.retain(|e| !is_parrot(&e.title));
+    plan.habits.retain(|h| !is_parrot(&h.name));
+    for p in &mut plan.projects {
+        p.tasks.retain(|t| !is_parrot(&t.title));
+    }
+    plan.projects.retain(|p| !p.tasks.is_empty());
+}
+
 /// The model sometimes DUPLICATES what it just created — a second event at the same start time
 /// ("quick 5 min sync with raj at 3:15" → "Sync with Raj" 3:15 AND "Quick Sync" 3:15) or a second
 /// habit for one routine ("every other tuesday retro" → "Team Retro" + "Retro Day"). Drop the later
@@ -1063,6 +1179,11 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_fields(plan, user_text, today);
     backfill_task_dependencies(plan, user_text);
     merge_split_event_fragments(plan); // before the backfill: a fabricated sibling hides the single subject
+    // Same reason, two more sources of a fabricated sibling: an edit of an event the user never named,
+    // and a few-shot exemplar copied verbatim. Both also break `single_create`, so the event the user
+    // DID describe silently loses its stated end time to the 60-minute default.
+    drop_unsupported_edits(plan, user_text);
+    drop_parroted_exemplars(plan, user_text);
     backfill_event_fields(plan, user_text, today);
     clamp_absurd_event_durations(plan, user_text);
     promote_timed_work_to_block(plan, user_text);
@@ -4217,6 +4338,97 @@ mod tests {
 
     fn d() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()
+    }
+
+    #[test]
+    fn drops_an_edit_of_an_event_the_user_never_mentioned() {
+        // "I also have physics class from 12:45 to 2 pm" — the model saw "Gym" on the calendar (and in
+        // its own few-shot examples) and tacked on an edit of it. No edit verb, no back-reference, and
+        // the user never typed "gym" → fabrication.
+        let text = "I also have physics class from 12:45 to 2 pm";
+        let mut class = ev("today", Some("12:45"), None);
+        class.title = "Physics Class".into();
+        let mut plan = ParsedPlan { events: vec![class], update_events: vec![up("Gym")], ..Default::default() };
+        apply_recovery(&mut plan, text, d());
+
+        assert!(plan.update_events.is_empty(), "fabricated Gym edit dropped");
+        // …and with the plan unambiguous again, the end time the user stated is recovered instead of
+        // silently defaulting to 60 minutes.
+        let (s, e) = resolve_event(d().and_hms_opt(8, 0, 0).unwrap(), &plan.events[0]).unwrap();
+        assert_eq!((e - s).num_minutes(), 75, "12:45 → 14:00");
+    }
+
+    #[test]
+    fn keeps_edits_the_user_actually_asked_for() {
+        // The guard must never touch a genuine edit — whether the target is named…
+        let mut named = ParsedPlan { update_events: vec![up("Dentist")], ..Default::default() };
+        drop_unsupported_edits(&mut named, "move the dentist to 3pm");
+        assert_eq!(named.update_events.len(), 1);
+
+        // …or only back-referenced from an earlier turn ("it" / an edit verb carries it).
+        let mut pronoun = ParsedPlan { update_events: vec![up("Sleepover")], ..Default::default() };
+        drop_unsupported_edits(&mut pronoun, "make it 2 hours instead");
+        assert_eq!(pronoun.update_events.len(), 1, "a back-reference legitimises an unnamed target");
+
+        // A remove the user really asked for survives; a fabricated one beside a statement doesn't.
+        let mut real = ParsedPlan { remove_events: vec!["sleepover".into()], ..Default::default() };
+        drop_unsupported_edits(&mut real, "cancel all my sleepovers");
+        assert_eq!(real.remove_events.len(), 1);
+
+        let mut fabricated = ParsedPlan { remove_events: vec!["Gym".into()], ..Default::default() };
+        drop_unsupported_edits(&mut fabricated, "I have physics practicum from 9:30 - 10:50");
+        assert!(fabricated.remove_events.is_empty());
+    }
+
+    #[test]
+    fn drops_a_few_shot_exemplar_the_model_parroted() {
+        // Live on the tuned 7B: "I also have physics class from 12:45 to 2 pm" produced the real event
+        // AND a verbatim copy of the "lunch with mom friday 12-2" exemplar. The phantom must go — and
+        // with the plan unambiguous again the class recovers its stated end instead of defaulting to 60m.
+        let text = "I also have physics class from 12:45 to 2 pm";
+        let mut class = ev("today", Some("12:45"), None);
+        class.title = "Physics Class".into();
+        let mut parrot = ev("friday", Some("12:00"), Some("14:00"));
+        parrot.title = "Lunch with mom".into();
+        let mut plan = ParsedPlan { events: vec![class, parrot], ..Default::default() };
+        apply_recovery(&mut plan, text, d());
+
+        assert_eq!(plan.events.len(), 1, "phantom dropped: {:?}", plan.events.iter().map(|e| &e.title).collect::<Vec<_>>());
+        assert_eq!(plan.events[0].title, "Physics Class");
+        let (s, e) = resolve_event(d().and_hms_opt(8, 0, 0).unwrap(), &plan.events[0]).unwrap();
+        assert_eq!((e - s).num_minutes(), 75, "12:45 → 14:00 recovered once the plan is unambiguous");
+    }
+
+    #[test]
+    fn parrot_guard_spares_events_the_user_really_named() {
+        // The same titles are ordinary requests when the user actually says them.
+        let mut real = ParsedPlan { events: vec![ev("tomorrow", Some("06:00"), None)], ..Default::default() };
+        real.events[0].title = "Gym".into();
+        drop_parroted_exemplars(&mut real, "gym tomorrow at 6 in the morning");
+        assert_eq!(real.events.len(), 1, "the user said gym");
+
+        // A lone parroted event is NOT dropped — that would turn the turn into a silent no-op.
+        let mut lone = ParsedPlan { events: vec![ev("friday", Some("12:00"), Some("14:00"))], ..Default::default() };
+        lone.events[0].title = "Lunch with mom".into();
+        drop_parroted_exemplars(&mut lone, "something totally unrelated");
+        assert_eq!(lone.events.len(), 1, "nothing genuine would survive — leave it alone");
+
+        // …and it IS dropped when it rides along with a real removal it shares nothing with.
+        let mut with_remove = ParsedPlan {
+            events: vec![ev("friday", Some("12:00"), Some("14:00"))],
+            remove_events: vec!["Dentist".into()],
+            ..Default::default()
+        };
+        with_remove.events[0].title = "Lunch with mom".into();
+        drop_parroted_exemplars(&mut with_remove, "Cancel my dentist appointment.");
+        assert!(with_remove.events.is_empty(), "phantom create alongside a real remove");
+
+        // A partial overlap is NOT a parrot: on "Move lunch to 1pm" the model dresses the user's real
+        // lunch in the exemplar title, and the edit-verb reclassifier downstream still needs it.
+        let mut dressed = ParsedPlan { events: vec![ev("today", Some("13:00"), None)], ..Default::default() };
+        dressed.events[0].title = "Lunch with mom".into();
+        drop_parroted_exemplars(&mut dressed, "Move lunch to 1pm and add a coffee break at 3pm.");
+        assert_eq!(dressed.events.len(), 1, "the user said lunch — not a fabrication");
     }
 
     #[test]

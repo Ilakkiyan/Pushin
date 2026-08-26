@@ -213,6 +213,10 @@ export async function installMockBridge(page: Page) {
       }),
     };
 
+    // `listen()`'s unlisten path goes through this global, not `invoke` — without it every effect
+    // cleanup throws "Cannot read properties of undefined (reading 'unregisterListener')", which
+    // buries real page errors in the capture harness's diagnostics.
+    (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
     (window as any).__TAURI_INTERNALS__ = {
       // Window/webview identity so @tauri-apps/api `getCurrentWindow()`/`getCurrentWebview()` (used by
       // the frameless TitleBar) resolve instead of throwing during the initial render.

@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "capture": "playwright test tests/e2e/_capture.spec.ts --project=chromium"
   },
   "dependencies": {
     "@blocknote/core": "^0.51.4",

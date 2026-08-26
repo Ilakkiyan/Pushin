@@ -32,6 +32,17 @@ import { applyVaultChange } from "./lib/vaultImport";
 import { api, type VaultChange } from "./lib/ipc";
 import { getVersion } from "@tauri-apps/api/app";
 
+/**
+ * Opt OUT of the dev "what's new" replay. Dev builds re-show the intro on every launch so it can be
+ * iterated on, but it covers every view a screenshot wants to capture: `?whatsnew=0` for the browser
+ * harness, `VITE_PUSHIN_INTRO=0 npm run tauri dev` for the real desktop window (which has no URL to
+ * hang a query on). See scripts/capture-window.ps1.
+ */
+function introSuppressed(): boolean {
+  if (import.meta.env.VITE_PUSHIN_INTRO === "0") return true;
+  return typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "0";
+}
+
 export default function App() {
   const loaded = useStore((s) => s.loaded);
   const view = useStore((s) => s.view);
@@ -68,6 +79,7 @@ export default function App() {
   const [whatsNew, setWhatsNew] = useState(
     () =>
       import.meta.env.MODE !== "test" &&
+      !introSuppressed() &&
       (import.meta.env.DEV ||
         (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1")),
   );
@@ -172,6 +184,10 @@ export default function App() {
   // localStorage remembers the last version seen so it shows exactly once per release.
   useEffect(() => {
     if (!loaded || import.meta.env.MODE === "test") return;
+    if (introSuppressed()) {
+      setVersionChecked(true); // nothing to show — don't leave `bootCover` up forever
+      return;
+    }
     // Dev builds (and the ?whatsnew=1 hook) replay the full opening sequence — splash → loading →
     // intro — on EVERY launch, so it can be iterated on. Production shows it once per version (below).
     const forced =

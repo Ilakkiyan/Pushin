@@ -22,7 +22,7 @@ test("capture themed views", async ({ page }) => {
   await installMockBridge(page);
 
   // --- opening wordmark, frozen on its settled frame ---
-  await page.goto("/?splash=logo");
+  await page.goto("/?splash=logo&whatsnew=0");
   await page.waitForTimeout(1600);
   await page.screenshot({ path: `${OUT}/03-splash.png` });
   await page.screenshot({ path: `${OUT}/03-splash.jpg`, type: "jpeg", quality: 85 });
@@ -31,7 +31,7 @@ test("capture themed views", async ({ page }) => {
   // In `npm run dev` the forced What's New overlay suppresses WelcomeBack (App renders it only when
   // !whatsNew), so this is best-effort in dev — skipped (not fatal) if it can't appear.
   try {
-    await page.goto("/?splash=off");
+    await page.goto("/?splash=off&whatsnew=0");
     await page.getByText(/Good (morning|afternoon|evening)/).waitFor({ timeout: 6000 });
     await page.waitForTimeout(700); // welcome-in settle
     await page.screenshot({ path: `${OUT}/04-welcome.png` });
@@ -40,14 +40,14 @@ test("capture themed views", async ({ page }) => {
   }
 
   // --- new-user guide (un-onboarded) ---
-  await page.goto("/?splash=off&new=1");
+  await page.goto("/?splash=off&new=1&whatsnew=0");
   await page.waitForTimeout(2500);
   await page.screenshot({ path: `${OUT}/05-guide.png` });
   const guideBody = (await page.locator("body").innerText().catch(() => "")).slice(0, 200);
   errors.push(`guide body: ${guideBody.replace(/\n/g, " | ")}`);
 
   // --- inner app (splash skipped + entered) ---
-  await page.goto("/?splash=off&enter=1");
+  await page.goto("/?splash=off&enter=1&whatsnew=0");
   await dismissWhatsNew(page);
   await page.getByText("Today").first().waitFor({ timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(400);
@@ -94,7 +94,7 @@ test("capture themed views", async ({ page }) => {
   // viewport so the whole day column is visible without scrolling.
   try {
     await page.setViewportSize({ width: 1280, height: 1400 });
-    await page.goto("/?splash=off&enter=1");
+    await page.goto("/?splash=off&enter=1&whatsnew=0");
     await dismissWhatsNew(page);
     await page.getByText("Today").first().waitFor({ timeout: 20000 });
     await page.waitForTimeout(500);
@@ -106,7 +106,7 @@ test("capture themed views", async ({ page }) => {
   // Settings ▸ On-device AI (Item A): the idle-unload control + the "switch to the tuned model" nudge.
   try {
     await page.setViewportSize({ width: 1280, height: 1000 });
-    await page.goto("/?splash=off&enter=1");
+    await page.goto("/?splash=off&enter=1&whatsnew=0");
     await dismissWhatsNew(page);
     await page.getByText("Today").first().waitFor({ timeout: 15000 }).catch(() => {});
     await page.getByText("Settings", { exact: true }).first().click({ timeout: 5000 }).catch((e) => errors.push(`settings click: ${e}`));
@@ -132,7 +132,7 @@ test("capture themed views", async ({ page }) => {
   // Mobile shell.
   try {
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto("/?splash=off&enter=1");
+    await page.goto("/?splash=off&enter=1&whatsnew=0");
     await dismissWhatsNew(page);
     await page.waitForTimeout(900);
     await page.screenshot({ path: `${OUT}/07-mobile.png` });

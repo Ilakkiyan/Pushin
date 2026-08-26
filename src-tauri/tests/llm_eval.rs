@@ -333,11 +333,35 @@ fn dedup_does_not_overfire(_o: &PlanOutcome, c: &Connection) -> Vec<(String, boo
     ]
 }
 
+/// Stating a new commitment must not touch an unrelated event the model can see on the calendar
+/// (or in its own few-shot examples), and the stated end time must survive.
+fn plain_statement_leaves_other_events_alone(o: &PlanOutcome, c: &Connection) -> Vec<(String, bool)> {
+    let gym = db::list_events(c).unwrap_or_default().into_iter().find(|e| e.title.to_lowercase().contains("gym"));
+    vec![
+        chk("no unrelated event edited", o.updated_event_titles.is_empty()),
+        chk("no unrelated event removed", o.removed_event_titles.is_empty()),
+        chk(
+            "Gym untouched at 13:00-14:00",
+            gym.map(|g| g.start.ends_with("13:00:00") && g.end.ends_with("14:00:00")).unwrap_or(false),
+        ),
+        chk("physics class is 12:45-14:00 (75m)", ev_minutes(c, "physics").map(|m| (m - 75).abs() <= 5).unwrap_or(false)),
+    ]
+}
+
 // ---------------- the battery ----------------
 
 fn cases() -> Vec<Case> {
     use Expect as E;
     vec![
+        // ---- restraint: a statement of fact is a pure create ----
+        Case {
+            name: "stating a class doesn't edit an unrelated event",
+            category: "restraint",
+            history: &[],
+            seed: &[("Gym", 0, (13, 0), 0, (14, 0))],
+            prompt: "I also have physics class from 12:45 to 2 pm",
+            expect: E { events: Some(1), custom: Some(plain_statement_leaves_other_events_alone), ..Default::default() },
+        },
         // ---- single task ----
         Case {
             name: "single task with stated length",
