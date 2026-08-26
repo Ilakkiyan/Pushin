@@ -17,7 +17,10 @@ export default defineConfig({
   },
   webServer: {
     command: "npm run dev",
-    port: 1420,
+    // `url` rather than `port`: the port form resolves as soon as Vite's socket accepts a TCP
+    // connection, which is before it can actually serve — so workers could start against a server
+    // that then reloaded underneath them. `url` polls with a real HTTP request instead.
+    url: "http://localhost:1420",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
