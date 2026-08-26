@@ -50,8 +50,12 @@ pub const TABLES: &[TableSpec] = &[
     // them a peer would see a synced event as "never pushed" and insert a duplicate into Google
     // (see `calendar::google::sync`). `account_id` is a local FK and `etag` a per-device
     // concurrency token, so both stay device-local.
+    // `ics_sub_id` is a rowid into `ics_subscriptions`, which is NOT synced — shipping it raw made a
+    // peer's apply fail the FK check and abort the ENTIRE batch, so one .ics feed blocked all sync to
+    // a device without it. Dropped on the wire rather than rewritten: the far side has no equivalent
+    // row to point at. (Whether .ics events should replicate at all is a separate open question.)
     TableSpec { name: "events", fks: &[], poly: None,
-        skip: &["account_id", "etag"], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
+        skip: &["account_id", "etag", "ics_sub_id"], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
     // Embeddings are re-derived locally; never ship 384-dim vectors.
     TableSpec { name: "notes", fks: &[("parent_id", "notes")], poly: None,
         skip: &["embedding", "embedding_model"], secrets: &[], added_in: SYNC_MIGRATION_VERSION },

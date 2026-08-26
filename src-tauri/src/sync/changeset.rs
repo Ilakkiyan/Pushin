@@ -557,6 +557,46 @@ mod tests {
         ).unwrap();
         conn.last_insert_rowid()
     }
+    /// `events.ics_sub_id` is a foreign key into `ics_subscriptions`, which is NOT a synced table.
+    /// It used to go on the wire as a raw LOCAL rowid — neither rewritten to a uuid (it is not in
+    /// the events `TableSpec::fks`) nor dropped (it was not in `skip`). On a peer without that
+    /// subscription the INSERT hit `FOREIGN KEY constraint failed` and took the WHOLE apply down
+    /// with it, so one .ics feed blocked all sync to that device. It is now skipped: the event
+    /// still syncs, minus a local id that is meaningless on the far side.
+    #[test]
+    fn ics_backed_event_syncs_without_dragging_its_local_feed_id_across() {
+        let a = db::test_conn();
+        let b = db::test_conn();
+
+        // Device A subscribes to a feed and ingests one event from it.
+        a.execute(
+            "INSERT INTO ics_subscriptions(name, url, color, created_at) VALUES('Team','https://e/t.ics','#38bdf8','t')",
+            [],
+        ).unwrap();
+        let sub = a.last_insert_rowid();
+        a.execute(
+            "INSERT INTO events(title, start, end, kind, source, provider, ics_sub_id, created_at)              VALUES('Standup','2026-09-01T09:00:00','2026-09-01T09:15:00','fixed','ics','ics',?1,'t')",
+            params![sub],
+        ).unwrap();
+
+        let mut clock = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        let ev = changes.iter().find(|c| c.table == "events").expect("the ics event is still captured");
+        assert!(!ev.fields.contains_key("ics_sub_id"), "a local feed rowid must never go on the wire");
+        assert!(!changes.iter().any(|c| c.table == "ics_subscriptions"), "the feed itself is not synced");
+
+        // B has no subscriptions at all, and enforces foreign keys exactly as `db::open` does.
+        b.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let mut clock_b = HlcState::default();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).expect("apply must not be blocked by a foreign feed id");
+
+        assert_eq!(scalar_i64(&b, "SELECT count(*) FROM events WHERE title = 'Standup'"), 1, "the event lands");
+        assert_eq!(
+            scalar_i64(&b, "SELECT count(*) FROM events WHERE ics_sub_id IS NOT NULL"), 0,
+            "and carries no dangling feed id — so deleting an unrelated feed can't cascade it away",
+        );
+    }
+
     /// Pairing a second device must carry the whole Google setup across — including the refresh
     /// token, which has no SQLite column and travels via the OS keychain (`TableSpec::secrets`).
     #[test]
