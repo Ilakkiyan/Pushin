@@ -27,6 +27,16 @@ const MIGRATION_0018: &str = include_str!("../migrations/0018_note_origin.sql");
 const MIGRATION_0019: &str = include_str!("../migrations/0019_ics_subscriptions.sql");
 const MIGRATION_0020: &str = include_str!("../migrations/0020_google_link.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_task_missed.sql");
+const MIGRATION_0022: &str = include_str!("../migrations/0022_ics_sync.sql");
+
+/// 0022's uuid backfill for `ics_subscriptions`, shared with its test so the two can't drift.
+///
+/// Two already-paired devices that BOTH subscribed to a feed before it became syncable would each
+/// mint a random uuid and then sync into two rows for one feed — the user's calendar list doubles.
+/// Deriving the id from the URL makes both devices arrive at the same uuid independently, so LWW
+/// merges them. Restricted to URLs appearing once locally: a pre-existing local duplicate would
+/// otherwise collide on the unique index mid-migration.
+pub(crate) const ICS_UUID_BACKFILL: &str = "UPDATE ics_subscriptions SET uuid = 'ics-' || lower(hex(url))      WHERE url IN (SELECT url FROM ics_subscriptions GROUP BY url HAVING count(*) = 1)";
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -135,6 +145,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         // on an already-synced table, so 0015's triggers carry them to paired devices as-is.
         conn.execute_batch(MIGRATION_0021)?;
         conn.pragma_update(None, "user_version", 21)?;
+    }
+    if version < 22 {
+        // `ics_subscriptions` joins the synced registry so a feed imported on one device appears on
+        // all of them. The table exists from 0019; like `google_link` in 0020 it arrived after the
+        // frozen 0015 generator ran, so it applies 0015's columns/backfill/triggers itself. The .sql
+        // file is documentation — the DDL is generated from the TableSpec so the two can't drift.
+        conn.execute_batch(MIGRATION_0022)?;
+        let spec = crate::sync::schema::spec("ics_subscriptions").expect("ics_subscriptions is a synced table");
+        conn.execute_batch(&crate::sync::schema::table_sync_sql(spec))?;
+        conn.execute(ICS_UUID_BACKFILL, [])?;
+        conn.pragma_update(None, "user_version", 22)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())

@@ -41,6 +41,13 @@ pub const TABLES: &[TableSpec] = &[
     // `calendar_accounts` and is deliberately NOT synced.
     TableSpec { name: "google_link", fks: &[], poly: None, skip: &[],
         secrets: &[("refresh_token", crate::db::KC_REFRESH)], added_in: 20 },
+    // Read-only .ics feed subscriptions. The user's decision is that importing a feed on one device
+    // shows up on all of them, so the SUBSCRIPTION replicates. `last_synced` does not: every device
+    // fetches the feed on its own schedule, so it is a per-device fact like Google's `sync_token`.
+    //
+    // The feed's mirrored EVENTS are deliberately NOT synced (see the `events` spec below).
+    TableSpec { name: "ics_subscriptions", fks: &[], poly: None, skip: &["last_synced"],
+        secrets: &[], added_in: 22 },
     TableSpec { name: "projects",    fks: &[], poly: None, skip: &[], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
     TableSpec { name: "labels",      fks: &[], poly: None, skip: &[], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
     TableSpec { name: "people",      fks: &[], poly: None, skip: &[], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
@@ -50,10 +57,14 @@ pub const TABLES: &[TableSpec] = &[
     // them a peer would see a synced event as "never pushed" and insert a duplicate into Google
     // (see `calendar::google::sync`). `account_id` is a local FK and `etag` a per-device
     // concurrency token, so both stay device-local.
-    // `ics_sub_id` is a rowid into `ics_subscriptions`, which is NOT synced — shipping it raw made a
-    // peer's apply fail the FK check and abort the ENTIRE batch, so one .ics feed blocked all sync to
-    // a device without it. Dropped on the wire rather than rewritten: the far side has no equivalent
-    // row to point at. (Whether .ics events should replicate at all is a separate open question.)
+    // `ics_sub_id` stays off the wire even though `ics_subscriptions` now syncs, because the feed's
+    // mirrored events do not replicate — each device re-derives them from the URL. Two reasons:
+    // `db::replace_ics_events` refreshes a feed by DELETING every one of its events and re-inserting
+    // them, so replicating those rows would have two devices tombstoning and re-creating each other's
+    // copies on every refresh (the churn `plan_block_mirror` exists to avoid for Google blocks); and
+    // the events are re-derivable from the feed, like embeddings, so shipping them buys nothing.
+    // Historically this column went on the wire as a raw LOCAL rowid, which failed the FK check on a
+    // peer without that feed and aborted the ENTIRE batch — one .ics feed blocked all sync (9ae15ce).
     TableSpec { name: "events", fks: &[], poly: None,
         skip: &["account_id", "etag", "ics_sub_id"], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
     // Embeddings are re-derived locally; never ship 384-dim vectors.

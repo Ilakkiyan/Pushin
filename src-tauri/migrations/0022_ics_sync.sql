@@ -1,0 +1,16 @@
+-- Bring `ics_subscriptions` into the device-sync chain: importing a .ics feed on one device now
+-- shows that feed on every paired device.
+--
+-- There is no DDL here on purpose. The table itself already exists (0019); what it needs is 0015's
+-- treatment — `uuid` / `updated_hlc` / `dirty` columns, a uuid backfill for existing rows, the unique
+-- index, and the three change-capture triggers. That SQL is GENERATED from the table's `TableSpec`
+-- by `sync::schema::table_sync_sql`, so the registry and the migration can never drift apart, and
+-- `migrate()` runs it for this version. Same shape as `google_link` in 0020: a table that joins the
+-- synced registry after 0015 has already run applies 0015's treatment itself.
+--
+-- What replicates: the subscription (name, url, color, created_at).
+-- What does NOT: `last_synced`, because every device fetches the feed on its own schedule; and the
+-- feed's mirrored EVENTS, because `replace_ics_events` refreshes a feed by deleting every one of its
+-- events and re-inserting them — replicating those rows would have paired devices tombstoning and
+-- re-creating each other's copies on every refresh. Each device re-derives them from the URL, which
+-- is what the origin device does anyway.

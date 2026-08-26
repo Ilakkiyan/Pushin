@@ -415,7 +415,15 @@ fn apply_upsert(conn: &Connection, ch: &Change, force: bool) -> Result<Option<bo
         }
     }
 
-    // LWW vs an existing local row.
+    // LWW vs an existing local row. Presence and stamp are asked SEPARATELY: a row created locally
+    // and never yet synced has a NULL `updated_hlc`, and collapsing that into "no such row" would
+    // make apply INSERT over it and trip the unique index on uuid. That stayed hidden while uuids
+    // were always random — two devices never minted the same one — but `ics_subscriptions` derives
+    // its uuid from the feed URL precisely so both sides converge, which reaches this path by design.
+    let exists: bool = conn
+        .query_row(&format!("SELECT 1 FROM {table} WHERE uuid = ?1"), params![ch.uuid], |_| Ok(()))
+        .optional()?
+        .is_some();
     let existing_hlc: Option<String> = conn
         .query_row(
             &format!("SELECT updated_hlc FROM {table} WHERE uuid = ?1"),
@@ -424,7 +432,6 @@ fn apply_upsert(conn: &Connection, ch: &Change, force: bool) -> Result<Option<bo
         )
         .optional()?
         .flatten();
-    let exists = existing_hlc.is_some();
     if let Some(eh) = &existing_hlc {
         if eh.as_str() >= ch.hlc.as_str() {
             return Ok(Some(false)); // our copy is newer-or-equal
@@ -557,18 +564,107 @@ mod tests {
         ).unwrap();
         conn.last_insert_rowid()
     }
-    /// `events.ics_sub_id` is a foreign key into `ics_subscriptions`, which is NOT a synced table.
-    /// It used to go on the wire as a raw LOCAL rowid — neither rewritten to a uuid (it is not in
-    /// the events `TableSpec::fks`) nor dropped (it was not in `skip`). On a peer without that
-    /// subscription the INSERT hit `FOREIGN KEY constraint failed` and took the WHOLE apply down
-    /// with it, so one .ics feed blocked all sync to that device. It is now skipped: the event
-    /// still syncs, minus a local id that is meaningless on the far side.
+    /// Importing a .ics feed on one device must show it on all of them — the user's call. The
+    /// SUBSCRIPTION replicates; its mirrored events do not (each device re-derives them from the
+    /// URL, exactly as the origin device does, since a feed only ever populates on refresh).
     #[test]
-    fn ics_backed_event_syncs_without_dragging_its_local_feed_id_across() {
+    fn an_ics_subscription_replicates_to_a_paired_device() {
         let a = db::test_conn();
         let b = db::test_conn();
 
-        // Device A subscribes to a feed and ingests one event from it.
+        a.execute(
+            "INSERT INTO ics_subscriptions(name, url, color, last_synced, created_at)              VALUES('Team','https://example.com/team.ics','#38bdf8','2026-08-26T09:00:00','t')",
+            [],
+        ).unwrap();
+
+        let mut clock = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        let sub = changes.iter().find(|c| c.table == "ics_subscriptions").expect("the feed syncs");
+        assert_eq!(sub.fields["name"], json!("Team"));
+        assert_eq!(sub.fields["url"], json!("https://example.com/team.ics"));
+        assert_eq!(sub.fields["color"], json!("#38bdf8"));
+        // Every device fetches on its own schedule, so the fetch stamp is per-device.
+        assert!(!sub.fields.contains_key("last_synced"), "last_synced is a local fact");
+
+        b.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let mut clock_b = HlcState::default();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).unwrap();
+
+        let (name, url, synced): (String, String, Option<String>) = b
+            .query_row("SELECT name, url, last_synced FROM ics_subscriptions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(name, "Team");
+        assert_eq!(url, "https://example.com/team.ics");
+        assert_eq!(synced, None, "the peer has not fetched it yet — it refreshes on its own");
+    }
+
+    /// Upgrade path: two already-paired devices that each added the SAME feed before it became
+    /// syncable must converge on ONE row, not double the user's calendar list. 0022 derives the uuid
+    /// from the URL so both sides mint the same id independently and LWW merges them.
+    #[test]
+    fn the_same_feed_added_on_two_devices_converges_to_one_row() {
+        let a = db::test_conn();
+        let b = db::test_conn();
+        for c in [&a, &b] {
+            c.execute(
+                "INSERT INTO ics_subscriptions(name, url, color, created_at)                  VALUES('Team','https://example.com/team.ics','#38bdf8','t')",
+                [],
+            ).unwrap();
+            // These rows predate 0022 on a real upgrade: they exist with a locally-minted uuid, and
+            // the migration's backfill is what re-keys them. Replay exactly that sequence.
+            c.execute("UPDATE ics_subscriptions SET uuid = NULL", []).unwrap();
+            c.execute(db::ICS_UUID_BACKFILL, []).unwrap();
+        }
+
+        let ua: String = a.query_row("SELECT uuid FROM ics_subscriptions", [], |r| r.get(0)).unwrap();
+        let ub: String = b.query_row("SELECT uuid FROM ics_subscriptions", [], |r| r.get(0)).unwrap();
+        assert_eq!(ua, ub, "the same feed URL yields the same global id on every device");
+
+        let mut clock = HlcState::default();
+        let mut clock_b = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).unwrap();
+
+        assert_eq!(
+            scalar_i64(&b, "SELECT count(*) FROM ics_subscriptions"), 1,
+            "one feed stays one feed — the calendar list must not double after upgrading",
+        );
+    }
+
+    /// Removing a feed on one device removes it everywhere (the tombstone replicates).
+    #[test]
+    fn removing_an_ics_subscription_propagates() {
+        let a = db::test_conn();
+        let b = db::test_conn();
+        a.execute(
+            "INSERT INTO ics_subscriptions(name, url, color, created_at) VALUES('Team','https://e/t.ics','#38bdf8','t')",
+            [],
+        ).unwrap();
+        let mut clock = HlcState::default();
+        let mut clock_b = HlcState::default();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
+        apply_changes(&b, &mut clock_b, 2_000, &changes).unwrap();
+        assert_eq!(scalar_i64(&b, "SELECT count(*) FROM ics_subscriptions"), 1);
+
+        a.execute("DELETE FROM ics_subscriptions WHERE name = 'Team'", []).unwrap();
+        let changes = build_outbox(&a, "nodeA", &mut clock, 3_000).unwrap();
+        assert!(changes.iter().any(|c| c.table == "ics_subscriptions" && c.op == Op::Delete));
+        apply_changes(&b, &mut clock_b, 4_000, &changes).unwrap();
+        assert_eq!(scalar_i64(&b, "SELECT count(*) FROM ics_subscriptions"), 0, "the feed is gone everywhere");
+    }
+
+    /// The feed's mirrored events stay device-local. `db::replace_ics_events` refreshes by deleting
+    /// every event and re-inserting, so replicating them would have paired devices tombstoning and
+    /// re-creating each other's copies on every refresh. This also keeps the 9ae15ce regression
+    /// fixed: a raw local `ics_sub_id` on the wire failed a peer's FK check and aborted the ENTIRE
+    /// batch, so one .ics feed blocked all sync to a device without it.
+    #[test]
+    fn ics_events_stay_local_and_never_ship_a_feed_rowid() {
+        let a = db::test_conn();
+        let b = db::test_conn();
+
         a.execute(
             "INSERT INTO ics_subscriptions(name, url, color, created_at) VALUES('Team','https://e/t.ics','#38bdf8','t')",
             [],
@@ -581,19 +677,16 @@ mod tests {
 
         let mut clock = HlcState::default();
         let changes = build_outbox(&a, "nodeA", &mut clock, 1_000).unwrap();
-        let ev = changes.iter().find(|c| c.table == "events").expect("the ics event is still captured");
+        let ev = changes.iter().find(|c| c.table == "events").expect("the event row is still captured");
         assert!(!ev.fields.contains_key("ics_sub_id"), "a local feed rowid must never go on the wire");
-        assert!(!changes.iter().any(|c| c.table == "ics_subscriptions"), "the feed itself is not synced");
 
-        // B has no subscriptions at all, and enforces foreign keys exactly as `db::open` does.
+        // Apply on a peer with foreign keys enforced exactly as `db::open` sets them.
         b.pragma_update(None, "foreign_keys", "ON").unwrap();
         let mut clock_b = HlcState::default();
-        apply_changes(&b, &mut clock_b, 2_000, &changes).expect("apply must not be blocked by a foreign feed id");
-
-        assert_eq!(scalar_i64(&b, "SELECT count(*) FROM events WHERE title = 'Standup'"), 1, "the event lands");
+        apply_changes(&b, &mut clock_b, 2_000, &changes).expect("apply must not be blocked by a feed id");
         assert_eq!(
             scalar_i64(&b, "SELECT count(*) FROM events WHERE ics_sub_id IS NOT NULL"), 0,
-            "and carries no dangling feed id — so deleting an unrelated feed can't cascade it away",
+            "no dangling feed id — so deleting an unrelated feed can't cascade a synced event away",
         );
     }
 
