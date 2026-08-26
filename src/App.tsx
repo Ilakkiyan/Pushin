@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
+import PaneErrorBoundary from "./components/PaneErrorBoundary";
 import ConflictBanner from "./components/ConflictBanner";
 import UpdateBanner from "./components/UpdateBanner";
 import OpeningAnimation from "./components/OpeningAnimation";
@@ -275,6 +276,7 @@ export default function App() {
             <UpdateBanner />
             <ConflictBanner />
             <main className="flex-1 min-h-0 flex">
+              <PaneErrorBoundary resetKey={view}>
               {view === "today" && <TodayPane />}
               {view === "calendar" && (
                 <>
@@ -305,6 +307,7 @@ export default function App() {
               {view === "people" && <PeoplePane />}
               {view === "booking" && import.meta.env.DEV && <BookingPane />}
               {view === "settings" && <SettingsPane />}
+              </PaneErrorBoundary>
             </main>
           </div>
         </div>

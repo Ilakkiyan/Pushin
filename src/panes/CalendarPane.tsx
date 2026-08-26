@@ -419,7 +419,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                     top={top(parseLocal(ev.start))}
                     height={height(minutesBetweenEv(ev))}
                     color={colorByLabel ? primaryLabelColor(eventLabels[ev.id]) : null}
-                    onDelete={() => deleteEvent(ev.id)}
+                    onDelete={() => confirmDelete(ev.title) && deleteEvent(ev.id)}
                     onOpen={() => setDetail(ev)}
                     onDragStart={(e) => {
                       e.stopPropagation();
@@ -507,11 +507,18 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           ev={detail}
           onNotes={() => makeEventNote(detail)}
           onClose={() => { setDetail(null); setLabelRefresh((n) => n + 1); }}
-          onDelete={() => { deleteEvent(detail.id); setDetail(null); setLabelRefresh((n) => n + 1); }}
+          onDelete={() => { if (!confirmDelete(detail.title)) return; deleteEvent(detail.id); setDetail(null); setLabelRefresh((n) => n + 1); }}
         />
       )}
     </div>
   );
+}
+
+/** Confirm before destroying a calendar entry. The delete control is a hover-revealed "×" on a dense
+ *  week grid, one click from permanent, with no undo anywhere in the app — and the vault and label
+ *  editors already ask first, so not asking here was the odd one out. */
+function confirmDelete(title: string): boolean {
+  return window.confirm(`Delete "${title}"? This can't be undone.`);
 }
 
 function primaryLabelColor(labels: Label[] | undefined): string | null {

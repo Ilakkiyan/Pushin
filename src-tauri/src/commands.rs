@@ -35,6 +35,19 @@ pub struct AppState {
     pub vault_echo: crate::vault::EchoGuard,
 }
 
+impl AppState {
+    /// Lock the database, surviving a poisoned mutex.
+    ///
+    /// `Mutex::lock().unwrap()` panics forever once ANY thread has panicked while holding the lock —
+    /// so a single bug in one command bricked every later database call for the rest of the session,
+    /// and the only cure was restarting the app. Recovering the guard is safe here: SQLite rolls back
+    /// its own transactions, so the `Connection` is still consistent; what was lost is at most the
+    /// one operation that panicked. Losing that beats losing the process.
+    pub fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.db.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -64,7 +77,7 @@ pub struct LlmStatus {
 
 #[tauri::command]
 pub fn load_all(state: State<AppState>) -> Result<AppData, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     Ok(AppData {
         settings: db::get_settings(&conn).map_err(err)?,
         projects: db::list_projects(&conn).map_err(err)?,
@@ -78,7 +91,7 @@ pub fn load_all(state: State<AppState>) -> Result<AppData, String> {
 
 #[tauri::command]
 pub fn reschedule(state: State<AppState>) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
@@ -88,7 +101,7 @@ pub fn reschedule(state: State<AppState>) -> Result<ScheduleResult, String> {
 /// it's safe to call any time the schedule is shown. Mirrors `reschedule_inner`'s fixed-event inputs.
 #[tauri::command]
 pub fn explain_schedule(state: State<AppState>) -> Result<Vec<BlockReason>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let tasks = db::list_tasks(&conn).map_err(err)?;
     let events = db::list_events(&conn).map_err(err)?;
     let blocks = db::list_blocks(&conn).map_err(err)?;
@@ -107,7 +120,7 @@ pub fn explain_schedule(state: State<AppState>) -> Result<Vec<BlockReason>, Stri
 
 #[tauri::command]
 pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::save_settings(&conn, &settings).map_err(err)
 }
 
@@ -115,7 +128,7 @@ pub fn save_settings(state: State<AppState>, settings: Settings) -> Result<(), S
 
 #[tauri::command]
 pub fn list_ics_subscriptions(state: State<AppState>) -> Result<Vec<IcsSubscription>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_ics_subscriptions(&conn).map_err(err)
 }
 
@@ -136,14 +149,14 @@ async fn fetch_and_import_ics(state: &AppState, sub_id: i64, url: &str) -> Resul
         .map_err(|e| format!("couldn't read the calendar feed: {e}"))?;
     let events = crate::calendar::ics::parse_ics(&text);
     let n = events.len();
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let changed = db::replace_ics_events(&mut conn, sub_id, &events).map_err(err)?;
     Ok((n, changed))
 }
 
 /// Re-plan so tasks flow around the (fixed) subscription events.
 fn reschedule_after_ics(state: &AppState) {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     if let Ok(settings) = db::get_settings(&conn) {
         let _ = reschedule_inner(&mut conn, &settings);
     }
@@ -163,14 +176,14 @@ pub async fn add_ics_subscription(
     let name = if name.trim().is_empty() { "Subscribed calendar".to_string() } else { name.trim().to_string() };
     let color = color.unwrap_or_else(|| "#64748b".into());
     let id = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::insert_ics_subscription(&conn, &name, &url, &color).map_err(err)?
     };
     // Best-effort first import — if the feed is unreachable the subscription still exists so the user
     // can fix the URL and refresh.
     let _ = fetch_and_import_ics(state.inner(), id, &url).await;
     reschedule_after_ics(state.inner());
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_ics_subscriptions(&conn)
         .map_err(err)?
         .into_iter()
@@ -196,10 +209,7 @@ async fn refresh_each(state: &AppState, subs: &[crate::model::IcsSubscription]) 
 /// timer in `lib.rs`; a feed that hasn't moved must not reshuffle the user's day. Returns whether
 /// anything changed, so the caller can decide to tell the UI.
 pub(crate) async fn refresh_ics_once(state: &AppState) -> bool {
-    let subs = match state.db.lock() {
-        Ok(conn) => db::list_ics_subscriptions(&conn).unwrap_or_default(),
-        Err(_) => return false,
-    };
+    let subs = db::list_ics_subscriptions(&state.db()).unwrap_or_default();
     if subs.is_empty() {
         return false;
     }
@@ -213,7 +223,7 @@ pub(crate) async fn refresh_ics_once(state: &AppState) -> bool {
 #[tauri::command]
 pub async fn refresh_ics_subscriptions(state: State<'_, AppState>) -> Result<usize, String> {
     let subs = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::list_ics_subscriptions(&conn).map_err(err)?
     };
     let (total, _) = refresh_each(state.inner(), &subs).await;
@@ -223,7 +233,7 @@ pub async fn refresh_ics_subscriptions(state: State<'_, AppState>) -> Result<usi
 
 #[tauri::command]
 pub fn remove_ics_subscription(state: State<AppState>, id: i64) -> Result<(), String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     db::delete_ics_subscription(&conn, id).map_err(err)?;
     if let Ok(settings) = db::get_settings(&conn) {
         let _ = reschedule_inner(&mut conn, &settings);
@@ -237,7 +247,7 @@ pub fn remove_ics_subscription(state: State<AppState>, id: i64) -> Result<(), St
 #[tauri::command]
 pub fn vault_write(state: State<AppState>, page_id: i64, rel_path: String, markdown: String) -> Result<(), String> {
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let Some(dir) = db::get_settings(&conn).map_err(err)?.vault_dir else {
             return Ok(());
         };
@@ -255,14 +265,14 @@ pub fn vault_write(state: State<AppState>, page_id: i64, rel_path: String, markd
 /// The page currently mapped to `rel_path`, if any (file→page lookup used by the watcher path).
 #[tauri::command]
 pub fn vault_page_for_path(state: State<AppState>, rel_path: String) -> Result<Option<i64>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::page_id_for_rel_path(&conn, &rel_path).map_err(err)
 }
 
 /// Map an externally-created file to a (just-created) page, without writing the file back.
 #[tauri::command]
 pub fn vault_link_path(state: State<AppState>, page_id: i64, rel_path: String) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::set_page_rel_path(&conn, page_id, Some(&rel_path)).map_err(err)
 }
 
@@ -270,7 +280,7 @@ pub fn vault_link_path(state: State<AppState>, page_id: i64, rel_path: String) -
 /// an external `rm` would be too destructive).
 #[tauri::command]
 pub fn vault_unlink_path(state: State<AppState>, rel_path: String) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::unlink_rel_path(&conn, &rel_path).map_err(err)
 }
 
@@ -285,7 +295,7 @@ pub fn vault_refresh_watch(state: State<AppState>, app: tauri::AppHandle) -> Res
 /// Sync the watcher to the `vault_dir` setting. Best-effort — a failed watch never breaks the app.
 pub fn start_vault_watch(app: &tauri::AppHandle, state: &AppState) {
     let dir = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).ok().and_then(|s| s.vault_dir)
     };
     let next = dir.and_then(|d| crate::vault::start_watch(&d, app.clone(), state.vault_echo.clone()).ok());
@@ -337,7 +347,7 @@ pub async fn plan_tasks(
     history: Option<Vec<parser::ChatTurn>>,
 ) -> Result<PlanOutcome, String> {
     let (settings, current_events) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         (db::get_settings(&conn).map_err(err)?, db::list_events(&conn).map_err(err)?)
     };
     // Auto-recall relevant durable notes (pages) to inform planning. Pages only: the planner already
@@ -352,7 +362,7 @@ pub async fn plan_tasks(
         .await
         .map_err(err)?;
 
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let mut outcome = parser::store_plan(&conn, &settings, &parsed).map_err(err)?;
     // A habit the user just described in chat should land ON the calendar, not merely sit in the Habits
     // list. Auto-schedule each newly-created habit across the planning horizon before re-planning tasks.
@@ -385,7 +395,7 @@ pub async fn extract_memories(state: State<'_, AppState>, text: String) -> Resul
         return Ok(vec![]);
     }
     let settings = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?
     };
     Ok(parser::extract_memories(&state.http, &settings, &text).await.unwrap_or_default())
@@ -402,7 +412,7 @@ pub fn create_task(
     priority: i64,
     project_id: Option<i64>,
 ) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     let deadline = deadline.and_then(|d| scheduler::parse_dt(&d).map(scheduler::fmt_dt));
     db::insert_task(
@@ -423,7 +433,7 @@ pub fn create_task(
 
 #[tauri::command]
 pub fn set_task_status(state: State<AppState>, id: i64, status: String) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::set_task_status(&conn, id, &status).map_err(err)?;
     // Finishing it settles the score: the rollover count is a "you keep pushing this" nag, so it
@@ -441,7 +451,7 @@ pub fn set_task_status(state: State<AppState>, id: i64, status: String) -> Resul
 /// the batch rather than one per task.
 #[tauri::command]
 pub fn archive_tasks(state: State<AppState>, ids: Vec<i64>) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     for id in ids {
         db::set_task_status(&conn, id, "archived").map_err(err)?;
@@ -451,7 +461,7 @@ pub fn archive_tasks(state: State<AppState>, ids: Vec<i64>) -> Result<ScheduleRe
 
 #[tauri::command]
 pub fn delete_task(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::delete_task(&conn, id).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -461,7 +471,7 @@ pub fn delete_task(state: State<AppState>, id: i64) -> Result<ScheduleResult, St
 
 #[tauri::command]
 pub fn delete_project(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::delete_project(&conn, id).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -469,7 +479,7 @@ pub fn delete_project(state: State<AppState>, id: i64) -> Result<ScheduleResult,
 
 #[tauri::command]
 pub fn set_project_archived(state: State<AppState>, id: i64, archived: bool) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::set_project_archived(&conn, id, archived).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -485,7 +495,7 @@ pub fn add_event(
     end: String,
     kind: String,
 ) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::insert_event(&conn, &title, &start, &end, &kind).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -493,7 +503,7 @@ pub fn add_event(
 
 #[tauri::command]
 pub fn delete_event(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::delete_event(&conn, id).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -508,7 +518,7 @@ pub fn lock_block(
     start: String,
     end: String,
 ) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::set_block_locked(&conn, id, locked, &start, &end).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -518,7 +528,7 @@ pub fn lock_block(
 
 #[tauri::command]
 pub fn list_event_types(state: State<AppState>) -> Result<Vec<EventType>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_event_types(&conn).map_err(err)
 }
 
@@ -530,7 +540,7 @@ pub fn create_event_type(
     buffer_minutes: i64,
     color: String,
 ) -> Result<i64, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::insert_event_type(&conn, &name, duration_minutes, buffer_minutes, &color).map_err(err)
 }
 
@@ -544,19 +554,19 @@ pub fn update_event_type(
     color: String,
     enabled: bool,
 ) -> Result<EventType, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::update_event_type(&conn, id, &name, duration_minutes, buffer_minutes, &color, enabled).map_err(err)
 }
 
 #[tauri::command]
 pub fn regenerate_event_type_token(state: State<AppState>, id: i64) -> Result<EventType, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::regenerate_event_type_token(&conn, id).map_err(err)
 }
 
 #[tauri::command]
 pub fn delete_event_type(state: State<AppState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_event_type(&conn, id).map_err(err)
 }
 
@@ -620,7 +630,7 @@ fn habit_stats(conn: &Connection) -> anyhow::Result<Vec<HabitStats>> {
 
 #[tauri::command]
 pub fn list_habits(state: State<AppState>) -> Result<Vec<HabitStats>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     habit_stats(&conn).map_err(err)
 }
 
@@ -635,7 +645,7 @@ pub fn create_habit(
     interval_days: i64,
     duration_minutes: i64,
 ) -> Result<Vec<HabitStats>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::insert_habit(&conn, &name, &color, &cadence, &days, interval_days.max(1), duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
     habit_stats(&conn).map_err(err)
 }
@@ -652,7 +662,7 @@ pub fn update_habit(
     interval_days: i64,
     duration_minutes: i64,
 ) -> Result<Vec<HabitStats>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::update_habit(&conn, id, &name, &color, &cadence, &days, interval_days.max(1), duration_minutes.clamp(5, 24 * 60)).map_err(err)?;
     habit_stats(&conn).map_err(err)
 }
@@ -733,7 +743,7 @@ fn find_habit(conn: &Connection, id: i64) -> Result<Habit, String> {
 /// Drop a habit onto the calendar for a single day (default today), then re-plan.
 #[tauri::command]
 pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     let now = Local::now().naive_local();
     let day_date = day
@@ -755,7 +765,7 @@ pub fn schedule_habit(state: State<AppState>, id: i64, day: Option<String>) -> R
 /// what time you like each habit" by watching where you drag it, non-destructively.
 #[tauri::command]
 pub fn move_habit(state: State<AppState>, event_id: i64, new_start: String) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
 
     let ev = db::list_events(&conn)
@@ -784,7 +794,7 @@ pub fn move_habit(state: State<AppState>, event_id: i64, new_start: String) -> R
 /// full). Off: remove its instances from today forward (past days stay as history). Re-plans once.
 #[tauri::command]
 pub fn set_habit_scheduled(state: State<AppState>, id: i64, scheduled: bool) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     let now = Local::now().naive_local();
     let habit = find_habit(&conn, id)?;
@@ -812,7 +822,7 @@ pub fn set_habit_scheduled(state: State<AppState>, id: i64, scheduled: bool) -> 
 /// Toggle a habit's completion for a day ("YYYY-MM-DD"); defaults to today.
 #[tauri::command]
 pub fn toggle_habit(state: State<AppState>, id: i64, day: Option<String>) -> Result<Vec<HabitStats>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let day = day.unwrap_or_else(|| Local::now().naive_local().date().format("%Y-%m-%d").to_string());
     db::toggle_habit_log(&conn, id, &day).map_err(err)?;
     habit_stats(&conn).map_err(err)
@@ -820,14 +830,14 @@ pub fn toggle_habit(state: State<AppState>, id: i64, day: Option<String>) -> Res
 
 #[tauri::command]
 pub fn delete_habit(state: State<AppState>, id: i64) -> Result<Vec<HabitStats>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_habit(&conn, id).map_err(err)?;
     habit_stats(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn booking_slots(state: State<AppState>, event_type_id: i64, horizon_days: i64) -> Result<Vec<BookingSlot>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     let et = db::list_event_types(&conn)
         .map_err(err)?
@@ -846,7 +856,7 @@ pub fn create_booking(
     start: String,
     end: String,
 ) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     let et = db::get_event_type(&conn, event_type_id).map_err(err)?;
     booking::confirm_booking(&mut conn, &settings, &et, &name, &email, &start, &end).map_err(err)?;
@@ -855,7 +865,7 @@ pub fn create_booking(
 
 #[tauri::command]
 pub fn cancel_booking(state: State<AppState>, id: i64) -> Result<ScheduleResult, String> {
-    let mut conn = state.db.lock().unwrap();
+    let mut conn = state.db();
     let settings = db::get_settings(&conn).map_err(err)?;
     db::cancel_booking(&mut conn, id).map_err(err)?;
     reschedule_inner(&mut conn, &settings).map_err(err)
@@ -867,13 +877,13 @@ pub fn cancel_booking(state: State<AppState>, id: i64) -> Result<ScheduleResult,
 #[tauri::command]
 pub async fn connect_google(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let (client_id, client_secret) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let s = db::get_settings(&conn).map_err(err)?;
         (s.google_client_id.clone(), s.google_client_secret.clone())
     };
     let connected = google::connect(&app, &state.http, &client_id, &client_secret).await.map_err(err)?;
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::save_google_account(
             &conn,
             &connected.email,
@@ -904,7 +914,7 @@ pub async fn connect_google(app: AppHandle, state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 pub fn disconnect_google(state: State<AppState>) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_google_account(&conn).map_err(err)?;
     // Deleting the shared link propagates the disconnect to the user's other devices (its tombstone
     // also clears the refresh token from their keychains).
@@ -920,7 +930,7 @@ pub fn disconnect_google(state: State<AppState>) -> Result<(), String> {
 pub async fn sync_google(state: State<'_, AppState>) -> Result<google::SyncSummary, String> {
     let summary = google::sync(state.db.as_ref(), &state.http).await.map_err(err)?;
     {
-        let mut conn = state.db.lock().unwrap();
+        let mut conn = state.db();
         let settings = db::get_settings(&conn).map_err(err)?;
         reschedule_inner(&mut conn, &settings).map_err(err)?;
     }
@@ -933,7 +943,7 @@ pub async fn sync_google(state: State<'_, AppState>) -> Result<google::SyncSumma
 #[tauri::command]
 pub async fn llm_status(app: AppHandle, state: State<'_, AppState>) -> Result<LlmStatus, String> {
     let (base_url, model_id) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let s = db::get_settings(&conn).map_err(err)?;
         (s.llm_base_url.clone(), s.model_id.clone())
     };
@@ -1001,7 +1011,7 @@ async fn await_ready_and_warm(client: &reqwest::Client, base_url: &str, model: &
 #[tauri::command]
 pub async fn ensure_inference(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let (base_url, model_id) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let s = db::get_settings(&conn).map_err(err)?;
         (s.llm_base_url.clone(), s.model_id.clone())
     };
@@ -1021,7 +1031,7 @@ pub async fn ensure_inference(app: AppHandle, state: State<'_, AppState>) -> Res
 
     // Persist the choice so the UI + future starts agree on the active model.
     if model_to_use != model_id {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let mut s = db::get_settings(&conn).map_err(err)?;
         s.model_id = model_to_use.clone();
         db::save_settings(&conn, &s).map_err(err)?;
@@ -1053,7 +1063,7 @@ pub async fn ensure_inference(app: AppHandle, state: State<'_, AppState>) -> Res
 #[tauri::command]
 pub async fn restart_inference(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let (base_url, model_id) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let s = db::get_settings(&conn).map_err(err)?;
         (s.llm_base_url.clone(), s.model_id.clone())
     };
@@ -1130,7 +1140,7 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
     // Short lock to read embedding config; dropped before the network call (gotcha #8).
     let base = model_manager::embed_base_url();
     let model = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?.embed_model
     };
     let blob = if model.trim().is_empty() {
@@ -1138,7 +1148,7 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
     } else {
         hermes::embed_text(&state.http, &base, &model, &content).await.ok().map(|v| hermes::vec_to_blob(&v))
     };
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     // Stored as a MEMORY (origin='memory'), not a user vault page — it stays out of the vault tree and
     // shows in Settings ▸ AI Memory, but still feeds recall.
     db::insert_memory(&conn, &content, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
@@ -1148,14 +1158,14 @@ pub async fn hermes_add_note(state: State<'_, AppState>, content: String) -> Res
 /// The AI-tracked memory facts (from the chat "Remember this?" chip), newest first — for Settings.
 #[tauri::command]
 pub fn list_memories(state: State<AppState>) -> Result<Vec<crate::model::Memory>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_memories(&conn).map_err(err)
 }
 
 /// Forget an AI-tracked memory fact.
 #[tauri::command]
 pub fn delete_memory(state: State<AppState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_memory(&conn, id).map_err(err)
 }
 
@@ -1164,7 +1174,7 @@ pub fn delete_memory(state: State<AppState>, id: i64) -> Result<(), String> {
 /// keyword. The DB lock is never held across the embed `.await` (gotcha #8).
 async fn recall_notes(state: &State<'_, AppState>, query: &str, k: usize) -> Result<RecallResult, String> {
     let model = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?.embed_model
     };
     let qvec = if model.trim().is_empty() {
@@ -1174,7 +1184,7 @@ async fn recall_notes(state: &State<'_, AppState>, query: &str, k: usize) -> Res
         hermes::embed_text(&state.http, &base, &model, query).await.ok()
     };
     let notes = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::notes_for_recall(&conn).map_err(err)?
     };
     let (mode, ranked) = hermes::rank_notes(notes, qvec.as_deref(), query, k);
@@ -1198,7 +1208,7 @@ pub async fn hermes_recall(state: State<'_, AppState>, query: String, k: Option<
 /// The DB lock is never held across the embed `.await` (gotcha #8).
 async fn recall_context(state: &State<'_, AppState>, query: &str, kinds: &[EntityKind], k: usize) -> Result<crate::context::ContextBundle, String> {
     let model = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?.embed_model
     };
     let qvec = if model.trim().is_empty() {
@@ -1209,7 +1219,7 @@ async fn recall_context(state: &State<'_, AppState>, query: &str, kinds: &[Entit
     };
     // One lock: rank the index snapshot, then resolve neighbors + recency from the same connection.
     let (mode, top, neighbors, recency) = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         let all = db::entity_index_for_recall(&conn, kinds).map_err(err)?;
         let text_map: HashMap<(EntityKind, i64), String> = all.iter().map(|it| ((it.kind, it.id), it.text.clone())).collect();
         let (mode, top) = hermes::rank_items(all, qvec.as_deref(), query, k);
@@ -1241,7 +1251,7 @@ async fn recall_context(state: &State<'_, AppState>, query: &str, kinds: &[Entit
 /// The DB lock is taken only to read the model name and dropped before the network call (gotcha #8).
 async fn embed_best_effort(state: &State<'_, AppState>, text: &str) -> (Option<Vec<u8>>, String) {
     let model = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map(|s| s.embed_model).unwrap_or_default()
     };
     if text.trim().is_empty() || model.trim().is_empty() {
@@ -1264,7 +1274,7 @@ pub async fn reindex_all(db: Arc<Mutex<Connection>>, http: reqwest::Client) -> u
 
     // 1. Snapshot model + entities + existing index state under one short lock.
     let (model, items, existing) = {
-        let conn = db.lock().unwrap();
+        let conn = db.lock().unwrap_or_else(|e| e.into_inner());
         let model = db::get_settings(&conn).map(|s| s.embed_model).unwrap_or_default();
         let items = match db::entities_for_index(&conn) {
             Ok(v) => v,
@@ -1313,7 +1323,7 @@ pub async fn reindex_all(db: Arc<Mutex<Connection>>, http: reqwest::Client) -> u
     };
 
     // 4. Write under a short lock.
-    let conn = db.lock().unwrap();
+    let conn = db.lock().unwrap_or_else(|e| e.into_inner());
     let mut embedded = 0usize;
     for (it, hash, blob) in &prepared {
         let model_used = blob.as_ref().map(|_| model.as_str());
@@ -1340,14 +1350,14 @@ fn spawn_reindex(state: &State<'_, AppState>) {
 /// The vault page tree (lightweight rows — no bodies).
 #[tauri::command]
 pub fn list_pages(state: State<AppState>) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_pages(&conn).map_err(err)
 }
 
 /// A single page with its full body (for the editor).
 #[tauri::command]
 pub fn get_page(state: State<AppState>, id: i64) -> Result<Page, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::get_page(&conn, id).map_err(err)
 }
 
@@ -1357,7 +1367,7 @@ pub async fn create_page(state: State<'_, AppState>, title: String, parent_id: O
     let title = title.trim().to_string();
     let content = content.unwrap_or_default();
     let (blob, model) = embed_best_effort(&state, &content).await;
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let id = db::insert_page(
         &conn,
         if title.is_empty() { "Untitled" } else { &title },
@@ -1386,7 +1396,7 @@ pub async fn update_page(
 ) -> Result<Page, String> {
     let title = title.trim().to_string();
     let (blob, model) = embed_best_effort(&state, &content).await;
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::update_page(
         &conn,
         id,
@@ -1406,7 +1416,7 @@ pub async fn update_page(
 /// ON DELETE SET NULL FK). Returns the refreshed tree.
 #[tauri::command]
 pub fn delete_page(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_note(&conn, id).map_err(err)?;
     db::list_pages(&conn).map_err(err)
 }
@@ -1414,7 +1424,7 @@ pub fn delete_page(state: State<AppState>, id: i64) -> Result<Vec<Page>, String>
 /// Reparent / reorder a page in the tree. Returns the refreshed tree.
 #[tauri::command]
 pub fn move_page(state: State<AppState>, id: i64, parent_id: Option<i64>, sort_order: f64) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::move_page(&conn, id, parent_id, sort_order).map_err(err)?;
     db::list_pages(&conn).map_err(err)
 }
@@ -1422,28 +1432,28 @@ pub fn move_page(state: State<AppState>, id: i64, parent_id: Option<i64>, sort_o
 /// Pages that link to this one ("Linked references").
 #[tauri::command]
 pub fn page_backlinks(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::page_backlinks(&conn, id).map_err(err)
 }
 
 /// Free-text search over page titles + bodies (for the link picker and command palette).
 #[tauri::command]
 pub fn search_pages(state: State<AppState>, query: String) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::search_pages(&conn, &query).map_err(err)
 }
 
 /// Pages that mention this page's title but don't link it ("unlinked mentions").
 #[tauri::command]
 pub fn unlinked_mentions(state: State<AppState>, id: i64) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::unlinked_mentions(&conn, id).map_err(err)
 }
 
 /// The whole vault connection graph (nodes + resolved link edges).
 #[tauri::command]
 pub fn page_graph(state: State<AppState>) -> Result<PageGraph, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::page_graph(&conn).map_err(err)
 }
 
@@ -1455,7 +1465,7 @@ pub async fn capture_note(state: State<'_, AppState>, text: String) -> Result<()
         return Err("Nothing to capture.".into());
     }
     let (blob, model) = embed_best_effort(&state, &text).await;
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::capture(&conn, &text, blob.as_deref(), blob.as_ref().map(|_| model.as_str())).map_err(err)?;
     Ok(())
 }
@@ -1463,14 +1473,14 @@ pub async fn capture_note(state: State<'_, AppState>, text: String) -> Result<()
 /// The unsorted Inbox.
 #[tauri::command]
 pub fn list_inbox(state: State<AppState>) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_inbox(&conn).map_err(err)
 }
 
 /// Keep an Inbox capture as a normal vault page (clears its inbox flag).
 #[tauri::command]
 pub fn keep_inbox_note(state: State<AppState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::clear_inbox(&conn, id).map_err(err)
 }
 
@@ -1481,7 +1491,7 @@ pub fn daily_note(state: State<AppState>, date: String) -> Result<Page, String> 
     let title = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map(|d| format!("{}, {} {}, {}", d.format("%A"), d.format("%B"), d.day(), d.year()))
         .unwrap_or_else(|_| date.clone());
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::get_or_create_daily(&conn, &date, &title).map_err(err)
 }
 
@@ -1531,27 +1541,27 @@ pub fn read_markdown_dir(path: String) -> Result<Vec<ImportDoc>, String> {
 /// Link / unlink a page to a task or event (`kind` = "task" | "event").
 #[tauri::command]
 pub fn link_page_entity(state: State<AppState>, page_id: i64, kind: String, entity_id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::link_entity(&conn, page_id, &kind, entity_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn unlink_page_entity(state: State<AppState>, page_id: i64, kind: String, entity_id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::unlink_entity(&conn, page_id, &kind, entity_id).map_err(err)
 }
 
 /// The tasks/events a page references (for the editor's "Linked tasks & events" strip).
 #[tauri::command]
 pub fn page_entities(state: State<AppState>, page_id: i64) -> Result<Vec<EntityRef>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::page_entities(&conn, page_id).map_err(err)
 }
 
 /// The pages that reference a given task/event (for a "Notes" affordance on it).
 #[tauri::command]
 pub fn entity_pages(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Page>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::entity_pages(&conn, &kind, entity_id).map_err(err)
 }
 
@@ -1560,35 +1570,35 @@ pub fn entity_pages(state: State<AppState>, kind: String, entity_id: i64) -> Res
 /// All non-archived labels with usage counts.
 #[tauri::command]
 pub fn list_labels(state: State<AppState>) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_labels(&conn).map_err(err)
 }
 
 /// Create a label; returns the refreshed list.
 #[tauri::command]
 pub fn create_label(state: State<AppState>, input: LabelInput) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::create_label(&conn, &input).map_err(err)?;
     db::list_labels(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn update_label(state: State<AppState>, id: i64, input: LabelInput) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::update_label(&conn, id, &input).map_err(err)?;
     db::list_labels(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn delete_label(state: State<AppState>, id: i64) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_label(&conn, id).map_err(err)?;
     db::list_labels(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn merge_labels(state: State<AppState>, from: i64, into: i64) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::merge_labels(&conn, from, into).map_err(err)?;
     db::list_labels(&conn).map_err(err)
 }
@@ -1596,28 +1606,28 @@ pub fn merge_labels(state: State<AppState>, from: i64, into: i64) -> Result<Vec<
 /// Replace the full label set on an entity (`kind` = task|event|habit|page|project).
 #[tauri::command]
 pub fn set_entity_labels(state: State<AppState>, kind: String, entity_id: i64, label_ids: Vec<i64>) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::set_entity_labels(&conn, &kind, entity_id, &label_ids).map_err(err)
 }
 
 /// The labels on an entity.
 #[tauri::command]
 pub fn labels_for(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::labels_for(&conn, &kind, entity_id).map_err(err)
 }
 
 /// Labels for many entities of one kind in a single call, keyed by entity id.
 #[tauri::command]
 pub fn labels_for_entities(state: State<AppState>, kind: String, ids: Vec<i64>) -> Result<std::collections::BTreeMap<i64, Vec<Label>>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::labels_for_entities(&conn, &kind, &ids).map_err(err)
 }
 
 /// Quick "create on the fly" from the picker — find-or-create by name; returns the refreshed list.
 #[tauri::command]
 pub fn quick_label(state: State<AppState>, name: String, color: String) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::get_or_create_label(&conn, &name, &color).map_err(err)?;
     db::list_labels(&conn).map_err(err)
 }
@@ -1625,7 +1635,7 @@ pub fn quick_label(state: State<AppState>, name: String, color: String) -> Resul
 /// Every entity tagged with a label (for the cross-cutting filtered view).
 #[tauri::command]
 pub fn entities_for_label(state: State<AppState>, label_id: i64) -> Result<Vec<EntityRef>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::entities_for_label(&conn, label_id).map_err(err)
 }
 
@@ -1651,7 +1661,7 @@ pub async fn vault_ask(state: State<'_, AppState>, question: String) -> Result<V
     let ids: Vec<i64> = recalled.items.iter().map(|it| if it.kind == EntityKind::Page { it.id } else { 0 }).collect();
 
     let settings = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?
     };
     let system = format!(
@@ -1713,7 +1723,7 @@ pub async fn assistant_chat(state: State<'_, AppState>, message: String, history
         _ => String::new(),
     };
     let settings = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?
     };
     let profile = settings.profile_prompt(); // the "About you" setup profile, if filled in
@@ -1753,7 +1763,7 @@ pub async fn route_intent(state: State<'_, AppState>, message: String) -> Result
         return Ok("plan".into());
     }
     let settings = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?
     };
     let system = "Route the user's message to one of two handlers. Answer with intent \"plan\" ONLY if \
@@ -1817,7 +1827,7 @@ fn has_clock_time(lc: &str) -> bool {
 /// text and aren't already applied. Surfaced as confirm-chips in the label picker.
 #[tauri::command]
 pub fn suggest_labels(state: State<AppState>, kind: String, entity_id: i64) -> Result<Vec<Label>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let Some(text) = db::entity_text(&conn, &kind, entity_id).map_err(err)? else {
         return Ok(vec![]);
     };
@@ -1830,32 +1840,32 @@ pub fn suggest_labels(state: State<AppState>, kind: String, entity_id: i64) -> R
 
 #[tauri::command]
 pub fn list_people(state: State<AppState>) -> Result<Vec<Person>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::list_people(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn get_person(state: State<AppState>, id: i64) -> Result<Person, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::get_person(&conn, id).map_err(err)
 }
 
 #[tauri::command]
 pub fn create_person(state: State<AppState>, name: String, email: Option<String>, notes: Option<String>) -> Result<Person, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let id = db::insert_person(&conn, &name, email.as_deref(), &notes.unwrap_or_default()).map_err(err)?;
     db::get_person(&conn, id).map_err(err)
 }
 
 #[tauri::command]
 pub fn update_person(state: State<AppState>, id: i64, name: String, email: Option<String>, notes: String) -> Result<Person, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::update_person(&conn, id, &name, email.as_deref(), &notes).map_err(err)
 }
 
 #[tauri::command]
 pub fn delete_person(state: State<AppState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::delete_person(&conn, id).map_err(err)
 }
 
@@ -1863,25 +1873,25 @@ pub fn delete_person(state: State<AppState>, id: i64) -> Result<(), String> {
 
 #[tauri::command]
 pub fn start_focus(state: State<AppState>, task_id: i64) -> Result<FocusSession, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::start_focus(&conn, task_id).map_err(err)
 }
 
 #[tauri::command]
 pub fn stop_focus(state: State<AppState>, id: i64) -> Result<(), String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::stop_focus(&conn, id).map_err(err)
 }
 
 #[tauri::command]
 pub fn active_focus(state: State<AppState>) -> Result<Option<FocusSession>, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::active_focus(&conn).map_err(err)
 }
 
 #[tauri::command]
 pub fn task_focus_minutes(state: State<AppState>, task_id: i64) -> Result<i64, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     db::focus_minutes_for_task(&conn, task_id).map_err(err)
 }
 
@@ -1914,7 +1924,7 @@ pub async fn extract_action_items(state: State<'_, AppState>, notes: String) -> 
         return Ok(vec![]);
     }
     let settings = {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db();
         db::get_settings(&conn).map_err(err)?
     };
     let schema = serde_json::json!({
@@ -1942,7 +1952,7 @@ do NOT invent any. If there are none, return an empty list.";
 /// relationship history, plus notes linked to the meeting.
 #[tauri::command]
 pub fn meeting_brief(state: State<AppState>, event_id: i64) -> Result<MeetingBrief, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let event = db::list_events(&conn)
         .map_err(err)?
         .into_iter()
@@ -1960,7 +1970,7 @@ pub fn meeting_brief(state: State<AppState>, event_id: i64) -> Result<MeetingBri
 /// Deterministic — assembled from SQLite, no LLM. `date` defaults to today (`YYYY-MM-DD`).
 #[tauri::command]
 pub fn daily_briefing(state: State<AppState>, date: Option<String>) -> Result<crate::briefing::Briefing, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db();
     let today = date
         .as_deref()
         .and_then(|d| NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok())
@@ -2028,7 +2038,7 @@ pub struct SyncStatus {
 fn build_status(state: &AppState) -> Result<SyncStatus, String> {
     let enabled = sync::identity::mesh_secret().is_some();
     let running = state.sync_engine.lock().map_err(err)?.is_some();
-    let conn = state.db.lock().map_err(err)?;
+    let conn = state.db();
     Ok(SyncStatus {
         enabled,
         running,
@@ -2059,7 +2069,7 @@ pub(crate) async fn ensure_engine(app: AppHandle, state: &AppState) -> Result<Ar
         *state.sync_engine.lock().map_err(err)? = None;
         e.shutdown().await;
     }
-    let use_relay = { sync::state::use_relay(&*state.db.lock().map_err(err)?) };
+    let use_relay = { sync::state::use_relay(&*state.db()) };
     let engine = SyncEngine::start(state.db.clone(), app, state.http.clone(), use_relay).await.map_err(err)?;
     *state.sync_engine.lock().map_err(err)? = Some(engine.clone());
     Ok(engine)
@@ -2108,13 +2118,13 @@ pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<usiz
 
 #[tauri::command]
 pub async fn sync_remove_peer(state: State<'_, AppState>, node_id: String) -> Result<(), String> {
-    let conn = state.db.lock().map_err(err)?;
+    let conn = state.db();
     sync::state::remove_peer(&conn, &node_id).map_err(err)
 }
 
 #[tauri::command]
 pub async fn sync_set_device_name(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    let conn = state.db.lock().map_err(err)?;
+    let conn = state.db();
     sync::state::set_device_name(&conn, &name).map_err(err)
 }
 
@@ -2122,7 +2132,7 @@ pub async fn sync_set_device_name(state: State<'_, AppState>, name: String) -> R
 #[tauri::command]
 pub async fn sync_set_relay(app: AppHandle, state: State<'_, AppState>, use_relay: bool) -> Result<(), String> {
     {
-        let conn = state.db.lock().map_err(err)?;
+        let conn = state.db();
         sync::state::set_use_relay(&conn, use_relay).map_err(err)?;
     }
     // Take the engine out (dropping the lock guard) before awaiting its shutdown.
@@ -2144,7 +2154,7 @@ pub async fn sync_leave(state: State<'_, AppState>) -> Result<(), String> {
         e.shutdown().await;
     }
     sync::identity::forget_mesh();
-    let conn = state.db.lock().map_err(err)?;
+    let conn = state.db();
     for p in sync::state::list_peers(&conn).unwrap_or_default() {
         let _ = sync::state::remove_peer(&conn, &p.node_id);
     }

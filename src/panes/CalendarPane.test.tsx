@@ -336,3 +336,35 @@ describe("CalendarPane — habits and events", () => {
     expect(screen.queryByText("Next month")).toBeNull();
   });
 });
+describe("CalendarPane — destructive actions", () => {
+  it("asks before deleting an event, and does nothing if declined", async () => {
+    seed({ events: [event(5, "Dentist", at(14), at(15))] });
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    useStore.setState({ deleteEvent } as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<CalendarPane />);
+
+    // The "×" is hover-revealed but present in the DOM; click it directly.
+    const card = blockCard("Dentist");
+    const x = card.querySelector("button");
+    expect(x).not.toBeNull();
+    await userEvent.click(x!);
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(deleteEvent).not.toHaveBeenCalled();
+    confirmSpy.mockRestore();
+  });
+
+  it("deletes once the user confirms", async () => {
+    seed({ events: [event(5, "Dentist", at(14), at(15))] });
+    const deleteEvent = vi.fn().mockResolvedValue(undefined);
+    useStore.setState({ deleteEvent } as never);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<CalendarPane />);
+
+    await userEvent.click(blockCard("Dentist").querySelector("button")!);
+    await waitFor(() => expect(deleteEvent).toHaveBeenCalledWith(5));
+    confirmSpy.mockRestore();
+  });
+});
+

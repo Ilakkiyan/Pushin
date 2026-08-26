@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useCreateBlockNote, SuggestionMenuController, getDefaultReactSlashMenuItems, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { filterSuggestionItems } from "@blocknote/core";
 import { BlockNoteView } from "@blocknote/mantine";
-import { Check, FileText, Loader2, Link2, CheckSquare, CalendarDays } from "lucide-react";
+import { Check, FileText, Loader2, Link2, CheckSquare, CalendarDays, AlertTriangle } from "lucide-react";
 import { useStore } from "../state/store";
 import { api, type Page, type EntityRef } from "../lib/ipc";
 import { blocksToPlainText, extractLinkTitles, pageToInitialContent } from "../lib/blocks";
@@ -11,6 +11,9 @@ import { schema, type PartialPageBlock } from "../lib/editorSchema";
 import LabelPicker from "./LabelPicker";
 
 const SAVE_DEBOUNCE_MS = 600;
+// A failed save retries on its own; without this a transient failure waits for the next keystroke,
+// and a user who has stopped typing never gets one.
+const SAVE_RETRY_MS = 5000;
 
 /** The Notion-style document editor for a single vault page. Mounted with `key={page.id}` so it
  *  resets cleanly when switching pages. Autosaves (debounced) title + block JSON + derived plaintext
@@ -25,7 +28,7 @@ export default function PageEditor({ page }: { page: Page }) {
   const setView = useStore((s) => s.setView);
   const settings = useStore((s) => s.settings);
   const [title, setTitle] = useState(page.title === "Untitled" ? "" : page.title);
-  const [status, setStatus] = useState<"idle" | "saving" | "saved">("idle");
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [backlinks, setBacklinks] = useState<Page[]>([]);
   const [mentions, setMentions] = useState<Page[]>([]);
   const [entities, setEntities] = useState<EntityRef[]>([]);
@@ -88,7 +91,12 @@ export default function PageEditor({ page }: { page: Page }) {
         setStatus("saved");
         refreshBacklinks();
       } catch {
-        setStatus("idle");
+        // A failed save used to fall back to "idle", which renders exactly like "nothing to save" —
+        // so the user kept typing into a page that was no longer being persisted, with no clue. Say
+        // so, and keep `dirty` set (persist() throws before clearing it) so the retry below can win.
+        setStatus("error");
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => scheduleSave(), SAVE_RETRY_MS);
       }
     }, SAVE_DEBOUNCE_MS);
   };
@@ -190,6 +198,11 @@ export default function PageEditor({ page }: { page: Page }) {
           {status === "saved" && (
             <span className="text-[11px] text-gray-600 flex items-center gap-1">
               <Check className="size-3" /> Saved
+            </span>
+          )}
+          {status === "error" && (
+            <span className="text-[11px] text-amber-400 flex items-center gap-1" role="status">
+              <AlertTriangle className="size-3" /> Couldn&apos;t save — retrying
             </span>
           )}
         </div>

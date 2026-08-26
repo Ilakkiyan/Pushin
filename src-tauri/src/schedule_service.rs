@@ -325,8 +325,21 @@ mod tests {
         let r = reschedule_inner(&mut conn, &s).unwrap();
 
         let blocks: Vec<Block> = db::list_blocks(&conn).unwrap().into_iter().filter(|b| b.task_id == t).collect();
-        assert_eq!(blocks.len(), 1, "an overdue task is still put on the calendar");
-        assert!(scheduler::parse_dt(&blocks[0].start).unwrap() >= now);
+        // Assert it is SCHEDULED, not that it landed in exactly one block. The bug this guards is
+        // "no block at all"; how many chunks it takes is the scheduler's business and depends on the
+        // clock — run this after ~16:00 and a 60m task with a 30m min-chunk correctly splits across
+        // the work-day boundary, which made the old `len() == 1` fail every afternoon.
+        assert!(!blocks.is_empty(), "an overdue task is still put on the calendar");
+        let scheduled: i64 = blocks
+            .iter()
+            .map(|b| {
+                let (st, en) = (scheduler::parse_dt(&b.start).unwrap(), scheduler::parse_dt(&b.end).unwrap());
+                (en - st).num_minutes()
+            })
+            .sum();
+        assert_eq!(scheduled, 60, "all of its estimate is placed, however it is chunked");
+        let earliest = blocks.iter().map(|b| scheduler::parse_dt(&b.start).unwrap()).min().unwrap();
+        assert!(earliest >= now, "and it is placed in the future, not left in the past");
         assert!(
             r.conflicts.iter().any(|c| matches!(c, crate::model::Conflict::DeadlineMiss { task_id, .. } if *task_id == t)),
             "and it's still flagged as past its deadline: {:?}",

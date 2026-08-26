@@ -72,4 +72,32 @@ describe("PageEditor (autosave wiring)", () => {
       { timeout: 3000 },
     );
   });
+
+  it("says so when a save fails, instead of looking idle", async () => {
+    // A failed save used to render as "idle" — indistinguishable from "nothing to save" — so the
+    // user kept typing into a page that was no longer persisting. The vault is the second brain;
+    // silent data loss there is the worst failure this app can have.
+    (api.updatePage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("disk full"));
+    render(<PageEditor page={page} />);
+    const title = screen.getByPlaceholderText("Untitled");
+    await userEvent.clear(title);
+    await userEvent.type(title, "Roadmap");
+
+    await waitFor(() => expect(screen.getByText(/Couldn't save/i)).toBeInTheDocument(), { timeout: 4000 });
+  });
+
+  it("retries on its own after a failed save and clears the warning", async () => {
+    // Without a retry a transient failure waits for the next keystroke — and a user who has stopped
+    // typing never produces one.
+    (api.updatePage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("offline"));
+    render(<PageEditor page={page} />);
+    const title = screen.getByPlaceholderText("Untitled");
+    await userEvent.clear(title);
+    await userEvent.type(title, "Roadmap");
+
+    await waitFor(() => expect(screen.getByText(/Couldn't save/i)).toBeInTheDocument(), { timeout: 4000 });
+    // The next attempt succeeds (the mock only rejects once) and the warning clears itself.
+    await waitFor(() => expect(screen.getByText(/Saved/i)).toBeInTheDocument(), { timeout: 15000 });
+    expect(screen.queryByText(/Couldn't save/i)).toBeNull();
+  }, 20000);
 });
