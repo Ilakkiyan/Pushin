@@ -11,6 +11,35 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ## 2026-08-26
 
+### v0.8.2 — feeds that follow you, tasks that don't get lost, and four quiet failures ✅
+A correctness release. v0.8.1's headline was device sync, and v0.8.1 shipped with device sync broken
+for anyone using a .ics feed — that is the reason this cut exists.
+- **The .ics sync blocker** (`9ae15ce`, entry below). One feed rejected a peer's ENTIRE changeset
+  batch. Shipped in v0.8.0, live in v0.8.1, fixed here.
+- **.ics feeds now replicate** (`3d888ea`, migration `0022`). Import a calendar on one device and
+  every paired device shows it. The subscription syncs; its mirrored events do not — each device
+  re-derives them, because `replace_ics_events` is a delete-and-reinsert mirror and replicating those
+  rows would have devices tombstoning each other's copies on every refresh. Building it turned up two
+  more bugs: an upgrade would have doubled the calendar list (two devices that both had a feed each
+  minted a random uuid — the id is now derived from the feed URL so they converge), and a latent
+  `apply_upsert` fault that inferred row existence from `updated_hlc`, so a locally-created row that
+  had never been stamped read as absent and got INSERTed over. That one affected every synced table.
+- **Feeds refresh themselves** (`b835bf4`). Previously a feed only updated when you opened Settings
+  and pressed Refresh, so a subscribed calendar could sit stale forever. Now on launch and every 30
+  minutes — and the mirror short-circuits when nothing changed, so an unmoving feed never reshuffles
+  your day.
+- **Missed tasks roll forward** (`1a466fb`, migration `0021`, entry below).
+- **Four quiet failures** (`56dee6e`): no error boundary existed, so one throwing pane blanked the
+  whole app; a failed vault autosave rendered identically to "nothing to save", so you kept typing
+  into a page that had stopped persisting; one hover-revealed click deleted a calendar event with no
+  confirm and no undo; and 113 `db.lock().unwrap()` sites meant a single panic poisoned the mutex and
+  bricked every later database call until restart.
+- **Test infrastructure** (`f3269f3`, `3fb88ff`, `e7a86f8`): `npm run verify` runs every suite in
+  tiers with one consolidated report; the calendar — which had ZERO tests despite being the app's
+  point — gained 21; and the runner learned not to describe a failing step as passing.
+- Verified: `cargo test --lib` **329**, Vitest **109** (22 files), Playwright E2E **10**, `npm run
+  build` clean, live `llm_eval` **175/175**, `model_battery` 57–58/58 (the one adversarial case bounces run to run), `real_world_eval` 10/12.
+
 ### One .ics feed could block all device sync ✅
 `events.ics_sub_id` is an FK into `ics_subscriptions`, which is **not** a synced table. The column was
 neither declared in the events `TableSpec::fks` (so never rewritten to a uuid) nor in `skip` (so never
