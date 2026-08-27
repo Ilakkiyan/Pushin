@@ -156,7 +156,7 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 ## Local data (outside the repo, gitignored) — app-data dir `com.pushin.app/`
 `models/*.gguf` (downloaded models) · `bin/llama-server` (+libs, auto-downloaded engine) · `pushin.db` (SQLite).
 
-## Current status (released **v0.8.2**; `release.yml` builds installers for all platforms)
+## Current status (released **v0.8.3**; `release.yml` builds installers for all platforms)
 Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `docs/notes/DEVLOG.md`. Headline:
 - **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, **missed-task rollover** (a task whose day passed unfinished is kicked to the next free slot; pinned blocks included), tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
 - **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified).

@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarPlus, MessagesSquare, Sparkles, Sun, Zap } from "lucide-react";
+import { ArrowRight, CalendarPlus, Combine, MessagesSquare, Sparkles, Sun, Zap } from "lucide-react";
 
 /**
  * The post-update "What's new" intro, shown once after the app updates + restarts (App.tsx detects a
@@ -8,6 +8,11 @@ import { ArrowRight, CalendarPlus, MessagesSquare, Sparkles, Sun, Zap } from "lu
  * few; this is a welcome, not release notes.
  */
 const FEATURES: { icon: typeof Sparkles; title: string; body: string }[] = [
+  {
+    icon: Combine,
+    title: "One task, however it's split",
+    body: "A task the scheduler split around a meeting showed up as two identical-looking events, and dragging one moved only that half. Now dragging any piece moves the whole task: it merges back into a single block wherever there's room, and splits again only around what's genuinely in the way.",
+  },
   {
     icon: Sun,
     title: "Opens on your day, not a grid",
