@@ -123,6 +123,20 @@ test("a block dropped on the team meeting does not end up overlapping it", async
   expect(overlaps).toBe(false);
 });
 
+test("the what's-new intro renders its cards rather than an empty shell", async ({ page }) => {
+  // The dev server forces the intro on every launch so it can be iterated on, and the other specs
+  // dismiss it via the Explore button. Version-aware filtering nearly turned that preview into a
+  // heading over empty space: the forced path has to show the FULL list, not the (empty) diff
+  // between the running version and itself.
+  await page.goto("/?whatsnew=1");
+  const explore = page.getByRole("button", { name: /Explore/ });
+  await expect(explore).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/One task, however it's split/)).toBeVisible();
+  await expect(page.getByText(/Opens on your day/)).toBeVisible();
+  await explore.click();
+  await expect(explore).toHaveCount(0);
+});
+
 test("the done bin is collapsed by default and expands on click", async ({ page }) => {
   // "Ship the release" is seeded as finished with NO block — ticking a task off takes it off the
   // calendar, and the done bin in the task list is where it lives instead. The bin only grows, so

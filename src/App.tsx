@@ -7,7 +7,7 @@ import ConflictBanner from "./components/ConflictBanner";
 import UpdateBanner from "./components/UpdateBanner";
 import OpeningAnimation from "./components/OpeningAnimation";
 import WelcomeBack from "./components/WelcomeBack";
-import WhatsNew from "./components/WhatsNew";
+import WhatsNew, { hasNewFeatures } from "./components/WhatsNew";
 import TodayPane from "./panes/TodayPane";
 import CalendarPane from "./panes/CalendarPane";
 import MonthPane from "./panes/MonthPane";
@@ -73,6 +73,10 @@ export default function App() {
         (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("whatsnew") === "1")),
   );
   const [appVersion, setAppVersion] = useState<string | undefined>(undefined);
+  // The version this install last RAN, captured before it is overwritten below. It decides which
+  // cards the intro shows, so someone skipping three releases sees all three. `null` = unknown
+  // (fresh key, cleared storage, or a forced dev preview) and means "show everything".
+  const [previousVersion, setPreviousVersion] = useState<string | null>(null);
   // Until the version check resolves we don't yet know whether to show "what's new"; cover the gap so
   // the app never flashes the calendar before the intro. (`true` in tests so they render the app.)
   const [versionChecked, setVersionChecked] = useState(import.meta.env.MODE === "test");
@@ -103,7 +107,7 @@ export default function App() {
   // calendar. `guide` still holds it back so it can't paint over the new-user opening flow.
   const whatsNewEl =
     !guide && whatsNew ? (
-      <WhatsNew version={appVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
+      <WhatsNew version={appVersion} from={previousVersion} onDone={() => { setWhatsNew(false); setEntered(true); }} />
     ) : null;
   // Cover the brief window between the splash clearing and the version check resolving, so the app
   // never flashes behind the (about-to-appear) "what's new" intro.
@@ -202,9 +206,22 @@ export default function App() {
       .then((v) => {
         setAppVersion(v);
         const key = "pushin:lastSeenVersion";
-        const last = localStorage.getItem(key);
-        localStorage.setItem(key, v);
-        if (!forced && (useStore.getState().settings?.onboarded ?? false) && last !== v) setWhatsNew(true);
+        let last: string | null = null;
+        try {
+          last = localStorage.getItem(key);
+          localStorage.setItem(key, v);
+        } catch {
+          /* storage blocked — the intro just shows everything, once, rather than crashing boot */
+        }
+        // A forced preview (dev build, or ?whatsnew=1) shows the FULL list — that is the point of it,
+        // and passing the real previous version would filter a dev preview down to nothing, since the
+        // running version already equals the last-seen one.
+        setPreviousVersion(forced ? null : last);
+        // Nothing to announce → don't show an empty overlay. A release that is purely fixes adds no
+        // cards, and an intro with a heading and no content is worse than no intro.
+        if (!forced && (useStore.getState().settings?.onboarded ?? false) && last !== v && hasNewFeatures(last, v)) {
+          setWhatsNew(true);
+        }
       })
       .catch(() => {})
       .finally(() => setVersionChecked(true));

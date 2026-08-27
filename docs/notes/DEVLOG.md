@@ -89,7 +89,18 @@ writing that preference is guarded — a private window or blocked site data thr
 bin forgetting between sessions is a better outcome than the task list crashing. Matches the existing
 collapsible-group pattern in `StaleTasks`.
 
-- Verified: `cargo test --lib` **430**, Vitest **244** (28 files), Playwright E2E **12**,
+**What's New is version-aware.** The post-update intro used to show one fixed list, so anyone updating
+saw the same five v0.8.0 cards forever. Each card now carries the release it shipped in, and the
+overlay renders only what is new to *that* install: update every time and you see one card; skip three
+releases and you see all three releases' worth. `lib/version.ts` does the comparison (numeric per
+segment, so `0.10.0` correctly beats `0.9.0`; prereleases sort below their release; garbage sorts
+oldest rather than throwing). Cards for v0.8.1 and v0.8.2 were backfilled from this log — the list had
+gone two releases without an update, and version-aware cards with a hole in them are worse than none.
+A release with nothing user-visible now shows no overlay at all instead of a heading over empty space,
+and the forced dev preview (`?whatsnew=1`) still shows the full list — filtering it against itself
+would have rendered it empty, which an E2E now guards.
+
+- Verified: `cargo test --lib` **430**, Vitest **271** (30 files), Playwright E2E **13**,
   `npm run verify:live` — `llm_eval` 261/276.
 
 ---

@@ -134,7 +134,7 @@ const COMPONENTS: Array<[string, () => React.ReactElement]> = [
   ["ViewToggle", () => <ViewToggle />],
   ["WelcomeBack", () => <WelcomeBack onEnter={() => {}} />],
   ["WelcomeGuide", () => <WelcomeGuide onDone={() => {}} />],
-  ["WhatsNew", () => <WhatsNew version="0.8.2" onDone={() => {}} />],
+  ["WhatsNew", () => <WhatsNew version="0.8.3" from="0.8.2" onDone={() => {}} />],
 ];
 
 describe("every component mounts and unmounts cleanly", () => {
