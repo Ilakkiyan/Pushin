@@ -13,7 +13,7 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ### v0.8.3 — a split task that comes back together, and seven quiet failures ✅
 A correctness pass across every surface, driven by building the tests that were missing. The suite
-grew from 329/109/10 to **430 Rust / 235 Vitest / 11 Playwright**, and the model eval from 72 cases
+grew from 329/109/10 to **430 Rust / 271 Vitest / 13 Playwright**, and the model eval from 72 cases
 to **108**. Everything below was found by a test, not by reading.
 
 **Found and fixed**
