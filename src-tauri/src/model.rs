@@ -684,3 +684,255 @@ pub struct BlockReason {
     pub block_id: i64,
     pub reason: PlacementReason,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_with_status(status: &str) -> Task {
+        Task {
+            id: 1,
+            project_id: None,
+            title: "t".into(),
+            notes: String::new(),
+            estimated_minutes: 60,
+            deadline: None,
+            earliest_start: None,
+            priority: 2,
+            min_chunk_minutes: 30,
+            max_chunk_minutes: 120,
+            status: status.into(),
+            created_at: "2026-08-26T09:00:00".into(),
+            missed_count: 0,
+            last_missed_on: None,
+            depends_on: vec![],
+        }
+    }
+
+    // ---- Task lifecycle ----
+
+    #[test]
+    fn only_done_and_archived_tasks_leave_the_plan() {
+        // `is_active` gates the scheduler, the sweep, and the briefing. A status that leaks through
+        // as "active" silently re-plans finished work; one that doesn't makes real work vanish.
+        for live in ["todo", "scheduled", "in_progress", ""] {
+            let t = task_with_status(live);
+            assert!(t.is_active(), "{live:?} should still be planned");
+            assert!(!t.is_archived(), "{live:?} is not archived");
+        }
+        assert!(!task_with_status("done").is_active());
+        assert!(!task_with_status("archived").is_active());
+        assert!(task_with_status("archived").is_archived());
+        assert!(!task_with_status("done").is_archived(), "done is finished, not let go");
+    }
+
+    #[test]
+    fn status_matching_is_case_sensitive_and_exact() {
+        // Guards against a caller writing "Done"/"DONE" and quietly resurrecting a finished task.
+        assert!(task_with_status("Done").is_active(), "casing is not normalised — callers must write lowercase");
+        assert!(task_with_status("done ").is_active(), "and neither is whitespace");
+    }
+
+    // ---- EntityKind ----
+
+    #[test]
+    fn entity_kind_round_trips_through_its_string_form() {
+        // `as_str` is what lands in `entity_index.kind` and in every `page_links` row; `from_str`
+        // reads them back. A one-sided change orphans existing rows.
+        for k in [EntityKind::Task, EntityKind::Event, EntityKind::Page, EntityKind::Person, EntityKind::Goal] {
+            assert_eq!(EntityKind::from_str(k.as_str()), Some(k), "{k:?} does not round-trip");
+        }
+    }
+
+    #[test]
+    fn entity_kind_rejects_anything_it_does_not_know() {
+        for junk in ["", "Task", "TASK", "habit", "project", "note", " page"] {
+            assert_eq!(EntityKind::from_str(junk), None, "{junk:?} should not parse");
+        }
+    }
+
+    // ---- Settings ----
+
+    #[test]
+    fn default_settings_are_internally_consistent() {
+        let s = Settings::default();
+        assert!(s.work_start < s.work_end, "work day runs forwards: {} → {}", s.work_start, s.work_end);
+        assert!(!s.work_days.is_empty(), "a schedule with no work days can never place anything");
+        assert!(s.work_days.iter().all(|d| (1..=7).contains(d)), "work days are 1=Mon..7=Sun: {:?}", s.work_days);
+        assert!(s.horizon_days > 0);
+        assert!(s.default_min_chunk > 0 && s.default_min_chunk <= s.default_max_chunk);
+        assert!(s.buffer_minutes >= 0);
+        assert!(!s.model_id.is_empty());
+        assert!(s.llm_base_url.starts_with("http"), "base url: {}", s.llm_base_url);
+        assert_eq!(s.idle_unload_minutes, 10, "idle-unload ships on by default");
+        assert!(!s.embed_model.is_empty(), "semantic recall is on by default");
+    }
+
+    #[test]
+    fn an_old_settings_row_upgrades_without_the_personalization_fields() {
+        // Every field added after v1 is `#[serde(default)]` precisely so an existing user's stored
+        // settings still parse. If that ever regresses, the app fails to load on upgrade — the
+        // worst possible failure mode — so pin it with a minimal v1-shaped payload.
+        let v1 = serde_json::json!({
+            "timezone": "America/New_York",
+            "workStart": "09:00",
+            "workEnd": "17:00",
+            "workDays": [1, 2, 3, 4, 5],
+            "horizonDays": 14,
+            "bufferMinutes": 5,
+            "defaultMinChunk": 30,
+            "defaultMaxChunk": 120,
+            "modelId": "qwen2.5-7b-instruct-q4_k_m",
+            "llmBaseUrl": "http://127.0.0.1:8080",
+            "googleConnected": false
+        });
+        let s: Settings = serde_json::from_value(v1).expect("a v1 settings row must still deserialize");
+        assert!(!s.onboarded, "an existing user sees the personalization modal once");
+        assert!(!s.sleep_enabled, "and gets no surprise sleep blocking");
+        assert!(s.commitments.is_empty());
+        assert!(s.archetypes.is_empty());
+        assert_eq!(s.idle_unload_minutes, 10, "and inherits the on-by-default idle unload");
+        assert_eq!(s.embed_model, default_embed_model());
+        assert_eq!(s.vault_dir, None);
+    }
+
+    #[test]
+    fn settings_serialize_to_the_camel_case_keys_the_frontend_reads() {
+        // `src/lib/ipc.ts` types these by hand; a Rust field rename that changes the wire key
+        // breaks the UI silently (the field just reads as undefined).
+        let v = serde_json::to_value(Settings::default()).unwrap();
+        for key in [
+            "workStart",
+            "workEnd",
+            "workDays",
+            "horizonDays",
+            "bufferMinutes",
+            "defaultMinChunk",
+            "defaultMaxChunk",
+            "modelId",
+            "llmBaseUrl",
+            "googleConnected",
+            "sleepEnabled",
+            "embedModel",
+            "vaultDir",
+            "idleUnloadMinutes",
+            "aboutMe",
+        ] {
+            assert!(v.get(key).is_some(), "settings key {key} missing from the wire form");
+        }
+        assert!(v.get("work_start").is_none(), "snake_case must not leak to the frontend");
+    }
+
+    // ---- profile_prompt ----
+
+    fn settings_with(archetypes: &[&str], about: &str) -> Settings {
+        Settings {
+            archetypes: archetypes.iter().map(|s| s.to_string()).collect(),
+            about_me: about.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_empty_profile_adds_nothing_to_the_prompt() {
+        // Every character of the system prompt costs the small model accuracy (gotcha #1), so an
+        // unfilled profile must contribute exactly nothing.
+        assert_eq!(settings_with(&[], "").profile_prompt(), "");
+        assert_eq!(settings_with(&[], "   \n  ").profile_prompt(), "", "whitespace-only about-me is empty");
+        assert_eq!(settings_with(&["nonsense-key"], "").profile_prompt(), "", "unknown archetypes drop out entirely");
+    }
+
+    #[test]
+    fn a_profile_renders_labels_and_about_me() {
+        let p = settings_with(&["builder", "parent"], "I run a two-person startup.").profile_prompt();
+        assert!(p.contains("a builder/founder"));
+        assert!(p.contains("a parent/caregiver"));
+        assert!(p.contains("I run a two-person startup."));
+        assert!(p.starts_with("\n\n"), "the blurb separates itself from the prompt above it");
+
+        // Labels alone still terminate cleanly rather than trailing a bare colon.
+        let labels_only = settings_with(&["student"], "").profile_prompt();
+        assert!(labels_only.contains("a student"));
+        assert!(labels_only.trim_end().ends_with('.'), "labels-only blurb ends in a full stop: {labels_only:?}");
+
+        // About-me alone still renders, without an empty parenthetical.
+        let about_only = settings_with(&[], "Night owl.").profile_prompt();
+        assert!(about_only.contains("Night owl."));
+        assert!(!about_only.contains("()"), "no empty parenthetical: {about_only:?}");
+        assert!(!about_only.contains("describe themselves as"), "no dangling label clause");
+    }
+
+    #[test]
+    fn unknown_archetypes_are_filtered_without_leaving_stray_separators() {
+        let p = settings_with(&["builder", "wizard", "student"], "").profile_prompt();
+        assert!(p.contains("a builder/founder, a student"), "got {p:?}");
+        assert!(!p.contains(", ,"), "a dropped key left an empty slot: {p:?}");
+    }
+
+    // ---- Wire contracts for the scheduler's outputs ----
+
+    #[test]
+    fn conflicts_serialize_as_a_tagged_union_the_ui_can_switch_on() {
+        let v = serde_json::to_value(Conflict::DeadlineMiss {
+            task_id: 7,
+            title: "Essay".into(),
+            scheduled_end: "2026-08-27T17:00:00".into(),
+            deadline: "2026-08-26T23:59:00".into(),
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "deadlineMiss");
+        assert_eq!(v["taskId"], 7);
+        assert_eq!(v["scheduledEnd"], "2026-08-27T17:00:00");
+
+        let cycle = serde_json::to_value(Conflict::DependencyCycle { task_ids: vec![1, 2] }).unwrap();
+        assert_eq!(cycle["kind"], "dependencyCycle");
+        assert_eq!(cycle["taskIds"], serde_json::json!([1, 2]));
+
+        let un = serde_json::to_value(Conflict::Unschedulable {
+            task_id: 3,
+            title: "Big".into(),
+            remaining_minutes: 45,
+        })
+        .unwrap();
+        assert_eq!(un["kind"], "unschedulable");
+        assert_eq!(un["remainingMinutes"], 45);
+    }
+
+    #[test]
+    fn every_placement_reason_has_a_distinct_kind_tag() {
+        // The calendar's "why is this here" switch is exhaustive on these tags.
+        let reasons = vec![
+            PlacementReason::Continuation { part: 2, of: 3 },
+            PlacementReason::AfterDependency { dep_title: "Draft".into() },
+            PlacementReason::NotBefore { earliest_start: "2026-08-27T09:00:00".into() },
+            PlacementReason::AroundCommitment,
+            PlacementReason::ForDeadline { deadline: "2026-08-28T17:00:00".into() },
+            PlacementReason::Earliest,
+        ];
+        let mut tags: Vec<String> = reasons
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap()["kind"].as_str().unwrap().to_string())
+            .collect();
+        let n = tags.len();
+        tags.sort();
+        tags.dedup();
+        assert_eq!(tags.len(), n, "two placement reasons share a tag: {tags:?}");
+        assert!(tags.contains(&"aroundCommitment".to_string()));
+        assert!(tags.contains(&"afterDependency".to_string()));
+
+        // Unit variants stay round-trippable (a fieldless variant is easy to break with a retag).
+        for r in reasons {
+            let json = serde_json::to_string(&r).unwrap();
+            let back: PlacementReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, r);
+        }
+    }
+
+    #[test]
+    fn placement_reason_field_names_are_camel_case() {
+        let v = serde_json::to_value(PlacementReason::AfterDependency { dep_title: "Draft".into() }).unwrap();
+        assert_eq!(v["depTitle"], "Draft");
+        let c = serde_json::to_value(PlacementReason::Continuation { part: 2, of: 3 }).unwrap();
+        assert_eq!((c["part"].as_u64(), c["of"].as_u64()), (Some(2), Some(3)));
+    }
+}

@@ -88,6 +88,49 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 
 14. **Measuring the model: the eval harnesses.** `tests/llm_eval.rs` (per-category scorecard) and `tests/model_battery.rs` (UI-projected pre-push gate) run the **real** parser→store_plan(→reschedule) path against a live `:8080`. Both `#[ignore]`d + self-skip with no server, so `cargo test` stays green. **Baseline ~90% of checks; the TOTAL bounces run-to-run (gotcha #1) — judge per-category.** On WSL the test exe is a Windows binary so it reaches `:8080`; if relinking `pushin.exe` fails while the app runs, run the built exe directly. See `docs/notes/ARCHITECTURE_NOTES.md` → Test suite.
 
+15. **Never anchor a test to `Local::now()` plus an offset.** Five tests on `main` were red or
+    latently red for this alone. `plant_block(now - Duration::days(1), 60)` is not "yesterday": run it
+    at 23:30 and the block *ends* at 00:30 **today**, so the end-based rollover sweep correctly leaves
+    it alone and every assertion flips. A fixed-60-minute estimate against "the elapsed part of today"
+    breaks for the 50 minutes after midnight. Anchor to a fixed hour on a computed date
+    (`days_ago_at(now, 1, 9)`) and size fixtures from the same clock you assert against. These fail at
+    the hours nobody runs the suite, which is exactly when CI does.
+
+16. **The model flips am/pm on the START time, and the confirmation text still reads right.** The
+    live 7B answers `"21:00"` to "at 9am" often enough to matter — a morning appointment booked for
+    the evening, discovered by missing it. `parser::fix_flipped_meridian` takes the user's own words
+    as authoritative, but only under three gates: exactly ONE explicitly `am`/`pm`-marked time in the
+    message, exactly ONE timed item in the plan, and a disagreement of exactly ±12h. A merely
+    *different* time is a different reading of the sentence and is left alone. Related:
+    `find_worded_duration` reads "half an hour" / "an hour and a half" / "two and a half hours", which
+    the model reliably answers with its 60-minute default — and it must run BEFORE the digit scan,
+    since "1 hour and a half" contains a digit the scanner would stop at.
+
+17. **Dragging a calendar block addresses the TASK, not the block.** A task the scheduler split
+    around a meeting is several blocks sharing one title. Pinning just the dragged one left its
+    siblings stranded as duplicate-looking events that could never be reunited. `move_task_to` pools
+    the task's chunks and re-lays them from the drop point — merging into one block where the space
+    allows, splitting only around real obstacles. It uses `scheduler::free_after`, NOT `free_slots`: a
+    drag is an explicit instruction, so it may land outside work hours and in the sleep window; the
+    only thing it will not do is overlap. Finished/archived tasks are excluded — their blocks are
+    history. Habits keep the old slide-to-nearest-free behavior (one fixed-length thing, nothing to
+    merge).
+
+18. **A shared `Arc<Mutex<Connection>>` needs poison tolerance on *every* side.** `AppState::db()`
+    recovers from a poisoned lock precisely so one panic can't brick the session — but
+    `booking_server` held the *same* mutex and still called `.unwrap()`, so an unrelated panic
+    anywhere in the app silently 500'd every public booking link with no sign inside the app. When you
+    add a new holder of that Arc, use a poison-tolerant lock.
+
+19. **`.ics` feeds are not well-formed.** `VALARM` blocks nest inside `VEVENT` and carry their own
+    `SUMMARY`; read flat, the alarm's subject overwrote the event's title, so every feed with
+    reminders imported mis-titled. And a `DTEND` that is not strictly after `DTSTART` (zero-length or
+    reversed — both ship in the wild) produces an interval that every overlap check
+    (`a.start < b.end && b.start < a.end`) reports as "never overlaps", so the event drew as a
+    hairline and the scheduler planned straight through it. Both are handled in `calendar::ics`; when
+    extending the parser, compose fixtures from lines (`ics(&[...])`) rather than inline literals — a
+    hand-written one hid a folded-line bug in the *test data*.
+
 ---
 
 ## Build / run / test
@@ -99,7 +142,7 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
   over running the suites by hand: it also captures output the `rtk` wrapper would otherwise compress
   away, which once silently ate a full 14-minute `llm_eval` run.
 - Environment specifics (WSL uses the Windows `cargo.exe`; no live llama-server there): memory `build-test-env`.
-- **Backend:** `cargo build`/`cargo test --lib` (**329** tests) with `--manifest-path src-tauri/Cargo.toml`. The Bash cwd resets to project root between calls — use absolute paths or `--manifest-path`.
+- **Backend:** `cargo build`/`cargo test --lib` (**430** tests) with `--manifest-path src-tauri/Cargo.toml`. The Bash cwd resets to project root between calls — use absolute paths or `--manifest-path`.
 - **Frontend:** `npm run build` (`tsc && vite build`); tests `npm test` (Vitest), `npm run test:e2e` (Playwright).
   "CI-only" means CI *runs* it, NOT that you may skip it: **run it locally before tagging a release, and
   after ANY change to nav structure, pane copy, or `_mockBridge.ts`.** It is the only suite that renders the
@@ -120,7 +163,7 @@ Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `d
 - **Context Engine + execution loop:** `entity_index` recall spine feeding planner auto-recall + `vault_ask`; People/CRM; keyword auto-labeling; Daily Briefing + Cmd-K "Run" bar; Focus timer + adaptive scheduler; Meeting Companion; hardened public booking page.
 - **Device sync (pairing proven on loopback, cross-machine still unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. `two_real_iroh_endpoints_pair_and_converge` runs a real ticket→dial→session between two endpoints in one process; only NAT traversal is untested. Iroh pinned **0.90**.
 - **Shell polish:** frameless `TitleBar`, opening animation, in-app auto-update (v0.5.0+, signed).
-- **Tested:** Rust `cargo test --lib` (**329**) + httpmock, Vitest (**109**, 22 files) + IPC/bridge contract tests, Playwright E2E (**10**), live `llm_eval` **175/175**, `model_battery` 57–58/58 (one adversarial case bounces), `real_world_eval` 10/12 (run them with `npm run verify:live`, which skips them when no llama-server is on :8080).
+- **Tested:** Rust `cargo test --lib` (**430**) + httpmock, Vitest (**244**, 28 files) + IPC/bridge contract tests, Playwright E2E (**12**), live `llm_eval` **261/276** across 108 cases — the original tier still scores 100% per category; the **hard tier** (`date-math`, `duration-words`, `pronoun-ref`, `ambiguity`, `restraint-hard`, `noisy-input`, `adversarial`, `overload`) is where the remaining gap lives and is the tuning signal. `model_battery` 57–58/58 (one adversarial case bounces), `real_world_eval` 10/12 (run them with `npm run verify:live`, which skips them when no llama-server is on :8080).
 - **Repo:** GitHub `Ilakkiyan/Pushin`; `main` default; releases are version tags.
 
 ## Working style with this user

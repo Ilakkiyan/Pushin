@@ -33,6 +33,9 @@ function snap(min: number, step = 15) {
 interface DragState {
   kind: "block" | "habit";
   id: number; // task-block id, or habit-event id
+  /// The TASK a dragged block belongs to. A task split around a meeting is several blocks sharing
+  /// one title; dragging any of them moves the whole task, so the drop is addressed by task id.
+  taskId?: number;
   startClientY: number;
   origStart: Date;
   durationMin: number;
@@ -44,7 +47,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   const projects = useStore((s) => s.projects);
   const events = useStore((s) => s.events);
   const blocks = useStore((s) => s.blocks);
-  const moveBlock = useStore((s) => s.moveBlock);
+  const moveTask = useStore((s) => s.moveTask);
   const unlockBlock = useStore((s) => s.unlockBlock);
   const blockReasons = useStore((s) => s.blockReasons);
   const moveHabit = useStore((s) => s.moveHabit);
@@ -163,24 +166,28 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
           startMin = Math.max(TOP_MIN, Math.min(startMin, TOP_MIN + TOTAL_MIN - d.durationMin));
           const base = new Date(d.origStart);
           base.setHours(0, 0, 0, 0);
-          // Don't drop onto an existing event/block — slide to the closest free time instead of
-          // overlapping (the backend rejects an overlapping drop, which looks like a snap-back).
-          const busy: Array<[number, number]> = [];
-          for (const ev of events) {
-            if (d.kind === "habit" && ev.id === d.id) continue; // ignore the habit being dragged
-            const s = parseLocal(ev.start);
-            if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(ev.end))]);
+          if (d.kind === "habit") {
+            // A habit occurrence is one fixed-length thing, so it slides to the closest free time
+            // rather than overlapping (the backend rejects an overlap, which reads as a snap-back).
+            const busy: Array<[number, number]> = [];
+            for (const ev of events) {
+              if (ev.id === d.id) continue; // ignore the habit being dragged
+              const s = parseLocal(ev.start);
+              if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(ev.end))]);
+            }
+            for (const b of blocks) {
+              const s = parseLocal(b.start);
+              if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(b.end))]);
+            }
+            startMin = nearestFreeStart(startMin, d.durationMin, busy, TOP_MIN, TOP_MIN + TOTAL_MIN);
+            moveHabit(d.id, toLocalIso(addMinutes(base, startMin)));
+          } else if (d.taskId != null) {
+            // A task block is handed over raw. The backend owns the placement because it is the only
+            // side that can MERGE the task's other chunks back in — dragging half of a split task
+            // used to pin just that half and orphan the rest under the same title. It slides past
+            // anything busy at the drop point and re-splits only where it has to.
+            moveTask(d.taskId, toLocalIso(addMinutes(base, startMin)));
           }
-          for (const b of blocks) {
-            if (d.kind === "block" && b.id === d.id) continue; // ignore the block being dragged
-            const s = parseLocal(b.start);
-            if (sameDay(s, base)) busy.push([minutesFromMidnight(s), minutesFromMidnight(parseLocal(b.end))]);
-          }
-          startMin = nearestFreeStart(startMin, d.durationMin, busy, TOP_MIN, TOP_MIN + TOTAL_MIN);
-          const newStart = addMinutes(base, startMin);
-          const newEnd = addMinutes(newStart, d.durationMin);
-          if (d.kind === "habit") moveHabit(d.id, toLocalIso(newStart));
-          else moveBlock(d.id, toLocalIso(newStart), toLocalIso(newEnd));
         }
         return null;
       });
@@ -191,7 +198,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [drag, moveBlock, moveHabit, events, blocks]);
+  }, [drag, moveTask, moveHabit, events, blocks]);
 
   const top = (d: Date) => ((minutesFromMidnight(d) - TOP_MIN) / 60) * PX_PER_HOUR;
   const height = (mins: number) => Math.max(20, (mins / 60) * PX_PER_HOUR);
@@ -438,6 +445,9 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                   // Two lines (title + start time) need ~40px; below that, show just a centered title line.
                   const compact = h < 40;
                   const isDragging = drag?.kind === "block" && drag.id === b.id;
+                  // Sibling chunks of the SAME task are about to be absorbed into the drop, so they
+                  // fade rather than sit there looking like separate events left behind.
+                  const isSibling = !isDragging && drag?.kind === "block" && drag.taskId != null && drag.taskId === b.taskId;
                   const dy = isDragging ? (drag!.deltaMin / 60) * PX_PER_HOUR : 0;
                   const color = (colorByLabel ? primaryLabelColor(taskLabels[b.taskId]) : null) ?? project?.color ?? "#6366f1";
                   // "Why is this here" — derived scheduler reason. Full text on hover (title); shown
@@ -457,12 +467,13 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                       }}
                       onPointerDown={(e) => {
                         e.stopPropagation();
-                        setDrag({ kind: "block", id: b.id, startClientY: e.clientY, origStart: parseLocal(b.start), durationMin: dur, deltaMin: 0 });
+                        setDrag({ kind: "block", id: b.id, taskId: b.taskId, startClientY: e.clientY, origStart: parseLocal(b.start), durationMin: dur, deltaMin: 0 });
                       }}
                       className={clsx(
                         "absolute left-1 right-1 select-none rounded-md px-1.5 text-[11px] leading-tight overflow-hidden cursor-grab active:cursor-grabbing z-10 border flex flex-col",
                         compact ? "py-0 justify-center" : "py-1",
                         isDragging ? "opacity-80 ring-2 ring-white/40" : "",
+                        isSibling ? "opacity-30" : "",
                       )}
                       style={{
                         top: top(parseLocal(b.start)) + dy,

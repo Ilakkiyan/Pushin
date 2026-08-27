@@ -497,6 +497,11 @@ export const api = {
   deleteEvent: (id: number) => invoke<ScheduleResult>("delete_event", { id }),
   lockBlock: (id: number, locked: boolean, start: string, end: string) =>
     invoke<ScheduleResult>("lock_block", { id, locked, start, end }),
+  /// Move a whole TASK to a new start — the calendar drag. Takes a task id, not a block id: a task
+  /// the scheduler split around a meeting is several blocks with one title, and dragging any of them
+  /// means "put this task here". The backend re-lays its chunks from `start`, merging them where
+  /// there is room and splitting only around what is genuinely in the way.
+  moveTaskTo: (taskId: number, start: string) => invoke<ScheduleResult>("move_task_to", { taskId, start }),
 
   listEventTypes: () => invoke<EventType[]>("list_event_types"),
   createEventType: (name: string, durationMinutes: number, bufferMinutes: number, color: string) =>

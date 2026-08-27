@@ -14,7 +14,10 @@ export default function InboxPane() {
   const [busyId, setBusyId] = useState<number | null>(null);
 
   useEffect(() => {
-    loadInbox();
+    // A rejected load must not leave an unhandled rejection: the pane keeps whatever it had
+    // (nothing, on first paint) rather than the promise escaping into the console. Every other
+    // pane in the app already does this — these two were the exceptions.
+    loadInbox().catch(() => {});
   }, [loadInbox]);
 
   const planItem = async (id: number, text: string) => {

@@ -9,6 +9,91 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-08-27
+
+### Bug hunt + test suite build-out, and a harder model benchmark ✅
+A correctness pass across every surface, driven by building the tests that were missing. The suite
+grew from 329/109/10 to **430 Rust / 235 Vitest / 11 Playwright**, and the model eval from 72 cases
+to **108**. Everything below was found by a test, not by reading.
+
+**Found and fixed**
+- **Four tests were already red on `main`, and a fifth was latently red.** All five anchored fixtures
+  to `Local::now()` plus an offset, which stops meaning what it says at particular hours — a block
+  planted "yesterday" at 23:30 *ends* today, and a 60-minute estimate outruns the elapsed day for the
+  50 minutes after midnight. See CLAUDE.md gotcha 15.
+- **`.ics`: `VALARM` clobbered event titles.** Nested sub-component properties were read flat, so any
+  feed whose events carry reminders — i.e. most of them — imported titled after the alarm. Also a
+  `DTEND` not strictly after `DTSTART` (zero-length and reversed both ship in the wild) made an
+  interval that every overlap check reads as "never overlaps": the event drew as a hairline and the
+  scheduler planned straight through it. `calendar::ics` tests 7 → 28.
+- **The booking server was bricked by a poisoned mutex.** `AppState::db()` recovers from poison
+  precisely so one panic can't kill the session; `booking_server` held the *same* `Arc<Mutex<_>>` and
+  still called `.unwrap()`, so an unrelated panic anywhere silently 500'd every public booking link
+  with no sign inside the app. Tests 11 → 23.
+- **The planner router could never fire for a habit.** `has_scheduling_cue` needs a WHEN and a DO, but
+  "every day"/"daily" sat only in the DO list — so "I'll go for a run every day", the most common way
+  anyone states a habit, never tripped the override. Recurrence words are WHEN now, and stay out of DO
+  so a bare "the bus comes every day" still reads as chat.
+- **`slug()` could name files Windows refuses to create.** A page called `CON` or `NUL` produced a
+  filename that cannot exist, and an 80-char cut could leave a trailing space — which Windows strips,
+  so the recorded `rel_path` no longer matched the file and the page lost its mapping.
+- **Two panes fired their loaders with no `.catch`.** `HabitsPane` and `InboxPane` were the only two
+  in the app doing this; a rejected load left an unhandled rejection and a blank panel.
+- **`g l` (Labels) worked but was missing from the ⌘K help.** Pinned by a test that walks every letter
+  and fails on any binding the help list doesn't document, and vice versa.
+- **The E2E mock bridge formatted mutated times as UTC** (`toISOString`) while the app stores naive
+  local — invisible in a UTC CI container, wrong on every developer machine.
+
+**Dragging a split task now merges it back** (`schedule_service::move_task_to`). A task the scheduler
+split around a meeting is several blocks sharing one title, and dragging one pinned only that half,
+stranding the rest as a duplicate-looking event. A drag now addresses the **task**: its chunks are
+pooled and re-laid from the drop point, merging into one block where there is room and splitting only
+around what is genuinely in the way. Free time for a drag comes from `scheduler::free_after`, not
+`free_slots` — a hand drag is an explicit instruction, so it may land in the evening or the sleep
+window; the one thing it will not do is overlap. See CLAUDE.md gotcha 17.
+
+**Two deterministic parser recoveries**, both from live-model evidence rather than guesswork:
+- `fix_flipped_meridian` — the 7B answers `"21:00"` to "at 9am" often enough to matter, and the
+  confirmation text still reads correctly. Gated to a single marked time, a single timed item, and an
+  exact ±12h disagreement.
+- `find_worded_duration` — "half an hour", "an hour and a half", "two and a half hours". The model
+  answers all of these with its 60-minute default.
+
+**The benchmark got harder, on purpose.** `llm_eval` went from 72 to 108 cases with a hard tier aimed
+at daily load rather than tidy demo sentences: `date-math`, `duration-words`, `pronoun-ref`,
+`ambiguity`, `overload`, `noisy-input` (typos, run-ons, voice-transcript filler), `adversarial`
+(self-correction mid-sentence, negation, an injection attempt in the message body), `odd-time-hard`,
+`deadline-hard`, and `restraint-hard` (venting, hypotheticals, past-tense reports, someone else's
+plans — all of which must create **nothing**). Every original category still scores 100%; the total is
+**261/276 (95%)** and the whole of the remaining gap is in the new tier, which is the point. Weakest:
+`date-math` and `ambiguity` at 50–60%. `PUSHIN_EVAL_DEBUG=1` now dumps the **raw model plan** beside
+the resolved calendar, which is what separates "the model said the wrong thing" from "Rust mangled a
+correct answer" — the two failures need opposite fixes.
+
+**Coverage built where there was none.** `model.rs` 0 → 13 (including the wire-format contract the
+hand-written TypeScript types depend on, and the v1-settings upgrade path), `sync/frame.rs` 0 → 13
+(hostile-peer framing: oversized prefixes, truncated headers and bodies, desync recovery), `vault.rs`
+2 → 12 (path-traversal in every shape), plus `vaultExport`/`vaultImport`/`useHotkeys`/`useIsMobile`/
+`updates` on the frontend and smoke suites that mount **every** previously-untested pane and component
+against an empty backend and a rejecting one.
+
+**Settled, not just pinned:** ticking a task off deletes its auto-scheduled block, and that is the
+intended behavior — the calendar shows what is PLANNED, the done bin in the task list is the record of
+what was finished. `sweep_missed`'s doc comment said the opposite ("done tasks keep their blocks");
+corrected, and `ticking_a_task_off_removes_it_from_the_calendar` holds the line, since the deletion
+happens two layers from the checkbox.
+
+**The done bin is collapsible.** It only ever grows, so it now starts collapsed with its count on the
+header (`Done · 3`), remembers the choice in `localStorage`, and reports `aria-expanded`. Reading and
+writing that preference is guarded — a private window or blocked site data throws on access, and the
+bin forgetting between sessions is a better outcome than the task list crashing. Matches the existing
+collapsible-group pattern in `StaleTasks`.
+
+- Verified: `cargo test --lib` **430**, Vitest **244** (28 files), Playwright E2E **12**,
+  `npm run verify:live` — `llm_eval` 261/276.
+
+---
+
 ## 2026-08-26
 
 ### v0.8.2 — feeds that follow you, tasks that don't get lost, and four quiet failures ✅

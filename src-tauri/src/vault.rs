@@ -138,4 +138,117 @@ mod tests {
         assert!(safe_join("/vault", "../escape.md").is_none());
         assert!(safe_join("/vault", "/etc/passwd").is_none());
     }
+
+    #[test]
+    fn safe_join_rejects_every_shape_of_escape() {
+        // `rel_path` is computed in the frontend from a page TITLE, so it is effectively user input.
+        // This is the boundary that keeps a title from writing outside the vault folder.
+        for bad in [
+            "../escape.md",
+            "../../escape.md",
+            "a/../../escape.md",
+            "a/b/../../../escape.md",
+            "/etc/passwd",
+            "//server/share/x.md",
+            "..",
+            "../",
+            "a/..",
+        ] {
+            assert!(safe_join("/vault", bad).is_none(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_windows_specific_escapes() {
+        // On Windows a bare `C:foo` is drive-RELATIVE, not absolute, so `is_absolute()` alone does
+        // not catch it — the component walk has to reject the Prefix.
+        for bad in [r"C:\Windows\System32\x.md", r"C:x.md", r"\\server\share\x.md", r"..\escape.md", r"\absolute.md"] {
+            let joined = safe_join("/vault", bad);
+            if let Some(p) = &joined {
+                assert!(
+                    p.starts_with("/vault"),
+                    "{bad:?} escaped the vault: {p:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn safe_join_accepts_ordinary_nested_paths() {
+        for good in ["x.md", "Daily/2026-08/2026-08-27.md", "Work/Q3/Roadmap.md", "./x.md", "a/./b.md"] {
+            let p = safe_join("/vault", good).unwrap_or_else(|| panic!("{good:?} should be allowed"));
+            assert!(p.starts_with("/vault"), "{good:?} landed outside: {p:?}");
+        }
+    }
+
+    #[test]
+    fn safe_join_keeps_non_ascii_names_intact() {
+        let p = safe_join("/vault", "\u{8a08}\u{753b}/\u{30e1}\u{30e2}.md").unwrap();
+        assert!(p.to_string_lossy().contains("\u{30e1}\u{30e2}.md"));
+    }
+
+    #[test]
+    fn a_current_dir_component_does_not_leave_a_dot_in_the_path() {
+        let p = safe_join("/vault", "./Daily/./x.md").unwrap();
+        let s = p.to_string_lossy().replace('\\', "/");
+        assert!(!s.contains("/./"), "unresolved current-dir component: {s}");
+        assert!(s.ends_with("Daily/x.md"), "{s}");
+    }
+
+    #[test]
+    fn content_hash_distinguishes_the_edits_the_echo_guard_has_to_notice() {
+        // The guard compares hashes to decide whether a file event is our own write echoing back.
+        // A collision on a near-identical edit would make an external change invisible.
+        assert_ne!(content_hash("# Plan"), content_hash("# Plan "), "trailing whitespace matters");
+        assert_ne!(content_hash("a\nb"), content_hash("a\r\nb"), "line endings matter");
+        assert_ne!(content_hash(""), content_hash(" "));
+        assert_ne!(content_hash("ab"), content_hash("ba"), "order matters");
+        assert_eq!(content_hash(""), content_hash(""), "and it is stable");
+    }
+
+    #[test]
+    fn content_hash_is_byte_oriented_and_handles_non_ascii() {
+        assert_eq!(content_hash("caf\u{e9}"), content_hash("caf\u{e9}"));
+        assert_ne!(content_hash("caf\u{e9}"), content_hash("cafe"));
+        // Same glyph, different normalisation — different bytes on disk, so different hashes.
+        assert_ne!(content_hash("caf\u{e9}"), content_hash("cafe\u{301}"));
+    }
+
+    #[test]
+    fn write_and_read_round_trip_inside_a_real_folder() {
+        let dir = std::env::temp_dir().join(format!("pushin_vault_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.to_string_lossy().to_string();
+
+        // Nested parents are created on demand — a page inside three folders must not need them first.
+        write_file(&root, "Work/Q3/Roadmap.md", "# Roadmap\n\nbody").unwrap();
+        assert_eq!(read_file(&root, "Work/Q3/Roadmap.md").unwrap(), "# Roadmap\n\nbody");
+
+        // Re-writing the same path replaces rather than appends.
+        write_file(&root, "Work/Q3/Roadmap.md", "shorter").unwrap();
+        assert_eq!(read_file(&root, "Work/Q3/Roadmap.md").unwrap(), "shorter");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writing_through_an_unsafe_path_fails_instead_of_escaping() {
+        let dir = std::env::temp_dir().join(format!("pushin_vault_unsafe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().to_string();
+
+        let err = write_file(&root, "../escaped.md", "should never land").unwrap_err();
+        assert!(err.to_string().contains("unsafe vault path"), "got {err}");
+        assert!(!dir.parent().unwrap().join("escaped.md").exists(), "a file was written outside the vault");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_a_missing_file_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!("pushin_vault_missing_{}", std::process::id()));
+        let root = dir.to_string_lossy().to_string();
+        assert!(read_file(&root, "nope.md").is_err());
+    }
 }

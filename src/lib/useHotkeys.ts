@@ -30,6 +30,7 @@ export const NAV_HOTKEYS: { combo: string; label: string }[] = [
   { combo: "g g", label: "Graph" },
   { combo: "g e", label: "People" },
   { combo: "g b", label: "Booking" },
+  { combo: "g l", label: "Labels" },
   { combo: "g s", label: "Settings" },
 ];
 

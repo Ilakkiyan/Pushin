@@ -490,6 +490,26 @@ pub fn replace_unlocked_blocks(conn: &mut Connection, new_blocks: &[Block]) -> R
     Ok(())
 }
 
+/// Replace every block belonging to ONE task with a fresh, pinned set.
+///
+/// The write behind dragging a task on the calendar. Pinned rows are deleted along with unpinned
+/// ones, unlike [`replace_unlocked_blocks`]: the user is placing this task by hand, so whatever its
+/// chunks used to be gives way to where they just put it. Writing all of them in one transaction is
+/// what lets a split task come back as a single block (or a differently-split one) instead of the
+/// old chunks being pinned and re-planned independently.
+pub fn replace_task_blocks(conn: &mut Connection, task_id: i64, spans: &[(String, String)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM blocks WHERE task_id = ?1", params![task_id])?;
+    {
+        let mut stmt = tx.prepare("INSERT INTO blocks(task_id, start, end, locked) VALUES(?1, ?2, ?3, 1)")?;
+        for (start, end) in spans {
+            stmt.execute(params![task_id, start, end])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Delete specific blocks by id — pinned ones included. Used only by the day-rollover sweep
 /// (`schedule_service::sweep_missed`), which is the one caller allowed to drop a *pinned* block:
 /// a pin says "do it at this time", and once that time is a day in the past the pin has nothing

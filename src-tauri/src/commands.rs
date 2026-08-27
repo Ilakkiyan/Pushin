@@ -524,6 +524,20 @@ pub fn lock_block(
     reschedule_inner(&mut conn, &settings).map_err(err)
 }
 
+/// Move a whole task to a new start time — the calendar's drag-and-drop write.
+///
+/// Takes a **task** id, not a block id, on purpose: a task the scheduler split around a meeting is
+/// several blocks with one title, and dragging any of them means "put this task here". The task's
+/// chunks are pooled and re-laid from `start`, merging into a single block where the space allows
+/// and re-splitting only around what is really in the way. See `schedule_service::move_task_to`.
+#[tauri::command]
+pub fn move_task_to(state: State<AppState>, task_id: i64, start: String) -> Result<ScheduleResult, String> {
+    let start = crate::scheduler::parse_dt(&start).ok_or_else(|| "invalid start time".to_string())?;
+    let mut conn = state.db();
+    let settings = db::get_settings(&conn).map_err(err)?;
+    crate::schedule_service::move_task_to(&mut conn, &settings, task_id, start).map_err(err)
+}
+
 // ---------- booking seam ----------
 
 #[tauri::command]
@@ -1790,13 +1804,21 @@ or anything else, answer \"chat\". When unsure, prefer \"chat\".";
 /// — a cheap, high-precision signal it's a planning request. Used to override the chat-biased router.
 fn has_scheduling_cue(msg: &str) -> bool {
     let lc = msg.to_lowercase();
+    // WHEN: anything that pins the message to a time — including RECURRENCE. "every day" is a
+    // *when*, not a *do*: filed under DO (where it started) a plain habit sentence like "I'll go
+    // for a run every day" satisfied DO twice and WHEN never, so the override could not fire for
+    // any habit phrased without an explicit day word — the single most common way people state one.
     const WHEN: &[&str] = &[
         "today", "tonight", "tomorrow", "tmr", "tmrw", "this weekend", "next week", "this week", "monday", "tuesday",
-        "wednesday", "thursday", "friday", "saturday", "sunday", "o'clock", "noon", "midnight",
+        "wednesday", "thursday", "friday", "saturday", "sunday", "o'clock", "noon", "midnight", "every day",
+        "every morning", "every evening", "every night", "every week", "every other day", "each day", "each week",
+        "daily", "weekly",
     ];
+    // DO: intent to act. Kept free of time words so a bare temporal phrase is never enough on its
+    // own — "the bus comes every day" has a WHEN but no DO, and correctly stays in chat.
     const DO: &[&str] = &[
         "going to", "i have", "i've got", "ive got", "i need to", "i want to", "i'll", "i will", "schedule", "add ",
-        "remind me", "book ", "meeting", "appointment", "deadline", "due ", "every day", "every week", "daily", "weekly",
+        "remind me", "book ", "meeting", "appointment", "deadline", "due ",
     ];
     let has_when = WHEN.iter().any(|w| lc.contains(w)) || has_clock_time(&lc);
     let has_do = DO.iter().any(|w| lc.contains(w));
@@ -2216,5 +2238,103 @@ mod tests {
         // 1-based: 1→10, 3→30; duplicate 1 collapses; 0 and 9 are out of range.
         assert_eq!(map_citation_indices(&[1, 3, 1, 0, 9], &ids), vec![10, 30]);
         assert!(map_citation_indices(&[], &ids).is_empty());
+    }
+
+    // ---- plan-vs-chat routing heuristics ----
+    //
+    // `has_scheduling_cue` overrides a chat-biased router. It is deliberately high-precision: a
+    // false positive drags an innocent question into the planner (which then invents calendar
+    // entries), and a false negative just means the router's own judgement stands. Both directions
+    // are pinned here because the wording lists are edited by hand.
+
+    #[test]
+    fn a_time_plus_an_intent_to_act_reads_as_planning() {
+        for msg in [
+            "I have a dentist appointment tomorrow at 2pm",
+            "Remind me to call the bank on Friday",
+            "schedule a review Monday",
+            "I need to finish the deck by Thursday",
+            "book a room for the standup tomorrow",
+            "I'll go for a run every day",
+            "I've got a meeting at 10:30",
+            "add gym tonight",
+            "I want to meditate every morning",
+            "I'll do the dishes daily",
+        ] {
+            assert!(has_scheduling_cue(msg), "should route to plan: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn a_recurrence_word_alone_is_not_enough_to_hijack_a_chat_message() {
+        // Recurrence counts as a WHEN, so it still needs an intent word beside it. Without this
+        // the override fires on ordinary observations.
+        for msg in ["the bus comes every day", "it rains here weekly", "she goes every morning"] {
+            assert!(!has_scheduling_cue(msg), "should stay chat: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn a_question_or_a_bare_time_reference_stays_chat() {
+        // Half the signal is not enough: a WHEN with no DO, or a DO with no WHEN, stays in chat.
+        for msg in [
+            "what did I do on Monday?",              // when, no intent to act
+            "how was tomorrow's weather looking",     // when, no intent to act
+            "I need to think about the architecture", // intent, no when
+            "summarise my notes",
+            "who is Ava again?",
+            "",
+        ] {
+            assert!(!has_scheduling_cue(msg), "should stay chat: {msg:?}");
+        }
+    }
+
+    #[test]
+    fn the_scheduling_cue_is_case_insensitive() {
+        assert!(has_scheduling_cue("SCHEDULE A REVIEW TOMORROW"));
+        assert!(has_scheduling_cue("I Have A Meeting Friday"));
+    }
+
+    #[test]
+    fn clock_times_are_recognised_in_every_written_form() {
+        for s in ["3pm", "3 pm", "at 10:30", "meet at 7am", "9:05 standup", "call at 12 pm"] {
+            assert!(has_clock_time(&s.to_lowercase()), "should read as a clock time: {s:?}");
+        }
+    }
+
+    #[test]
+    fn things_that_are_not_clock_times_are_not_mistaken_for_them() {
+        for s in ["chapter 3", "i have 4 tasks", "version 2.1", "room 101", "", "no digits here"] {
+            assert!(!has_clock_time(&s.to_lowercase()), "should not read as a clock time: {s:?}");
+        }
+    }
+
+    #[test]
+    fn clock_time_detection_never_panics_on_multibyte_or_edge_input() {
+        // `has_clock_time` walks bytes and then slices the &str at that index — a byte index that
+        // lands mid-character panics. Digits are single-byte so it is safe by construction, but the
+        // invariant is easy to break with an edit, so exercise the boundaries directly.
+        for s in [
+            "café 3pm",
+            "3€",
+            "\u{4f1a}\u{8b70} 14:00",  // CJK before a time
+            "9",                        // trailing digit, nothing after
+            "9:",                       // truncated
+            "1 ",                       // digit then space then end
+            "\u{1f600}7pm",             // emoji (4-byte) immediately before
+            "12:",
+            "%%%9",
+        ] {
+            let _ = has_clock_time(&s.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn a_digit_at_the_very_end_of_the_string_is_handled() {
+        // The am/pm lookahead runs past the digit; the ':' lookahead reads two bytes further. Both
+        // have to stay in bounds when the digit is the last byte.
+        assert!(!has_clock_time("meeting 5"));
+        assert!(!has_clock_time("5"));
+        assert!(!has_clock_time("5:"));
     }
 }

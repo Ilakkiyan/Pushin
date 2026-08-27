@@ -84,12 +84,12 @@ const event = (id: number, title: string, start: string, end: string, kind = "fi
   etag: null,
 });
 
-let moveBlock: ReturnType<typeof vi.fn>;
+let moveTask: ReturnType<typeof vi.fn>;
 let unlockBlock: ReturnType<typeof vi.fn>;
 let moveHabit: ReturnType<typeof vi.fn>;
 
 function seed(overrides: Record<string, unknown> = {}) {
-  moveBlock = vi.fn().mockResolvedValue(undefined);
+  moveTask = vi.fn().mockResolvedValue(undefined);
   unlockBlock = vi.fn().mockResolvedValue(undefined);
   moveHabit = vi.fn().mockResolvedValue(undefined);
   useStore.setState({
@@ -104,7 +104,7 @@ function seed(overrides: Record<string, unknown> = {}) {
     calColorByLabel: false,
     calLabelFilterIds: [],
     focusDateIso: null,
-    moveBlock,
+    moveTask,
     unlockBlock,
     moveHabit,
     ...overrides,
@@ -205,14 +205,37 @@ describe("CalendarPane — pinning", () => {
 });
 
 describe("CalendarPane — drag to reschedule", () => {
-  it("moves a block to the dropped time", async () => {
+  // A drag addresses the TASK, not the block under the cursor. A task the scheduler split around a
+  // meeting is several blocks sharing one title, and pinning only the dragged half is what stranded
+  // the other half as a second, identically-named event. Placement moves to the backend because
+  // that is the only side that can merge the siblings back in.
+  it("moves the task to the dropped time", async () => {
     seed({ tasks: [task(1, "Write slides")], blocks: [block(10, 1, at(9), at(10))] });
     render(<CalendarPane />);
 
     drag(blockCard("Write slides"), PX_PER_HOUR * 2); // +2h
 
-    await waitFor(() => expect(moveBlock).toHaveBeenCalledTimes(1));
-    expect(moveBlock).toHaveBeenCalledWith(10, at(11), at(12));
+    await waitFor(() => expect(moveTask).toHaveBeenCalledTimes(1));
+    expect(moveTask).toHaveBeenCalledWith(1, at(11));
+  });
+
+  it("dragging any chunk of a split task moves the task once, by task id", async () => {
+    // The reported bug at the UI seam: two blocks, one task, one title. Grabbing the second chunk
+    // must send the TASK id, not that chunk's block id, and must fire exactly once.
+    seed({
+      tasks: [task(1, "Split essay")],
+      blocks: [block(10, 1, at(9), at(10)), block(11, 1, at(11), at(12))],
+      events: [event(5, "Standup", at(10), at(11))],
+    });
+    render(<CalendarPane />);
+
+    const cards = screen.getAllByText("Split essay");
+    expect(cards).toHaveLength(2);
+    const second = cards[1].closest("div[style]") as HTMLElement;
+    drag(second, PX_PER_HOUR * 2); // 11:00 -> 13:00
+
+    await waitFor(() => expect(moveTask).toHaveBeenCalledTimes(1));
+    expect(moveTask).toHaveBeenCalledWith(1, at(13));
   });
 
   it("does not persist a drag that never moved", async () => {
@@ -221,11 +244,13 @@ describe("CalendarPane — drag to reschedule", () => {
 
     drag(blockCard("Write slides"), 0);
 
-    await waitFor(() => expect(moveBlock).not.toHaveBeenCalled());
+    await waitFor(() => expect(moveTask).not.toHaveBeenCalled());
   });
 
-  it("slides off an occupied slot instead of overlapping an existing event", async () => {
-    // Dropping the 9am block onto 14:00, where a meeting already sits, must not overlap it.
+  it("hands an occupied drop time to the backend rather than dodging away from it", async () => {
+    // A deliberate change: the pane used to slide to the nearest free slot, which made it impossible
+    // to say "put it here, around the meeting". The drop time now goes through as-is and the
+    // scheduler splits the task around what is in the way (covered in schedule_service::tests).
     seed({
       tasks: [task(1, "Write slides")],
       blocks: [block(10, 1, at(9), at(10))],
@@ -235,11 +260,8 @@ describe("CalendarPane — drag to reschedule", () => {
 
     drag(blockCard("Write slides"), PX_PER_HOUR * 5); // 9am -> 2pm, straight onto the meeting
 
-    await waitFor(() => expect(moveBlock).toHaveBeenCalledTimes(1));
-    const [, newStart, newEnd] = moveBlock.mock.calls[0];
-    // Whatever the scheduler picks, the result must not intersect 14:00–15:00.
-    const overlaps = newStart < at(15) && newEnd > at(14);
-    expect(overlaps).toBe(false);
+    await waitFor(() => expect(moveTask).toHaveBeenCalledTimes(1));
+    expect(moveTask).toHaveBeenCalledWith(1, at(14));
   });
 
   it("clamps a drag above midnight to the top of the day", async () => {
@@ -248,8 +270,8 @@ describe("CalendarPane — drag to reschedule", () => {
 
     drag(blockCard("Early"), -PX_PER_HOUR * 6); // would land at -5:00
 
-    await waitFor(() => expect(moveBlock).toHaveBeenCalledTimes(1));
-    expect(moveBlock).toHaveBeenCalledWith(10, at(0), at(1));
+    await waitFor(() => expect(moveTask).toHaveBeenCalledTimes(1));
+    expect(moveTask).toHaveBeenCalledWith(1, at(0));
   });
 
   it("drags a habit by its own handler, learning the new time", async () => {
@@ -260,7 +282,19 @@ describe("CalendarPane — drag to reschedule", () => {
 
     await waitFor(() => expect(moveHabit).toHaveBeenCalledTimes(1));
     expect(moveHabit).toHaveBeenCalledWith(7, at(8));
-    expect(moveBlock).not.toHaveBeenCalled();
+    expect(moveTask).not.toHaveBeenCalled();
+  });
+
+  it("a habit still slides off an occupied slot instead of overlapping", async () => {
+    // Habits keep the old avoidance: an occurrence is one fixed-length thing with nothing to merge.
+    seed({ events: [event(7, "Morning run", at(7), at(7, 30), "habit"), event(5, "Meeting", at(9), at(10))] });
+    render(<CalendarPane />);
+
+    drag(blockCard("Morning run"), PX_PER_HOUR * 2); // 7:00 -> 9:00, onto the meeting
+
+    await waitFor(() => expect(moveHabit).toHaveBeenCalledTimes(1));
+    const [, newStart] = moveHabit.mock.calls[0];
+    expect(newStart >= at(10) || newStart < at(9)).toBe(true);
   });
 });
 

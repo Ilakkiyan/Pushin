@@ -140,6 +140,7 @@ pub fn run() {
             commands::add_event,
             commands::delete_event,
             commands::lock_block,
+            commands::move_task_to,
             commands::list_event_types,
             commands::create_event_type,
             commands::update_event_type,

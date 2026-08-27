@@ -75,6 +75,33 @@ test("drag-to-reschedule moves a block and the new time survives the round trip"
     .toBeGreaterThan(before);
 });
 
+test("dragging one chunk of a split task merges the whole task back into a single block", async ({ page }) => {
+  // "Write thesis" is seeded as two chunks (10:00 and 15:00) — the split-around-a-meeting shape that
+  // showed up as two identically-named events you could never reunite. Dragging either one is an
+  // instruction about the TASK, so it re-lays as one block wherever there is room for all 3 hours.
+  const cards = page.locator("div[style*='top']").filter({ hasText: "Write thesis" });
+  await expect(cards).toHaveCount(2);
+
+  // The 15:00 chunk sits ~1050px down a 24-hour grid, well below a 720px viewport — read its box
+  // without scrolling first and `page.mouse.move` targets a point off-screen, so the drag silently
+  // never starts and the test "fails" for reasons that have nothing to do with merging.
+  const second = cards.nth(1);
+  await second.scrollIntoViewIfNeeded();
+  const box = await second.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + 5);
+  await page.mouse.down();
+  await page.mouse.move(box!.x + box!.width / 2, box!.y + 5 + 56 * 4, { steps: 10 }); // ~4h down, into the open evening
+  await page.mouse.up();
+
+  await expect(cards).toHaveCount(1, { timeout: 5000 });
+
+  // ...and the merged block carries the task's whole estimate (3h at 56px/hour), not just the half
+  // that was dragged.
+  const height = await cards.first().evaluate((el) => parseFloat((el as HTMLElement).style.height));
+  expect(height).toBeGreaterThan(56 * 2.5);
+});
+
 test("a block dropped on the team meeting does not end up overlapping it", async ({ page }) => {
   // "Prep slides" sits at 16:45, right after the 15:00–16:45 meeting. Drag it up onto the meeting.
   const target = card(page, "Prep slides");
@@ -94,6 +121,25 @@ test("a block dropped on the team meeting does not end up overlapping it", async
 
   const overlaps = slidesTop < meetingTop + meetingHeight && slidesTop + slidesHeight > meetingTop;
   expect(overlaps).toBe(false);
+});
+
+test("the done bin is collapsed by default and expands on click", async ({ page }) => {
+  // "Ship the release" is seeded as finished with NO block — ticking a task off takes it off the
+  // calendar, and the done bin in the task list is where it lives instead. The bin only grows, so
+  // it must not bury the active list.
+  await expect(page.getByText("Draft outline").first()).toBeVisible();
+  await expect(page.getByText("Ship the release")).toHaveCount(0);
+
+  const bin = page.getByRole("button", { name: /^Done/ });
+  await expect(bin).toBeVisible();
+  await expect(bin).toHaveAttribute("aria-expanded", "false");
+
+  await bin.click();
+  await expect(page.getByText("Ship the release")).toBeVisible();
+  await expect(bin).toHaveAttribute("aria-expanded", "true");
+
+  await bin.click();
+  await expect(page.getByText("Ship the release")).toHaveCount(0);
 });
 
 test("navigates weeks and returns with Today", async ({ page }) => {

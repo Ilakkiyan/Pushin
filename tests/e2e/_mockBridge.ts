@@ -59,11 +59,22 @@ export async function installMockBridge(page: Page) {
     // (Item C — scheduler explainability). Dated on `today` so it lands on the visible week.
     const today = new Date().toISOString().slice(0, 10);
     const at = (hm: string) => `${today}T${hm}:00`;
+    /// Format an epoch-ms as Pushin's wire format: naive **local** `YYYY-MM-DDTHH:MM:SS`.
+    /// `toISOString()` is UTC, so using it here shifted every mutated time by the machine's offset —
+    /// invisible in a UTC CI container and wrong everywhere else.
+    const naiveLocal = (msValue: number) => {
+      const d = new Date(msValue);
+      const p = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    };
     const seedTasks = [
       { id: 1, projectId: null, title: "Draft outline", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [] },
       { id: 2, projectId: null, title: "Write thesis", notes: "", estimatedMinutes: 180, deadline: at("23:59"), earliestStart: null, priority: 3, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [] },
       { id: 3, projectId: null, title: "Revise draft", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [1] },
       { id: 4, projectId: null, title: "Prep slides", notes: "", estimatedMinutes: 90, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "scheduled", createdAt: "", missedCount: 2, lastMissedOn: "2026-06-26", dependsOn: [] },
+      // Finished work, deliberately with NO block: ticking a task off takes it off the calendar and
+      // leaves it in the task list's done bin. Gives the E2E something to expand.
+      { id: 5, projectId: null, title: "Ship the release", notes: "", estimatedMinutes: 60, deadline: null, earliestStart: null, priority: 2, minChunkMinutes: 30, maxChunkMinutes: 240, status: "done", createdAt: "", missedCount: 0, lastMissedOn: null, dependsOn: [] },
     ];
     const blk = (id: number, taskId: number, s: string, e: string) => ({ id, taskId, start: at(s), end: at(e), locked: false, provider: null, externalId: null, syncState: null });
     const seedBlocks = [
@@ -111,8 +122,63 @@ export async function installMockBridge(page: Page) {
         if (e && newStart) {
           const durMs = new Date(e.end).getTime() - new Date(e.start).getTime();
           e.start = newStart;
-          e.end = new Date(new Date(newStart).getTime() + durMs).toISOString().slice(0, 19);
+          e.end = naiveLocal(new Date(newStart).getTime() + durMs);
         }
+        return { conflicts: [] };
+      },
+      // Dragging a task. Mirrors `schedule_service::move_task_to`: the task's chunks are POOLED and
+      // re-laid from the drop point, so they merge back into one block where there is room and split
+      // again only around what is genuinely in the way. The old `lock_block` path pinned the single
+      // dragged chunk and left its siblings behind under the same title.
+      move_task_to: ({ taskId, start }: any) => {
+        const ms = (s: string) => new Date(s).getTime();
+        const mine = seedBlocks.filter((b) => b.taskId === taskId);
+        const totalMs = mine.reduce((n, b) => n + (ms(b.end) - ms(b.start)), 0);
+        if (!totalMs || !start) return { conflicts: [] };
+
+        const busy: Array<[number, number]> = [
+          ...seedEvents.map((e) => [ms(e.start), ms(e.end)] as [number, number]),
+          ...seedBlocks.filter((b) => b.taskId !== taskId).map((b) => [ms(b.start), ms(b.end)] as [number, number]),
+        ].sort((a, b) => a[0] - b[0]);
+        const minChunkMs = (seedTasks.find((t) => t.id === taskId)?.minChunkMinutes ?? 15) * 60_000;
+
+        const spans: Array<[number, number]> = [];
+        let cursor = ms(start);
+        let left = totalMs;
+        for (let guard = 0; guard < 500 && left > 0; guard++) {
+          const inside = busy.find(([bs, be]) => bs <= cursor && be > cursor);
+          if (inside) {
+            cursor = inside[1]; // dropped on top of something — slide past it
+            continue;
+          }
+          const next = busy.find(([bs]) => bs > cursor);
+          const room = (next ? next[0] : Number.POSITIVE_INFINITY) - cursor;
+          const take = Math.min(room, left);
+          if (take >= Math.min(minChunkMs, left)) {
+            spans.push([cursor, cursor + take]);
+            left -= take;
+            cursor += take;
+          } else {
+            cursor = next ? next[1] : cursor + 3_600_000; // gap too small to be worth splitting into
+          }
+        }
+        if (!spans.length) return { conflicts: [] };
+
+        for (let i = seedBlocks.length - 1; i >= 0; i--) {
+          if (seedBlocks[i].taskId === taskId) seedBlocks.splice(i, 1);
+        }
+        spans.forEach(([s, e], i) => {
+          seedBlocks.push({
+            id: 5000 + taskId * 10 + i,
+            taskId,
+            start: naiveLocal(s),
+            end: naiveLocal(e),
+            locked: true,
+            provider: null,
+            externalId: null,
+            syncState: null,
+          });
+        });
         return { conflicts: [] };
       },
       explain_schedule: () => seedReasons,

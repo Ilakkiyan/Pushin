@@ -6,13 +6,24 @@ import { BlockNoteEditor } from "@blocknote/core";
 import { api, type Page } from "./ipc";
 import { schema } from "./editorSchema";
 
-/** A safe, readable filename/folder segment: drop path separators + reserved chars, collapse spaces. */
+/** Filenames Windows refuses to create, whatever the extension. `CON.md` simply cannot exist. */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+/** A safe, readable filename/folder segment: drop path separators + reserved chars, collapse spaces.
+ *
+ *  Two OS rules matter here because getting them wrong is silent: Windows strips trailing spaces and
+ *  dots from filenames (so a slug ending in one names a file that never exists, and the page loses
+ *  its `rel_path` mapping on the next pass), and it reserves a handful of legacy device names
+ *  outright. Both are cheap to avoid and impossible to debug from the UI. */
 export function slug(title: string): string {
   const cleaned = title
     .replace(/[^\p{L}\p{N} \-_]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return (cleaned || "Untitled").slice(0, 80);
+  // Trim again AFTER the length cap — the cut itself can land on a space.
+  const capped = (cleaned || "Untitled").slice(0, 80).replace(/[ .]+$/, "");
+  if (!capped) return "Untitled";
+  return WINDOWS_RESERVED.test(capped) ? `${capped}_` : capped;
 }
 
 /** Where a page lives inside the vault folder. Daily notes get a dated `Daily/` tree; every other

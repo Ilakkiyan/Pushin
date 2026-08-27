@@ -150,7 +150,8 @@ interface State {
   setProjectArchived: (id: number, archived: boolean) => Promise<void>;
   addEvent: (title: string, start: string, end: string, kind: string) => Promise<void>;
   deleteEvent: (id: number) => Promise<void>;
-  moveBlock: (id: number, start: string, end: string) => Promise<void>;
+  /// Drag a whole task to a new start (merging/splitting its chunks). See `api.moveTaskTo`.
+  moveTask: (taskId: number, start: string) => Promise<void>;
   unlockBlock: (id: number, start: string, end: string) => Promise<void>;
   moveHabit: (eventId: number, newStart: string) => Promise<void>;
   reschedule: () => Promise<void>;
@@ -358,7 +359,7 @@ export const useStore = create<State>((set, get) => {
     setProjectArchived: (id, archived) => mutate(() => api.setProjectArchived(id, archived)),
     addEvent: (title, start, end, kind) => mutate(() => api.addEvent(title, start, end, kind)),
     deleteEvent: (id) => mutate(() => api.deleteEvent(id)),
-    moveBlock: (id, start, end) => mutate(() => api.lockBlock(id, true, start, end)),
+    moveTask: (taskId, start) => mutate(() => api.moveTaskTo(taskId, start)),
     unlockBlock: (id, start, end) => mutate(() => api.lockBlock(id, false, start, end)),
     moveHabit: (eventId, newStart) => mutate(() => api.moveHabit(eventId, newStart)),
     reschedule: () => mutate(() => api.reschedule()),

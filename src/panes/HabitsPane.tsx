@@ -48,7 +48,10 @@ export default function HabitsPane() {
   const [intervalDays, setIntervalDays] = useState(2);
 
   useEffect(() => {
-    loadHabits();
+    // A rejected load must not leave an unhandled rejection: the pane keeps whatever it had
+    // (nothing, on first paint) rather than the promise escaping into the console. Every other
+    // pane in the app already does this — these two were the exceptions.
+    loadHabits().catch(() => {});
   }, [loadHabits]);
 
   const toggleDay = (n: number) => setSelDays((d) => (d.includes(n) ? d.filter((x) => x !== n) : [...d, n].sort((a, b) => a - b)));

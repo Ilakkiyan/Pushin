@@ -273,13 +273,28 @@ fn percent_decode(s: &str) -> Result<String> {
     Ok(String::from_utf8(out)?)
 }
 
+/// Lock the shared database, surviving a poisoned mutex.
+///
+/// This is the *same* `Arc<Mutex<Connection>>` the app commands use, and `AppState::db()` already
+/// recovers from poison for exactly this reason: `lock().unwrap()` panics forever once any thread
+/// has panicked while holding the lock. The booking server sat on the other side of that same mutex
+/// still calling `.unwrap()`, so one panic anywhere in the app permanently 500'd every public
+/// booking page — a stranger's link silently stopped working with no sign inside the app. SQLite
+/// rolls back its own transaction, so the connection is still consistent; recovering loses at most
+/// the operation that panicked.
+fn lock_db(db: &Arc<Mutex<Connection>>) -> std::sync::MutexGuard<'_, Connection> {
+    db.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn route(req: Request, db: &Arc<Mutex<Connection>>, http: &reqwest::Client, limiter: &Arc<Mutex<RateLimiter>>) -> Response {
     let parts: Vec<&str> = req.path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (req.method.as_str(), parts.as_slice()) {
         ("GET", ["b", token, slug]) => public_page(db, token, slug),
         ("GET", ["api", "b", token, slug, "slots"]) => public_slots(db, token, slug, &req.query),
         ("POST", ["api", "b", token, slug, "book"]) => {
-            if !limiter.lock().unwrap().allow(Instant::now(), BOOK_LIMIT, BOOK_WINDOW) {
+            // Same poison-tolerance as the DB lock: a wedged limiter must not take the public
+            // page down with it.
+            if !limiter.lock().unwrap_or_else(|e| e.into_inner()).allow(Instant::now(), BOOK_LIMIT, BOOK_WINDOW) {
                 return json_response(429, "Too Many Requests", json!({ "error": "Too many booking attempts. Please try again shortly." }));
             }
             public_book(db, http, token, slug, &req.body)
@@ -290,7 +305,7 @@ fn route(req: Request, db: &Arc<Mutex<Connection>>, http: &reqwest::Client, limi
 }
 
 fn public_page(db: &Arc<Mutex<Connection>>, token: &str, slug: &str) -> Response {
-    let conn = db.lock().unwrap();
+    let conn = lock_db(db);
     match db::public_event_type(&conn, token, slug) {
         Ok(Some(et)) => response_text(200, "OK", "text/html; charset=utf-8", &booking_html(token, slug, &et)),
         _ => response_text(404, "Not Found", "text/html; charset=utf-8", &not_found_html()),
@@ -298,7 +313,7 @@ fn public_page(db: &Arc<Mutex<Connection>>, token: &str, slug: &str) -> Response
 }
 
 fn public_slots(db: &Arc<Mutex<Connection>>, token: &str, slug: &str, query: &HashMap<String, String>) -> Response {
-    let conn = db.lock().unwrap();
+    let conn = lock_db(db);
     let Ok(Some(et)) = db::public_event_type(&conn, token, slug) else {
         return json_response(404, "Not Found", json!({ "error": "Not found" }));
     };
@@ -318,7 +333,7 @@ fn public_book(db: &Arc<Mutex<Connection>>, http: &reqwest::Client, token: &str,
         return json_response(400, "Bad Request", json!({ "error": "Check the booking details and try again." }));
     };
     let (result, should_sync) = {
-        let mut conn = db.lock().unwrap();
+        let mut conn = lock_db(db);
         let et = match db::public_event_type(&conn, token, slug) {
             Ok(Some(et)) => et,
             _ => return json_response(404, "Not Found", json!({ "error": "Not found" })),
@@ -718,5 +733,210 @@ mod tests {
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("Pushin booking server"), "fast client blocked by slow client: {text:?}");
         handle.stop();
+    }
+
+    // ---- Resilience ----
+
+    // A panic anywhere in the app poisons the shared connection mutex. `AppState::db()` already
+    // recovers from that; the booking server used to `.unwrap()` the same mutex, so one unrelated
+    // panic silently 500'd every public booking link with nothing visible inside the app.
+    #[test]
+    fn a_poisoned_db_lock_does_not_take_the_public_page_down() {
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let db = Arc::new(Mutex::new(conn));
+
+        // Poison the mutex the way a real bug would: panic while holding the guard.
+        let poisoner = Arc::clone(&db);
+        let _ = thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated bug in an unrelated command");
+        })
+        .join();
+        assert!(db.lock().is_err(), "test precondition: the mutex is poisoned");
+
+        // Every public route still answers.
+        assert_eq!(public_page(&db, &et.share_token, &et.slug).status, 200);
+        assert_eq!(public_slots(&db, &et.share_token, &et.slug, &HashMap::new()).status, 200);
+        assert_eq!(public_page(&db, "nope", "nope").status, 404, "and still 404s correctly");
+    }
+
+    // ---- Request parsing ----
+
+    #[test]
+    fn the_path_is_never_percent_decoded_but_query_values_are() {
+        // Deliberate asymmetry, pinned here because reversing it would be a security regression:
+        // slugs and share tokens are generated as `[a-z0-9-]` / hex, so the path never NEEDS
+        // decoding — and decoding it would let `%2F` smuggle a path separator past the router.
+        // Query values are user-facing text and must decode.
+        let (path, q) = split_target("/b/tok/slug%2Fdeep?name=Ann%20Lee&note=100%25%20sure");
+        assert_eq!(path, "/b/tok/slug%2Fdeep", "an encoded slash stays encoded and simply fails to route");
+        assert_eq!(q.get("name").map(String::as_str), Some("Ann Lee"));
+        assert_eq!(q.get("note").map(String::as_str), Some("100% sure"));
+
+        // ...and a smuggled separator does not reach a route.
+        let db = Arc::new(Mutex::new(db::test_conn()));
+        let http = reqwest::Client::new();
+        let limiter = Arc::new(Mutex::new(RateLimiter::default()));
+        let req = Request { method: "GET".into(), path, query: HashMap::new(), body: Vec::new() };
+        assert_eq!(route(req, &db, &http, &limiter).status, 404);
+    }
+
+    #[test]
+    fn malformed_percent_escapes_in_a_query_are_not_fatal() {
+        // A dangling `%` or non-hex pair must not panic or drop the rest of the query string.
+        let (_, q) = split_target("/b/t/s?a=trailing%&b=bad%zz&c=fine");
+        assert_eq!(q.get("c").map(String::as_str), Some("fine"), "later pairs survive an earlier bad escape");
+        assert!(q.get("a").is_some() || q.get("c").is_some(), "decoding never wipes the whole map");
+    }
+
+    #[test]
+    fn a_plus_in_a_query_value_is_a_space_but_a_plus_in_the_path_is_not() {
+        let (path, q) = split_target("/b/a+b/slug?name=Ada+Lovelace");
+        assert_eq!(q.get("name").map(String::as_str), Some("Ada Lovelace"));
+        assert!(path.contains("a+b") || path.contains("a b"), "path: {path:?}");
+    }
+
+    #[test]
+    fn a_target_with_no_query_yields_an_empty_map() {
+        let (path, q) = split_target("/b/tok/slug");
+        assert_eq!(path, "/b/tok/slug");
+        assert!(q.is_empty());
+        let (_, q2) = split_target("/b/tok/slug?");
+        assert!(q2.is_empty());
+        let (_, q3) = split_target("/b/tok/slug?flag&x=1");
+        assert_eq!(q3.get("x").map(String::as_str), Some("1"), "a valueless key does not eat the next pair");
+    }
+
+    #[test]
+    fn non_ascii_in_the_target_survives_decoding() {
+        // UTF-8 percent-escapes are decoded as bytes then re-assembled — a naive char-wise decoder
+        // panics here.
+        let (_, q) = split_target("/b/t/s?name=Jos%C3%A9%20Garc%C3%ADa");
+        assert_eq!(q.get("name").map(String::as_str), Some("Jos\u{e9} Garc\u{ed}a"));
+    }
+
+    // ---- Routing ----
+
+    #[test]
+    fn unknown_routes_404_and_the_root_is_a_liveness_probe() {
+        let db = Arc::new(Mutex::new(db::test_conn()));
+        let http = reqwest::Client::new();
+        let limiter = Arc::new(Mutex::new(RateLimiter::default()));
+
+        let req = |method: &str, path: &str| Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        assert_eq!(route(req("GET", "/"), &db, &http, &limiter).status, 200);
+        assert_eq!(route(req("GET", "/admin"), &db, &http, &limiter).status, 404);
+        assert_eq!(route(req("GET", "/../../etc/passwd"), &db, &http, &limiter).status, 404);
+        assert_eq!(route(req("POST", "/b/tok/slug"), &db, &http, &limiter).status, 404, "GET-only page rejects POST");
+        assert_eq!(route(req("DELETE", "/"), &db, &http, &limiter).status, 404);
+    }
+
+    #[test]
+    fn a_non_json_booking_body_is_a_400_not_a_500() {
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let db = Arc::new(Mutex::new(conn));
+        let http = reqwest::Client::new();
+        for body in [&b""[..], b"not json", b"{", b"[]", b"{\"name\":123}"] {
+            let r = public_book(&db, &http, &et.share_token, &et.slug, body);
+            assert_eq!(r.status, 400, "body {:?} should be a clean 400", String::from_utf8_lossy(body));
+        }
+    }
+
+    #[test]
+    fn the_slots_horizon_is_clamped_to_a_sane_range() {
+        // `horizonDays` is attacker-controlled; an unclamped value walks the scheduler over years
+        // of days per request. Values outside 1..=60 must be clamped, not honoured or rejected.
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let db = Arc::new(Mutex::new(conn));
+
+        let slots_for = |v: &str| {
+            let mut q = HashMap::new();
+            q.insert("horizonDays".to_string(), v.to_string());
+            let r = public_slots(&db, &et.share_token, &et.slug, &q);
+            assert_eq!(r.status, 200, "horizonDays={v} should still answer");
+            let parsed: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            parsed["slots"].as_array().map(|a| a.len()).unwrap_or(0)
+        };
+
+        let huge = slots_for("100000");
+        let sixty = slots_for("60");
+        assert_eq!(huge, sixty, "an absurd horizon is clamped to 60 days");
+        assert!(slots_for("0") <= slots_for("1"), "a zero horizon clamps up to 1 day, never negative");
+        assert!(slots_for("-5") <= slots_for("1"), "a negative horizon clamps up to 1 day");
+        // Garbage falls back to the default rather than erroring.
+        let _ = slots_for("banana");
+    }
+
+    #[test]
+    fn double_booking_the_same_slot_is_refused() {
+        // The public page is the one surface a stranger drives; two people clicking the same time
+        // must not both land on the calendar.
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let settings = Settings::default();
+        let slot = booking::available_slots(&conn, &settings, &et, 7).unwrap().remove(0);
+        let db = Arc::new(Mutex::new(conn));
+        let http = reqwest::Client::new();
+        let body = serde_json::to_vec(&json!({
+            "name": "First", "email": "a@example.com", "start": slot.start, "end": slot.end
+        }))
+        .unwrap();
+
+        assert_eq!(public_book(&db, &http, &et.share_token, &et.slug, &body).status, 200);
+        let second = serde_json::to_vec(&json!({
+            "name": "Second", "email": "b@example.com", "start": slot.start, "end": slot.end
+        }))
+        .unwrap();
+        assert_ne!(public_book(&db, &http, &et.share_token, &et.slug, &second).status, 200, "slot taken");
+        assert_eq!(db::list_bookings(&lock_db(&db)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_booked_slot_disappears_from_the_public_slot_list() {
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let settings = Settings::default();
+        let slot = booking::available_slots(&conn, &settings, &et, 7).unwrap().remove(0);
+        let db = Arc::new(Mutex::new(conn));
+        let http = reqwest::Client::new();
+        let body =
+            serde_json::to_vec(&json!({ "name": "A", "email": "a@example.com", "start": slot.start, "end": slot.end }))
+                .unwrap();
+        assert_eq!(public_book(&db, &http, &et.share_token, &et.slug, &body).status, 200);
+
+        let r = public_slots(&db, &et.share_token, &et.slug, &HashMap::new());
+        let parsed: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let starts: Vec<&str> = parsed["slots"].as_array().unwrap().iter().filter_map(|s| s["start"].as_str()).collect();
+        assert!(!starts.contains(&slot.start.as_str()), "the taken slot is still offered");
+    }
+
+    #[test]
+    fn a_hostile_booker_name_cannot_inject_into_the_page() {
+        // The name is stored and later rendered in-app; assert it round-trips as inert text.
+        let conn = db::test_conn();
+        let et = et_with(&conn, 30);
+        let settings = Settings::default();
+        let slot = booking::available_slots(&conn, &settings, &et, 7).unwrap().remove(0);
+        let db = Arc::new(Mutex::new(conn));
+        let http = reqwest::Client::new();
+        let evil = "<script>alert(1)</script>";
+        let body =
+            serde_json::to_vec(&json!({ "name": evil, "email": "x@example.com", "start": slot.start, "end": slot.end }))
+                .unwrap();
+        assert_eq!(public_book(&db, &http, &et.share_token, &et.slug, &body).status, 200);
+
+        let bookings = db::list_bookings(&lock_db(&db)).unwrap();
+        assert_eq!(bookings.len(), 1);
+        let html = booking_html(&et.share_token, &et.slug, &et);
+        assert!(!html.contains("<script>alert(1)</script>"), "booker name leaked into the public page markup");
     }
 }

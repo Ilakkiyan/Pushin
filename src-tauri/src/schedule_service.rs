@@ -98,7 +98,11 @@ fn resolve_habit_conflicts(conn: &Connection, now: NaiveDateTime) -> Result<()> 
 /// Deliberately narrow:
 /// - **Only tasks.** A meeting you didn't attend is history, not something to re-plan; habits have
 ///   their own occurrence/streak logic that rolling a miss forward would corrupt.
-/// - **Done/archived tasks keep their blocks** — that's the record of when the work happened.
+/// - **Done/archived tasks are not swept.** The sweep is about re-planning unfinished work, and
+///   there is none. Note this is narrower than "their blocks are kept": ticking a task off
+///   removes its auto-scheduled block on the next `reschedule` (see `reschedule_inner`), which
+///   is deliberate — the calendar shows what is PLANNED, and the done bin in the task list is
+///   the record of what was finished. Only a *pinned* block outlives completion.
 /// - **Idempotent.** `mark_task_missed` only counts the first sweep of a given local date, so the
 ///   dozens of reschedules a normal day triggers can't inflate the count.
 ///
@@ -240,12 +244,92 @@ pub fn reschedule_inner(conn: &mut Connection, settings: &Settings) -> Result<Sc
     Ok(result)
 }
 
+/// Move a task's WHOLE scheduled body of work so it begins at `start`, re-flowing it around
+/// whatever is actually in the way.
+///
+/// This is what a calendar drag calls. Dragging used to pin the one chunk under the cursor
+/// (`db::set_block_locked`), which is wrong for any task the scheduler had split around a meeting:
+/// the dragged half moved, the other half stayed pinned where it was, and the task read as two
+/// identically-titled events that could never be reunited. Here the task's chunks are pooled and
+/// re-laid from the drop point, so they **merge back into one block wherever the space allows** and
+/// only **split again around real obstacles** — matching what the user sees on the grid.
+///
+/// The free-time view is [`scheduler::free_after`], not [`scheduler::free_slots`]: a drag is an
+/// explicit instruction, so it may land outside work hours or in the sleep window. The one thing it
+/// will not do is overlap a fixed event, a habit, or another task's block — it slides past those.
+///
+/// The new blocks are **pinned**, matching the old drag behavior: you moved it there on purpose, so
+/// the next reschedule leaves it alone.
+pub fn move_task_to(
+    conn: &mut Connection,
+    settings: &Settings,
+    task_id: i64,
+    start: NaiveDateTime,
+) -> Result<ScheduleResult> {
+    let tasks = db::list_tasks(conn)?;
+    let Some(task) = tasks.iter().find(|t| t.id == task_id) else {
+        return reschedule_inner(conn, settings);
+    };
+    // A finished or archived task's blocks are the RECORD of when the work happened — the same
+    // reason `sweep_missed` refuses to touch them. Re-laying them would rewrite history from a
+    // stray drag on a block that is still drawn on the calendar.
+    if !task.is_active() {
+        return reschedule_inner(conn, settings);
+    }
+    let events = db::list_events(conn)?;
+    let blocks = db::list_blocks(conn)?;
+
+    let span = |s: &str, e: &str| match (scheduler::parse_dt(s), scheduler::parse_dt(e)) {
+        (Some(s), Some(e)) if e > s => Some(Interval { start: s, end: e }),
+        _ => None,
+    };
+
+    // How much work is being moved: whatever this task currently occupies on the calendar. A task
+    // with no blocks yet (dragged straight out of the task list) falls back to its estimate.
+    let mine: Vec<Interval> = blocks.iter().filter(|b| b.task_id == task_id).filter_map(|b| span(&b.start, &b.end)).collect();
+    let total: i64 = mine.iter().map(|iv| (iv.end - iv.start).num_minutes()).sum();
+    let total = if total > 0 { total } else { task.estimated_minutes.max(0) };
+    if total <= 0 {
+        return reschedule_inner(conn, settings);
+    }
+
+    // Everything the moved task has to flow around — every OTHER task's blocks, plus every event
+    // (habit occurrences are events too).
+    let mut busy: Vec<Interval> = events.iter().filter_map(|e| span(&e.start, &e.end)).collect();
+    busy.extend(blocks.iter().filter(|b| b.task_id != task_id).filter_map(|b| span(&b.start, &b.end)));
+    busy.sort_by_key(|i| i.start);
+
+    // Chunking rule stays the task's own: dragging must not manufacture fragments smaller than the
+    // task says it can be worked in.
+    let min_chunk = task.min_chunk_minutes.max(1);
+    let mut free = scheduler::free_after(start, &busy, settings.horizon_days.max(1));
+    let (placed, _, _) = scheduler::place(&mut free, start, total, min_chunk, None);
+
+    // Nothing could be placed at all (dropped into a wall of busy time with no gap big enough) —
+    // leave the task exactly as it was rather than silently deleting its blocks.
+    if placed.is_empty() {
+        return reschedule_inner(conn, settings);
+    }
+
+    let spans: Vec<(String, String)> =
+        placed.iter().map(|iv| (scheduler::fmt_dt(iv.start), scheduler::fmt_dt(iv.end))).collect();
+    db::replace_task_blocks(conn, task_id, &spans)?;
+    reschedule_inner(conn, settings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike; // only the drag fixtures need weekday maths
 
     fn add_task(conn: &Connection, title: &str, minutes: i64) -> i64 {
         db::insert_task(conn, None, title, "", minutes, None, 2, minutes.max(15), 240, &[]).unwrap()
+    }
+    /// Like `add_task` but with an explicit min-chunk. `add_task` sets min_chunk to the whole
+    /// estimate, which makes the task physically un-splittable — fine for the rollover tests, but it
+    /// would make the drag split/merge tests below pass for the wrong reason.
+    fn add_splittable_task(conn: &Connection, title: &str, minutes: i64, min_chunk: i64) -> i64 {
+        db::insert_task(conn, None, title, "", minutes, None, 2, min_chunk, 240, &[]).unwrap()
     }
     fn block_start(conn: &Connection, task_id: i64) -> Option<String> {
         db::list_blocks(conn).unwrap().into_iter().find(|b| b.task_id == task_id).map(|b| b.start)
@@ -267,6 +351,17 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    /// A fixed hour on a past day, independent of the wall clock.
+    ///
+    /// The rollover tests used to plant blocks at `now - N days`, which quietly breaks late at
+    /// night: run at 23:30 and a 60-minute block planted "yesterday" *ends* at 00:30 **today**, so
+    /// the end-based sweep correctly leaves it alone and every assertion below flips. Four of these
+    /// tests were red on `main` for exactly that reason. Anchor to 09:00 on the target date so the
+    /// block is unambiguously inside a day that is over, at any hour the suite happens to run.
+    fn days_ago_at(now: NaiveDateTime, days: i64, hour: u32) -> NaiveDateTime {
+        (now.date() - Duration::days(days)).and_hms_opt(hour, 0, 0).unwrap()
+    }
+
     fn task_by_id(conn: &Connection, id: i64) -> crate::model::Task {
         db::list_tasks(conn).unwrap().into_iter().find(|t| t.id == id).unwrap()
     }
@@ -279,7 +374,7 @@ mod tests {
         let s = Settings::default();
         let now = Local::now().naive_local();
         let t = add_task(&conn, "Missed essay", 60);
-        plant_block(&conn, t, now - Duration::days(1), 60, false);
+        plant_block(&conn, t, days_ago_at(now, 1, 9), 60, false);
 
         reschedule_inner(&mut conn, &s).unwrap();
 
@@ -299,7 +394,7 @@ mod tests {
         let s = Settings::default();
         let now = Local::now().naive_local();
         let t = add_task(&conn, "Pinned work", 60);
-        plant_block(&conn, t, now - Duration::days(1), 60, true);
+        plant_block(&conn, t, days_ago_at(now, 1, 9), 60, true);
 
         reschedule_inner(&mut conn, &s).unwrap();
 
@@ -361,7 +456,13 @@ mod tests {
         if mins < 15 {
             return; // running within 20 minutes of midnight — no room for an already-passed block today
         }
-        let t = add_task(&conn, "Blew past it", 60);
+        // The task's estimate is exactly the planted block's length, so the sticky block covers all
+        // of it and the scheduler has nothing left to place — which is what makes "exactly one
+        // block" mean "the one that was already there". A fixed 60-minute estimate made this test
+        // depend on the wall clock: for the 50 minutes after midnight the elapsed day is shorter
+        // than the estimate, the scheduler correctly adds a second block for the remainder, and the
+        // assertion below flipped for reasons that had nothing to do with the rollover rule.
+        let t = add_task(&conn, "Blew past it", mins);
         plant_block(&conn, t, start, mins, false);
 
         reschedule_inner(&mut conn, &s).unwrap();
@@ -380,7 +481,7 @@ mod tests {
         let s = Settings::default();
         let now = Local::now().naive_local();
         let t = add_task(&conn, "Missed twice over", 60);
-        plant_block(&conn, t, now - Duration::days(1), 60, false);
+        plant_block(&conn, t, days_ago_at(now, 1, 9), 60, false);
 
         reschedule_inner(&mut conn, &s).unwrap();
         reschedule_inner(&mut conn, &s).unwrap();
@@ -393,10 +494,10 @@ mod tests {
     fn a_finished_task_keeps_its_history_and_is_never_swept() {
         // A done task's past blocks are the record of when the work happened — the sweep must leave
         // them alone and must not mark a finished task as missed.
-        let mut conn = db::test_conn();
+        let conn = db::test_conn();
         let now = Local::now().naive_local();
         let t = add_task(&conn, "Already done", 60);
-        plant_block(&conn, t, now - Duration::days(1), 60, true);
+        plant_block(&conn, t, days_ago_at(now, 1, 9), 60, true);
         db::set_task_status(&conn, t, "done").unwrap();
 
         let rolled = sweep_missed(&conn, now).unwrap();
@@ -414,10 +515,10 @@ mod tests {
         let now = Local::now().naive_local();
         let t = add_task(&conn, "Perpetually deferred", 60);
 
-        plant_block(&conn, t, now - Duration::days(3), 60, false);
-        assert_eq!(sweep_missed(&conn, now - Duration::days(2)).unwrap(), 1);
-        plant_block(&conn, t, now - Duration::days(2), 60, false);
-        assert_eq!(sweep_missed(&conn, now - Duration::days(1)).unwrap(), 1);
+        plant_block(&conn, t, days_ago_at(now, 3, 9), 60, false);
+        assert_eq!(sweep_missed(&conn, days_ago_at(now, 2, 12)).unwrap(), 1);
+        plant_block(&conn, t, days_ago_at(now, 2, 9), 60, false);
+        assert_eq!(sweep_missed(&conn, days_ago_at(now, 1, 12)).unwrap(), 1);
 
         let task = task_by_id(&conn, t);
         assert_eq!(task.missed_count, 2, "two separate days missed");
@@ -508,5 +609,346 @@ mod tests {
 
         assert_eq!(scheduler::fmt_dt(gs), at(18, 0), "earlier-starting Gym stays put");
         assert!(!(gs < we && ws < ge), "Walk ({ws}–{we}) must no longer overlap Gym ({gs}–{ge})");
+    }
+
+    // ---------------- dragging a task on the calendar ----------------
+    //
+    // A task the scheduler split around a meeting is several blocks sharing one title. Dragging any
+    // of them means "put this task here": the chunks pool and re-lay from the drop point, merging
+    // where the space allows and splitting only around what is genuinely in the way.
+
+    /// Blocks of one task, in time order, as (start, end) minute-of-day pairs on `day`.
+    fn task_spans(conn: &Connection, task_id: i64) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+        let mut v: Vec<(NaiveDateTime, NaiveDateTime)> = db::list_blocks(conn)
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.task_id == task_id)
+            .map(|b| (scheduler::parse_dt(&b.start).unwrap(), scheduler::parse_dt(&b.end).unwrap()))
+            .collect();
+        v.sort_by_key(|(s, _)| *s);
+        v
+    }
+
+    fn minutes(spans: &[(NaiveDateTime, NaiveDateTime)]) -> i64 {
+        spans.iter().map(|(s, e)| (*e - *s).num_minutes()).sum()
+    }
+
+    /// A weekday inside the work week, far enough ahead that "now" never overtakes the fixture.
+    fn future_workday(now: NaiveDateTime) -> chrono::NaiveDate {
+        let mut d = now.date() + Duration::days(2);
+        while !Settings::default().work_days.contains(&(d.weekday().number_from_monday() as u8)) {
+            d += Duration::days(1);
+        }
+        d
+    }
+
+    #[test]
+    fn dragging_a_split_task_into_open_space_merges_its_chunks_into_one_block() {
+        // The reported bug: a 2h task split around an 11:00 meeting showed as two identically-named
+        // blocks, and dragging one moved only that half. Dropped somewhere with room for the whole
+        // thing, it must come back as ONE block.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let day = future_workday(now);
+
+        let t = add_splittable_task(&conn, "Split essay", 120, 30);
+        // 09:00-10:00 and 11:00-12:00, straddling a meeting at 10:00.
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, false);
+        plant_block(&conn, t, day.and_hms_opt(11, 0, 0).unwrap(), 60, false);
+        db::insert_event(
+            &conn,
+            "Standup",
+            &scheduler::fmt_dt(day.and_hms_opt(10, 0, 0).unwrap()),
+            &scheduler::fmt_dt(day.and_hms_opt(11, 0, 0).unwrap()),
+            "fixed",
+        )
+        .unwrap();
+        assert_eq!(task_spans(&conn, t).len(), 2, "precondition: the task starts out split");
+
+        // Drop it at 13:00, where the afternoon is wide open.
+        let target = day.and_hms_opt(13, 0, 0).unwrap();
+        move_task_to(&mut conn, &s, t, target).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert_eq!(spans.len(), 1, "the two halves merged back into one block, got {spans:?}");
+        assert_eq!(spans[0].0, target, "and it starts exactly where it was dropped");
+        assert_eq!(minutes(&spans), 120, "with all of its minutes intact");
+    }
+
+    #[test]
+    fn dragging_a_whole_task_onto_a_meeting_splits_it_around_the_meeting() {
+        // The other half of the behavior: drop a contiguous task where something already sits and it
+        // parts around it instead of overlapping or snapping away.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let now = Local::now().naive_local();
+        let day = future_workday(now);
+
+        let t = add_splittable_task(&conn, "Report", 120, 30);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 120, false);
+        db::insert_event(
+            &conn,
+            "Client call",
+            &scheduler::fmt_dt(day.and_hms_opt(14, 0, 0).unwrap()),
+            &scheduler::fmt_dt(day.and_hms_opt(15, 0, 0).unwrap()),
+            "fixed",
+        )
+        .unwrap();
+
+        // Drop at 13:00 — one hour of room, then the call, then open again.
+        move_task_to(&mut conn, &s, t, day.and_hms_opt(13, 0, 0).unwrap()).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert_eq!(spans.len(), 2, "split around the call, got {spans:?}");
+        assert_eq!(spans[0], (day.and_hms_opt(13, 0, 0).unwrap(), day.and_hms_opt(14, 0, 0).unwrap()));
+        assert_eq!(spans[1], (day.and_hms_opt(15, 0, 0).unwrap(), day.and_hms_opt(16, 0, 0).unwrap()));
+        assert_eq!(minutes(&spans), 120, "no minutes lost in the split");
+    }
+
+    #[test]
+    fn a_drop_inside_a_busy_interval_slides_forward_instead_of_overlapping() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Deep work", 60);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, false);
+        db::insert_event(
+            &conn,
+            "Interview",
+            &scheduler::fmt_dt(day.and_hms_opt(13, 0, 0).unwrap()),
+            &scheduler::fmt_dt(day.and_hms_opt(14, 0, 0).unwrap()),
+            "fixed",
+        )
+        .unwrap();
+
+        // Drop right in the middle of the interview.
+        move_task_to(&mut conn, &s, t, day.and_hms_opt(13, 30, 0).unwrap()).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, day.and_hms_opt(14, 0, 0).unwrap(), "slid to the end of what was in the way");
+    }
+
+    #[test]
+    fn a_dragged_task_may_land_outside_working_hours() {
+        // A drag is an explicit instruction. The auto-scheduler stays inside the work day; a hand
+        // drag is allowed to put work in the evening, and must not be quietly pulled back to 09:00.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Evening reading", 60);
+        plant_block(&conn, t, day.and_hms_opt(10, 0, 0).unwrap(), 60, false);
+
+        let evening = day.and_hms_opt(21, 0, 0).unwrap();
+        move_task_to(&mut conn, &s, t, evening).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, evening, "the drop time is honoured outside the work window");
+    }
+
+    #[test]
+    fn a_dragged_task_is_pinned_so_the_next_reschedule_leaves_it_alone() {
+        // Dragging has always meant "pin here". Losing that would make the block snap back to the
+        // auto-schedule on the very next user action, which fires constantly.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Pinned by drag", 60);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, false);
+        let target = day.and_hms_opt(15, 30, 0).unwrap();
+        move_task_to(&mut conn, &s, t, target).unwrap();
+
+        assert!(
+            db::list_blocks(&conn).unwrap().iter().filter(|b| b.task_id == t).all(|b| b.locked),
+            "every re-laid chunk is pinned"
+        );
+
+        // ...and it survives a full reschedule unchanged.
+        reschedule_inner(&mut conn, &s).unwrap();
+        assert_eq!(task_spans(&conn, t), vec![(target, target + Duration::minutes(60))]);
+    }
+
+    #[test]
+    fn dragging_one_task_does_not_disturb_another() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let a = add_task(&conn, "Task A", 60);
+        let b = add_task(&conn, "Task B", 60);
+        plant_block(&conn, a, day.and_hms_opt(9, 0, 0).unwrap(), 60, true);
+        plant_block(&conn, b, day.and_hms_opt(11, 0, 0).unwrap(), 60, true);
+        let b_before = task_spans(&conn, b);
+
+        move_task_to(&mut conn, &s, a, day.and_hms_opt(14, 0, 0).unwrap()).unwrap();
+
+        assert_eq!(task_spans(&conn, b), b_before, "the other task stayed put");
+        assert_eq!(task_spans(&conn, a).len(), 1);
+    }
+
+    #[test]
+    fn a_dragged_task_will_not_land_on_another_tasks_block() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let a = add_task(&conn, "Mover", 60);
+        let b = add_task(&conn, "Squatter", 60);
+        plant_block(&conn, a, day.and_hms_opt(9, 0, 0).unwrap(), 60, false);
+        plant_block(&conn, b, day.and_hms_opt(14, 0, 0).unwrap(), 60, true);
+
+        move_task_to(&mut conn, &s, a, day.and_hms_opt(14, 0, 0).unwrap()).unwrap();
+
+        let a_spans = task_spans(&conn, a);
+        let b_spans = task_spans(&conn, b);
+        for (as_, ae) in &a_spans {
+            for (bs, be) in &b_spans {
+                assert!(as_ >= be || ae <= bs, "dragged task overlaps another task's block: {a_spans:?} vs {b_spans:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_min_chunk_is_respected_when_a_drag_has_to_split() {
+        // Splitting must not manufacture fragments smaller than the task says it can be worked in —
+        // a 15-minute sliver of a 90-minute deep-work task is worse than pushing it later.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        // min_chunk 60, total 120.
+        let t = add_splittable_task(&conn, "Deep work", 120, 60);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 120, false);
+        // Leave only a 30-minute gap at the drop point, then a wall, then open space.
+        db::insert_event(
+            &conn,
+            "Wall",
+            &scheduler::fmt_dt(day.and_hms_opt(13, 30, 0).unwrap()),
+            &scheduler::fmt_dt(day.and_hms_opt(15, 0, 0).unwrap()),
+            "fixed",
+        )
+        .unwrap();
+
+        move_task_to(&mut conn, &s, t, day.and_hms_opt(13, 0, 0).unwrap()).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert!(
+            spans.iter().all(|(s0, e0)| (*e0 - *s0).num_minutes() >= 60),
+            "a sub-min-chunk sliver was created: {spans:?}"
+        );
+        assert_eq!(minutes(&spans), 120);
+    }
+
+    #[test]
+    fn dragging_a_task_that_has_no_blocks_yet_schedules_its_estimate() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Brand new", 45);
+        // Give the auto-scheduler nothing to do first — drop it straight onto a time.
+        let target = day.and_hms_opt(16, 0, 0).unwrap();
+        move_task_to(&mut conn, &s, t, target).unwrap();
+
+        let spans = task_spans(&conn, t);
+        assert_eq!(minutes(&spans), 45, "the estimate is what gets placed, got {spans:?}");
+        assert_eq!(spans[0].0, target);
+    }
+
+    #[test]
+    fn dragging_a_finished_task_does_not_rewrite_its_history() {
+        // A done task's blocks record when the work actually happened, and they are still drawn on
+        // the calendar — so a stray drag must not re-lay them somewhere else.
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Already done", 60);
+        // Pinned, matching `a_finished_task_keeps_its_history_and_is_never_swept` — see
+        // `a_done_tasks_unpinned_block_does_not_survive_a_reschedule` for why that matters.
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, true);
+        db::set_task_status(&conn, t, "done").unwrap();
+        let before = task_spans(&conn, t);
+
+        move_task_to(&mut conn, &s, t, day.and_hms_opt(15, 0, 0).unwrap()).unwrap();
+
+        assert_eq!(task_spans(&conn, t), before, "history stayed where it was");
+    }
+
+    /// Ticking a task off takes it off the calendar. **This is the intended behavior**, confirmed as
+    /// a product decision: the calendar shows what is PLANNED, and the done bin in the task list is
+    /// the record of what was finished. Finishing a task calls `reschedule`,
+    /// `replace_unlocked_blocks` deletes every `locked = 0` row, and a done task is not in
+    /// `active_ids` so it is not re-emitted as sticky either — the block goes.
+    ///
+    /// Kept as a test because it is load-bearing and non-obvious: the deletion happens two layers
+    /// away from the checkbox, so anything that made done tasks sticky (or pinned their blocks on
+    /// completion) would silently leave finished work cluttering the week.
+    #[test]
+    fn ticking_a_task_off_removes_it_from_the_calendar() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+
+        let t = add_task(&conn, "Finished this", 60);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, false);
+        db::set_task_status(&conn, t, "done").unwrap();
+
+        reschedule_inner(&mut conn, &s).unwrap();
+
+        assert!(task_spans(&conn, t).is_empty(), "a finished task leaves the calendar");
+
+        // A PINNED block is the one exception: an explicit "do it at THIS time" outlives completion,
+        // so a block you placed by hand is still there as a record of when you did it.
+        let p = add_task(&conn, "Also finished", 60);
+        plant_block(&conn, p, day.and_hms_opt(11, 0, 0).unwrap(), 60, true);
+        db::set_task_status(&conn, p, "done").unwrap();
+        reschedule_inner(&mut conn, &s).unwrap();
+        assert_eq!(task_spans(&conn, p).len(), 1, "a pinned block of a done task is kept as history");
+    }
+
+    #[test]
+    fn moving_an_unknown_task_is_a_harmless_no_op() {
+        let mut conn = db::test_conn();
+        let s = Settings::default();
+        let day = future_workday(Local::now().naive_local());
+        let t = add_task(&conn, "Real", 60);
+        plant_block(&conn, t, day.and_hms_opt(9, 0, 0).unwrap(), 60, true);
+        let before = task_spans(&conn, t);
+
+        move_task_to(&mut conn, &s, 999_999, day.and_hms_opt(14, 0, 0).unwrap()).unwrap();
+
+        assert_eq!(task_spans(&conn, t), before, "an unknown id changes nothing");
+    }
+
+    #[test]
+    fn a_drag_with_nowhere_to_go_leaves_the_task_where_it_was() {
+        // Dropped into a solid wall of busy time that runs to the horizon: better to keep the
+        // existing plan than to delete the task's blocks and place nothing.
+        let mut conn = db::test_conn();
+        let mut s = Settings::default();
+        s.horizon_days = 1;
+        let day = Local::now().naive_local().date();
+
+        let t = add_task(&conn, "Nowhere", 60);
+        plant_block(&conn, t, day.and_hms_opt(1, 0, 0).unwrap(), 60, true);
+        // Block out the rest of the day from the drop point onward.
+        db::insert_event(
+            &conn,
+            "All afternoon",
+            &scheduler::fmt_dt(day.and_hms_opt(12, 0, 0).unwrap()),
+            &scheduler::fmt_dt((day + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap()),
+            "fixed",
+        )
+        .unwrap();
+
+        move_task_to(&mut conn, &s, t, day.and_hms_opt(12, 0, 0).unwrap()).unwrap();
+
+        assert!(!task_spans(&conn, t).is_empty(), "the task still has a plan rather than vanishing");
     }
 }

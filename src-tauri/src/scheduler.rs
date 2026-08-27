@@ -183,11 +183,48 @@ pub fn free_slots(now: NaiveDateTime, s: &Settings, busy: &[Interval]) -> Vec<In
     out.into_iter().filter(|i| i.end > i.start).collect()
 }
 
+/// Free intervals from `from` forward, day by day, given a sorted `busy` list — the free-time view
+/// behind a **hand drag** rather than an auto-schedule.
+///
+/// Deliberately different from [`free_slots`]: no work-hour window, no sleep window, no buffer
+/// padding. A drag is an explicit instruction, so dropping work into the evening is allowed; the
+/// only thing it must not do is land on top of something that is already there. Intervals are
+/// clamped to midnight so a chunk never straddles two day columns in the calendar.
+pub(crate) fn free_after(from: NaiveDateTime, busy: &[Interval], days: i64) -> Vec<Interval> {
+    let mut out = Vec::new();
+    for d in 0..days.max(1) {
+        let date = from.date() + Duration::days(d);
+        let day_start = if d == 0 { from } else { date.and_hms_opt(0, 0, 0).unwrap() };
+        let Some(day_end) = (date + Duration::days(1)).and_hms_opt(0, 0, 0) else { continue };
+        let mut cursor = day_start;
+        for b in busy {
+            if b.end <= cursor {
+                continue;
+            }
+            if b.start >= day_end {
+                break;
+            }
+            let bs = b.start.max(day_start);
+            if bs > cursor {
+                out.push(Interval { start: cursor, end: bs.min(day_end) });
+            }
+            cursor = cursor.max(b.end.min(day_end));
+            if cursor >= day_end {
+                break;
+            }
+        }
+        if cursor < day_end {
+            out.push(Interval { start: cursor, end: day_end });
+        }
+    }
+    out.into_iter().filter(|i| i.end > i.start).collect()
+}
+
 /// Place up to `remaining` minutes of work into `free` (mutated), no earlier than `earliest` and
 /// (when set) no later than `latest` — so a task is never scheduled past its deadline. One block
 /// per contiguous interval; `min_chunk` avoids tiny fragments. Returns (placed blocks, last end,
 /// minutes that couldn't be placed). Time after `latest` stays in the free pool for other tasks.
-fn place(
+pub(crate) fn place(
     free: &mut Vec<Interval>,
     earliest: NaiveDateTime,
     mut remaining: i64,

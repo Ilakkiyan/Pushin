@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Plus, Trash2, NotebookPen, Play, Square, RotateCcw } from "lucide-react";
+import { Check, ChevronRight, Plus, Trash2, NotebookPen, Play, Square, RotateCcw } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type FocusSession, type Task } from "../lib/ipc";
@@ -11,6 +11,9 @@ function fmtElapsed(sec: number): string {
   const m = Math.floor(sec / 60);
   return `${m}:${String(sec % 60).padStart(2, "0")}`;
 }
+
+/** Remembers whether the done bin is open. Same `pushin:` prefix as the other UI preferences. */
+const DONE_OPEN_KEY = "pushin:taskListDoneOpen";
 
 const PRIORITY: Record<number, { label: string; cls: string }> = {
   1: { label: "Low", cls: "text-gray-400 bg-gray-400/10" },
@@ -109,6 +112,23 @@ export default function TaskListPane() {
   const [minutes, setMinutes] = useState(60);
   const [focus, setFocus] = useState<FocusSession | null>(null);
   const [now, setNow] = useState(Date.now());
+  // The done bin only grows, so it starts collapsed and remembers the choice — an archive you have
+  // to scroll past is worse than one you open when you want it. Read lazily and guarded: a private
+  // window or blocked site data throws on access, and this is not worth crashing the task list over.
+  const [doneOpen, setDoneOpen] = useState(() => {
+    try {
+      return localStorage.getItem(DONE_OPEN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(DONE_OPEN_KEY, doneOpen ? "1" : "0");
+    } catch {
+      /* not worth surfacing — the bin just forgets between sessions */
+    }
+  }, [doneOpen]);
 
   // Load any in-progress focus session on mount (e.g. after a navigation). Defensive against a
   // missing api method (older test mocks) so the task list never crashes.
@@ -195,10 +215,19 @@ export default function TaskListPane() {
         ))}
         {done.length > 0 && (
           <div className="mt-2 pt-2 border-t border-white/5">
-            <div className="px-4 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)]">Done</div>
-            {done.map((t) => (
-              <TaskRow key={t.id} task={t} active={focus} now={now} onStart={startFocus} onStop={stopFocus} />
-            ))}
+            <button
+              onClick={() => setDoneOpen((o) => !o)}
+              aria-expanded={doneOpen}
+              className="flex w-full items-center gap-1.5 px-4 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-faint)] hover:text-[var(--ink-muted)]"
+            >
+              <ChevronRight className={clsx("size-3 shrink-0 transition-transform", doneOpen && "rotate-90")} />
+              <span>Done</span>
+              <span className="tnum font-normal tracking-normal">· {done.length}</span>
+            </button>
+            {doneOpen &&
+              done.map((t) => (
+                <TaskRow key={t.id} task={t} active={focus} now={now} onStart={startFocus} onStop={stopFocus} />
+              ))}
           </div>
         )}
       </div>

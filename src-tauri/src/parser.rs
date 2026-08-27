@@ -1064,6 +1064,7 @@ pub fn apply_recovery(plan: &mut ParsedPlan, user_text: &str, today: NaiveDate) 
     backfill_task_dependencies(plan, user_text);
     merge_split_event_fragments(plan); // before the backfill: a fabricated sibling hides the single subject
     backfill_event_fields(plan, user_text, today);
+    fix_flipped_meridian(plan, user_text); // after the backfill: correct whatever start survived it
     clamp_absurd_event_durations(plan, user_text);
     promote_timed_work_to_block(plan, user_text);
     collapse_unrequested_decomposition(plan, user_text);
@@ -2698,8 +2699,172 @@ fn find_time_shift(text: &str) -> Option<i64> {
 
 /// Pull an explicit length ("2 hours", "90 min", "1.5 hrs") out of free text. Returns the
 /// first match in minutes; ignores bare numbers without a unit ("instead of 1").
+/// Every clock time in the text that carries an explicit `am`/`pm`, as 24-hour times.
+///
+/// Only *marked* times count. A bare "9" is genuinely ambiguous and the pipeline has a separate
+/// convention for it; the point here is to find the times the user was unambiguous about.
+fn find_meridian_times(lc: &str) -> Vec<NaiveTime> {
+    let b: Vec<char> = lc.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        let Ok(hour) = b[s..i].iter().collect::<String>().parse::<u32>() else {
+            continue;
+        };
+        let mut minute = 0u32;
+        if i + 2 < b.len() && b[i] == ':' && b[i + 1].is_ascii_digit() && b[i + 2].is_ascii_digit() {
+            minute = b[i + 1..i + 3].iter().collect::<String>().parse().unwrap_or(0);
+            i += 3;
+        }
+        let mut j = i;
+        while j < b.len() && b[j] == ' ' {
+            j += 1;
+        }
+        if j + 1 < b.len() && (b[j] == 'a' || b[j] == 'p') && b[j + 1] == 'm' {
+            let pm = b[j] == 'p';
+            if (1..=12).contains(&hour) && minute <= 59 {
+                let h24 = if pm {
+                    if hour == 12 { 12 } else { hour + 12 }
+                } else if hour == 12 {
+                    0
+                } else {
+                    hour
+                };
+                if let Some(t) = NaiveTime::from_hms_opt(h24, minute, 0) {
+                    out.push(t);
+                }
+            }
+            i = j + 2;
+        }
+    }
+    out
+}
+
+/// Correct a start time the model flipped across noon.
+///
+/// Even the 7B answers `"21:00"` to "at 9am" often enough to matter, and a morning appointment
+/// silently booked for the evening is close to the worst thing this pipeline can do: the
+/// confirmation text reads correctly, and you find out by missing it. The user's own words are
+/// authoritative here, so take them.
+///
+/// Deliberately narrow, like the other recovery passes:
+/// - the message must contain **exactly one** explicitly marked (`am`/`pm`) time — with two, there
+///   is no way to know which event a correction belongs to;
+/// - the plan must hold **exactly one** timed item, for the same reason;
+/// - and the disagreement must be **exactly ±12 hours**. A merely different time is a different
+///   reading of the sentence and is left alone; only a clean meridian flip is corrected.
+///
+/// A present `endTime` moves by the same delta, so the duration survives instead of inverting.
+fn fix_flipped_meridian(plan: &mut ParsedPlan, user_text: &str) {
+    let times = find_meridian_times(&user_text.to_lowercase());
+    if times.len() != 1 {
+        return;
+    }
+    let want = times[0];
+    let half_day = Duration::hours(12).num_minutes();
+
+    let fix = |start: &mut Option<String>, end: &mut Option<String>| {
+        let Some(got) = start.as_deref().and_then(parse_hm) else { return };
+        if want.signed_duration_since(got).num_minutes().abs() != half_day {
+            return;
+        }
+        let delta = want.signed_duration_since(got);
+        *start = Some(want.format("%H:%M").to_string());
+        if let Some(e) = end.as_deref().and_then(parse_hm) {
+            // NaiveTime addition wraps at midnight, which is exactly right for an evening→morning
+            // correction of a range that used to cross it.
+            *end = Some((e + delta).format("%H:%M").to_string());
+        }
+    };
+
+    if plan.events.len() == 1 && plan.update_events.is_empty() {
+        let ev = &mut plan.events[0];
+        let (mut s, mut e) = (ev.start_time.take(), ev.end_time.take());
+        fix(&mut s, &mut e);
+        ev.start_time = s;
+        ev.end_time = e;
+    } else if plan.events.is_empty() && plan.update_events.len() == 1 {
+        let up = &mut plan.update_events[0];
+        let (mut s, mut e) = (up.start_time.take(), up.end_time.take());
+        fix(&mut s, &mut e);
+        up.start_time = s;
+        up.end_time = e;
+    }
+}
+
+/// Hours named just before an `hour(s)`/`hr(s)` unit in `t` (a space-normalised lowercase string).
+fn hours_in(t: &str) -> Option<i64> {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    for (i, w) in words.iter().enumerate() {
+        if !matches!(*w, "hour" | "hours" | "hr" | "hrs") || i == 0 {
+            continue;
+        }
+        let prev = words[i - 1];
+        if matches!(prev, "a" | "an" | "one") {
+            return Some(1);
+        }
+        if let Some(n) = prev.parse::<i64>().ok().or_else(|| word_number(prev)) {
+            return Some(n);
+        }
+        // "<n> and a half hours" — the count sits four words back.
+        if prev == "half" && i >= 4 && words[i - 2] == "a" && words[i - 3] == "and" {
+            let c = words[i - 4];
+            if matches!(c, "a" | "an" | "one") {
+                return Some(1);
+            }
+            if let Some(n) = c.parse::<i64>().ok().or_else(|| word_number(c)) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Spoken durations the digit scanner cannot see: "half an hour", "an hour and a half", "quarter of
+/// an hour", "two and a half hours".
+///
+/// Worth handling deterministically because the model fails these in one specific direction — it
+/// falls back to its 60-minute default — so a "half an hour" standup is booked for a full hour every
+/// single time. Checked BEFORE the digit scan, because "1 hour and a half" *does* contain a digit
+/// and the digit scan would stop at "1 hour" and answer 60.
+fn find_worded_duration(lc: &str) -> Option<i64> {
+    // Punctuation → spaces, so a trailing "hour." still matches.
+    let flat: String = lc.chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    let t = format!(" {} ", flat.split_whitespace().collect::<Vec<_>>().join(" "));
+
+    if t.contains(" half an hour ") || t.contains(" a half hour ") || t.contains(" half hour ") {
+        return Some(30);
+    }
+    if t.contains(" quarter of an hour ") || t.contains(" a quarter hour ") || t.contains(" quarter hour ") {
+        return Some(15);
+    }
+    if t.contains(" three quarters of an hour ") {
+        return Some(45);
+    }
+    let extra = if t.contains(" and a half ") {
+        30
+    } else if t.contains(" and a quarter ") {
+        15
+    } else {
+        return None;
+    };
+    hours_in(&t).map(|h| h * 60 + extra)
+}
+
 fn find_duration_minutes(text: &str) -> Option<i64> {
-    let chars: Vec<char> = text.to_lowercase().chars().collect();
+    let lc = text.to_lowercase();
+    if let Some(m) = find_worded_duration(&lc) {
+        return Some(m);
+    }
+    let chars: Vec<char> = lc.chars().collect();
     let n = chars.len();
     let mut i = 0;
     while i < n {
@@ -6594,5 +6759,190 @@ mod tests {
         let mut plan = ParsedPlan { clarifications: vec!["What time for the table?".into()], ..Default::default() };
         apply_recovery(&mut plan, "book a table", d());
         assert_eq!(plan.clarifications.len(), 1, "not an affirmative; the clarification is kept");
+    }
+
+    // ---------------- spoken durations ----------------
+    //
+    // The model answers these with its 60-minute default, every time. Rust reads them off the user's
+    // own words instead.
+
+    #[test]
+    fn worded_durations_are_understood() {
+        for (text, want) in [
+            ("Standup tomorrow at 9, half an hour.", 30),
+            ("a half hour call", 30),
+            ("half hour sync", 30),
+            ("quarter of an hour standup", 15),
+            ("a quarter hour break", 15),
+            ("three quarters of an hour of practice", 45),
+            ("Physio tomorrow for an hour and a half", 90),
+            ("one hour and a half of revision", 90),
+            ("two and a half hours of writing", 150),
+            ("3 and a half hours on the essay", 210),
+            ("an hour and a quarter", 75),
+        ] {
+            assert_eq!(find_duration_minutes(text), Some(want), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn digit_durations_still_win_where_they_always_did() {
+        for (text, want) in [
+            ("block 90 minutes", 90),
+            ("2 hours of deep work", 120),
+            ("45 mins", 45),
+            ("1.5 hours", 90),
+            ("30m", 30),
+            ("2 hrs tomorrow", 120),
+        ] {
+            assert_eq!(find_duration_minutes(text), Some(want), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_digit_before_and_a_half_is_not_truncated_to_the_whole_hours() {
+        // The trap the word pass exists to avoid: "1 hour and a half" contains a digit, so the digit
+        // scanner sees "1 hour" and stops at 60. The word pass has to run first.
+        assert_eq!(find_duration_minutes("1 hour and a half"), Some(90));
+        assert_eq!(find_duration_minutes("2 hours and a quarter"), Some(135));
+    }
+
+    #[test]
+    fn text_with_no_duration_still_reports_none() {
+        for text in ["dentist tomorrow at 9am", "call mum", "", "the half-baked plan", "a quarter of the team"] {
+            assert_eq!(find_duration_minutes(text), None, "{text:?}");
+        }
+    }
+
+    // ---------------- meridian flips ----------------
+
+    fn one_event_plan(start: &str, end: Option<&str>) -> ParsedPlan {
+        ParsedPlan {
+            events: vec![ParsedEvent {
+                title: "Dentist".into(),
+                day: Some("tomorrow".into()),
+                date: None,
+                start_time: Some(start.into()),
+                end_time: end.map(|s| s.to_string()),
+                duration_minutes: None,
+                span_days: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_start_flipped_across_noon_is_corrected_to_what_the_user_wrote() {
+        // The live 7B answers "21:00" to "at 9am" often enough to matter, and a morning appointment
+        // booked for the evening reads correctly in the confirmation and wrong only when you miss it.
+        let mut plan = one_event_plan("21:00", None);
+        fix_flipped_meridian(&mut plan, "Dentist the day after tomorrow at 9am.");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("09:00"));
+    }
+
+    #[test]
+    fn the_correction_runs_in_both_directions() {
+        let mut plan = one_event_plan("09:00", None);
+        fix_flipped_meridian(&mut plan, "Dinner tomorrow at 9pm");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("21:00"));
+    }
+
+    #[test]
+    fn a_present_end_time_moves_with_the_start_so_the_duration_survives() {
+        let mut plan = one_event_plan("21:00", Some("22:30"));
+        fix_flipped_meridian(&mut plan, "Dentist tomorrow at 9am");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("09:00"));
+        assert_eq!(plan.events[0].end_time.as_deref(), Some("10:30"), "still 90 minutes long");
+    }
+
+    #[test]
+    fn a_time_that_merely_differs_is_left_alone() {
+        // Only a clean ±12h flip is a meridian error. A different time is a different reading of the
+        // sentence, and overriding it would be the recovery inventing an answer.
+        let mut plan = one_event_plan("14:00", None);
+        fix_flipped_meridian(&mut plan, "Dentist tomorrow at 9am");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("14:00"));
+    }
+
+    #[test]
+    fn two_marked_times_in_the_message_disable_the_correction() {
+        // With two, there is no way to know which one a flipped event was meant to be.
+        let mut plan = one_event_plan("21:00", None);
+        fix_flipped_meridian(&mut plan, "Dentist at 9am then lunch at 1pm");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("21:00"), "left for a human to sort out");
+    }
+
+    #[test]
+    fn two_events_in_the_plan_disable_the_correction() {
+        let mut plan = one_event_plan("21:00", None);
+        plan.events.push(ParsedEvent {
+            title: "Lunch".into(),
+            day: Some("tomorrow".into()),
+            date: None,
+            start_time: Some("12:00".into()),
+            end_time: None,
+            duration_minutes: None,
+            span_days: None,
+        });
+        fix_flipped_meridian(&mut plan, "Dentist at 9am and lunch");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("21:00"));
+    }
+
+    #[test]
+    fn an_unmarked_time_is_not_treated_as_authoritative() {
+        // A bare "9" is genuinely ambiguous — the pipeline has its own convention for it, and this
+        // pass must not second-guess that.
+        let mut plan = one_event_plan("21:00", None);
+        fix_flipped_meridian(&mut plan, "Workshop tomorrow at 9");
+        assert_eq!(plan.events[0].start_time.as_deref(), Some("21:00"));
+    }
+
+    #[test]
+    fn a_single_edit_is_corrected_the_same_way() {
+        let mut plan = ParsedPlan {
+            update_events: vec![UpdateEvent {
+                target: "dentist".into(),
+                title: None,
+                day: None,
+                start_time: Some("19:00".into()),
+                end_time: None,
+                duration_minutes: None,
+                date: None,
+                span_days: None,
+                shift_minutes: None,
+            }],
+            ..Default::default()
+        };
+        fix_flipped_meridian(&mut plan, "Move the dentist to 7am");
+        assert_eq!(plan.update_events[0].start_time.as_deref(), Some("07:00"));
+    }
+
+    #[test]
+    fn noon_and_midnight_are_handled_without_an_off_by_twelve() {
+        // 12am is 00:00 and 12pm is 12:00 — the one pair where naive `+12` arithmetic goes wrong.
+        assert_eq!(find_meridian_times("lunch at 12pm"), vec![NaiveTime::from_hms_opt(12, 0, 0).unwrap()]);
+        assert_eq!(find_meridian_times("bed at 12am"), vec![NaiveTime::from_hms_opt(0, 0, 0).unwrap()]);
+    }
+
+    #[test]
+    fn meridian_scanning_reads_minutes_and_spacing_variants() {
+        assert_eq!(find_meridian_times("at 9:30am"), vec![NaiveTime::from_hms_opt(9, 30, 0).unwrap()]);
+        assert_eq!(find_meridian_times("at 9 pm"), vec![NaiveTime::from_hms_opt(21, 0, 0).unwrap()]);
+        assert_eq!(find_meridian_times("7:05 PM".to_lowercase().as_str()), vec![NaiveTime::from_hms_opt(19, 5, 0).unwrap()]);
+    }
+
+    #[test]
+    fn meridian_scanning_ignores_things_that_are_not_times() {
+        assert!(find_meridian_times("chapter 3 and room 101").is_empty());
+        assert!(find_meridian_times("25pm is not a time").is_empty(), "hour out of range");
+        assert!(find_meridian_times("").is_empty());
+        assert!(find_meridian_times("i have 4 tasks").is_empty());
+    }
+
+    #[test]
+    fn meridian_scanning_never_panics_on_multibyte_text() {
+        for s in ["caf\u{e9} at 9am", "\u{4f1a}\u{8b70} 2pm", "\u{1f600}7pm", "9", "9:", "12:3"] {
+            let _ = find_meridian_times(&s.to_lowercase());
+        }
     }
 }

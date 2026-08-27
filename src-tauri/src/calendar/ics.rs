@@ -26,27 +26,45 @@ pub fn parse_ics(text: &str) -> Vec<IcsEvent> {
     let unfolded = unfold(text);
     let mut out = Vec::new();
     let mut cur: Option<Partial> = None;
-    for line in unfolded.lines() {
-        match line.trim_end() {
-            "BEGIN:VEVENT" => cur = Some(Partial::default()),
-            "END:VEVENT" => {
+    // Depth of any sub-component nested INSIDE the current VEVENT (`VALARM`, and in principle
+    // anything else a producer nests). Properties there belong to the sub-component, not the event:
+    // a `VALARM` carries its own `SUMMARY` (the reminder's subject), and reading it flat used to
+    // silently overwrite the event's title with the alarm's — every Google/Outlook feed with
+    // reminders came in mis-titled. Skip properties while depth > 0.
+    let mut nested = 0usize;
+    for raw in unfolded.lines() {
+        let line = raw.trim_end();
+        if let Some(comp) = line.strip_prefix("BEGIN:") {
+            if comp.eq_ignore_ascii_case("VEVENT") && cur.is_none() {
+                cur = Some(Partial::default());
+            } else if cur.is_some() {
+                nested += 1;
+            }
+            continue;
+        }
+        if let Some(comp) = line.strip_prefix("END:") {
+            if nested > 0 {
+                nested -= 1;
+            } else if comp.eq_ignore_ascii_case("VEVENT") {
                 if let Some(p) = cur.take() {
                     if let Some(ev) = p.finish() {
                         out.push(ev);
                     }
                 }
             }
-            other => {
-                if let Some(p) = cur.as_mut() {
-                    if let Some((name, params, value)) = split_prop(other) {
-                        match name.as_str() {
-                            "UID" => p.uid = value,
-                            "SUMMARY" => p.title = unescape(&value),
-                            "DTSTART" => p.start = parse_dt(&params, &value),
-                            "DTEND" => p.end = parse_dt(&params, &value),
-                            _ => {}
-                        }
-                    }
+            continue;
+        }
+        if nested > 0 {
+            continue;
+        }
+        if let Some(p) = cur.as_mut() {
+            if let Some((name, params, value)) = split_prop(line) {
+                match name.as_str() {
+                    "UID" => p.uid = value,
+                    "SUMMARY" => p.title = unescape(&value),
+                    "DTSTART" => p.start = parse_dt(&params, &value),
+                    "DTEND" => p.end = parse_dt(&params, &value),
+                    _ => {}
                 }
             }
         }
@@ -66,10 +84,16 @@ impl Partial {
     fn finish(self) -> Option<IcsEvent> {
         let (start, all_day) = self.start?;
         // Missing DTEND: all-day → +1 day; timed → +1 hour (a sane default, same as the app's).
-        let end = self
-            .end
-            .map(|(e, _)| e)
-            .unwrap_or_else(|| start + if all_day { Duration::days(1) } else { Duration::hours(1) });
+        //
+        // A DTEND that is not strictly after DTSTART gets the same treatment. Feeds in the wild
+        // ship both zero-length events (`DTEND == DTSTART`) and outright reversed ones; either
+        // produces an interval that every overlap test in the scheduler (`a.start < b.end &&
+        // b.start < a.end`) silently reports as "never overlaps", so the event drew as a hairline
+        // and the scheduler happily planned straight through it.
+        let end = match self.end.map(|(e, _)| e) {
+            Some(e) if e > start => e,
+            _ => start + if all_day { Duration::days(1) } else { Duration::hours(1) },
+        };
         let title = if self.title.trim().is_empty() { "(untitled)".to_string() } else { self.title };
         Some(IcsEvent {
             uid: if self.uid.trim().is_empty() { format!("{}-{}", title, start.format(DT_FMT)) } else { self.uid },
@@ -198,6 +222,291 @@ mod tests {
     fn a_broken_event_without_dtstart_is_skipped() {
         let evs = parse_ics("BEGIN:VEVENT\nUID:no-start\nSUMMARY:Nope\nEND:VEVENT\n");
         assert!(evs.is_empty(), "an event with no DTSTART is dropped, not fatal");
+    }
+
+    /// Build an `.ics` document from its content lines, CRLF-terminated the way real feeds are.
+    /// Composing from lines keeps the fixtures readable and escape-proof — hand-written inline
+    /// literals hid a folded-line bug in the *test data* rather than in the parser.
+    fn ics(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("{l}\r\n")).collect()
+    }
+
+    #[test]
+    fn a_valarm_summary_does_not_clobber_the_event_title() {
+        // Regression: VALARM properties were read flat into the enclosing event, so any feed whose
+        // events carry reminders (i.e. most of them) imported titled after the alarm.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:v1",
+            "SUMMARY:Quarterly review",
+            "DTSTART:20260715T140000",
+            "DTEND:20260715T150000",
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            "SUMMARY:Reminder",
+            "DESCRIPTION:Ping",
+            "TRIGGER:-PT15M",
+            "END:VALARM",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.title, "Quarterly review");
+        assert_eq!(ev.start, "2026-07-15T14:00:00");
+        assert_eq!(ev.end, "2026-07-15T15:00:00");
+    }
+
+    #[test]
+    fn a_valarm_cannot_overwrite_the_events_times_either() {
+        // A VALARM carrying its own DTSTART/DTEND must not move the event — that would silently
+        // drag a meeting to the reminder's time.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:v2",
+            "SUMMARY:Real meeting",
+            "DTSTART:20260715T140000",
+            "DTEND:20260715T150000",
+            "BEGIN:VALARM",
+            "DTSTART:20260101T000000",
+            "DTEND:20260101T003000",
+            "UID:alarm-uid",
+            "END:VALARM",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.start, "2026-07-15T14:00:00");
+        assert_eq!(ev.end, "2026-07-15T15:00:00");
+        assert_eq!(ev.uid, "v2");
+    }
+
+    #[test]
+    fn nested_components_do_not_swallow_the_end_of_the_event() {
+        // Two VALARMs back to back — the depth counter has to unwind both before END:VEVENT counts,
+        // or the second event is parsed as part of the first and vanishes.
+        let evs = parse_ics(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:a",
+            "SUMMARY:First",
+            "DTSTART:20260715T090000",
+            "DTEND:20260715T100000",
+            "BEGIN:VALARM",
+            "SUMMARY:R1",
+            "END:VALARM",
+            "BEGIN:VALARM",
+            "SUMMARY:R2",
+            "END:VALARM",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:b",
+            "SUMMARY:Second",
+            "DTSTART:20260716T090000",
+            "DTEND:20260716T100000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(evs.len(), 2, "both events survive the nesting");
+        assert_eq!(evs[0].title, "First");
+        assert_eq!(evs[1].title, "Second");
+    }
+
+    #[test]
+    fn a_reversed_dtend_falls_back_to_a_sane_duration() {
+        // A backwards interval reads as "never overlaps anything" to every scheduler check
+        // (`a.start < b.end && b.start < a.end`), so the event drew as a hairline AND the
+        // auto-scheduler planned straight through it. Treat it as a missing DTEND instead.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:r",
+            "SUMMARY:Backwards",
+            "DTSTART:20260715T140000",
+            "DTEND:20260715T130000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.start, "2026-07-15T14:00:00");
+        assert_eq!(ev.end, "2026-07-15T15:00:00", "reversed end falls back to the +1h default");
+    }
+
+    #[test]
+    fn a_zero_length_event_gets_a_duration() {
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:z",
+            "SUMMARY:Instant",
+            "DTSTART:20260715T140000",
+            "DTEND:20260715T140000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.end, "2026-07-15T15:00:00");
+
+        let allday = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:z2",
+            "SUMMARY:Day",
+            "DTSTART;VALUE=DATE:20260715",
+            "DTEND;VALUE=DATE:20260715",
+            "END:VEVENT",
+        ]));
+        assert_eq!(allday.end, "2026-07-16T00:00:00", "a same-day all-day DTEND still spans the day");
+    }
+
+    #[test]
+    fn an_event_with_no_uid_gets_a_stable_synthetic_one() {
+        // The synthetic uid is what de-dups a feed across refreshes, so it must be deterministic.
+        let doc = ics(&["BEGIN:VEVENT", "SUMMARY:No id", "DTSTART:20260715T140000", "DTEND:20260715T150000", "END:VEVENT"]);
+        let a = one(&doc);
+        let b = one(&doc);
+        assert_eq!(a.uid, b.uid, "same feed, same uid — otherwise every refresh duplicates the event");
+        assert!(a.uid.contains("No id"), "uid derives from title + start: {}", a.uid);
+    }
+
+    #[test]
+    fn a_utc_timestamp_lands_on_the_local_wall_clock() {
+        // Pushin stores naive-local, so a `...Z` value must be converted, not copied.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:u",
+            "SUMMARY:UTC",
+            "DTSTART:20260715T120000Z",
+            "DTEND:20260715T130000Z",
+            "END:VEVENT",
+        ]));
+        let want = Utc
+            .from_utc_datetime(&NaiveDateTime::parse_from_str("20260715T120000", "%Y%m%dT%H%M%S").unwrap())
+            .with_timezone(&Local)
+            .naive_local();
+        assert_eq!(ev.start, want.format(DT_FMT).to_string());
+        // ...and the hour-long span survives the conversion (both ends shift together).
+        let s = NaiveDateTime::parse_from_str(&ev.start, DT_FMT).unwrap();
+        let e = NaiveDateTime::parse_from_str(&ev.end, DT_FMT).unwrap();
+        assert_eq!((e - s).num_minutes(), 60);
+    }
+
+    #[test]
+    fn property_names_and_parameters_are_matched_case_insensitively() {
+        // Producers vary the case of both.
+        let ev = one(&ics(&["BEGIN:VEVENT", "uid:c1", "summary:Lowercase", "dtstart;value=date:20260715", "END:VEVENT"]));
+        assert_eq!(ev.title, "Lowercase");
+        assert_eq!(ev.start, "2026-07-15T00:00:00");
+        assert_eq!(ev.end, "2026-07-16T00:00:00", "all-day recognised through a lowercase VALUE=DATE");
+    }
+
+    #[test]
+    fn a_tzid_parameter_is_taken_as_wall_clock_local() {
+        // Documented v1 limitation (no tz database) — pinned so changing it is a deliberate act.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:t",
+            "SUMMARY:Zoned",
+            "DTSTART;TZID=America/New_York:20260715T140000",
+            "DTEND;TZID=America/New_York:20260715T150000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.start, "2026-07-15T14:00:00");
+        assert_eq!(ev.end, "2026-07-15T15:00:00");
+    }
+
+    #[test]
+    fn garbage_input_yields_no_events_and_never_panics() {
+        let junk: Vec<String> = vec![
+            String::new(),
+            "\n\n\n".to_string(),
+            ics(&["BEGIN:VEVENT"]),                                             // never closed
+            ics(&["END:VEVENT"]),                                               // closed without opening
+            ics(&["BEGIN:VEVENT", "DTSTART:notadate", "END:VEVENT"]),           // unparseable date
+            ics(&["BEGIN:VEVENT", "DTSTART:", "END:VEVENT"]),                   // empty value
+            ics(&["BEGIN:VEVENT", "SUMMARY", "END:VEVENT"]),                    // no colon at all
+            ics(&["BEGIN:VEVENT", "DTSTART;VALUE=DATE:20261332", "END:VEVENT"]), // month 13, day 32
+            ics(&["BEGIN:VEVENT", "DTSTART:20260715T250000", "END:VEVENT"]),    // hour 25
+            " leading fold with no previous line".to_string(),
+            "\u{0}\u{1}binary junk\u{feff}".to_string(),
+        ];
+        for j in &junk {
+            assert!(parse_ics(j).is_empty(), "expected no events from {j:?}");
+        }
+    }
+
+    #[test]
+    fn one_broken_event_does_not_take_the_rest_of_the_feed_with_it() {
+        // The whole point of "malformed events are skipped, never fatal": a single bad entry in a
+        // 500-event corporate feed must not blank the calendar.
+        let evs = parse_ics(&ics(&[
+            "BEGIN:VCALENDAR",
+            "BEGIN:VEVENT",
+            "UID:ok1",
+            "SUMMARY:Good one",
+            "DTSTART:20260715T090000",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:bad",
+            "SUMMARY:No start",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:ok2",
+            "SUMMARY:Good two",
+            "DTSTART:20260716T090000",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]));
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].uid, "ok1");
+        assert_eq!(evs[1].uid, "ok2");
+    }
+
+    #[test]
+    fn non_ascii_titles_survive_folding_and_escaping() {
+        // Byte-oriented unfolding over multi-byte text is a classic panic source. This SUMMARY is
+        // folded mid-phrase and carries combining marks plus astral-plane-adjacent symbols. Note
+        // the DOUBLE space on the continuation: RFC 5545 unfolding eats the single fold
+        // whitespace, so a space that belongs to the value has to be written twice.
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:e",
+            "SUMMARY:Cafe\u{301} \u{2615} with Jo\u{308}rg",
+            "  and 15\u{20ac}",
+            "DTSTART:20260715T140000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.title, "Cafe\u{301} \u{2615} with Jo\u{308}rg and 15\u{20ac}");
+    }
+
+    #[test]
+    fn escaped_text_is_unescaped() {
+        let ev = one(&ics(&[
+            "BEGIN:VEVENT",
+            "UID:n",
+            r"SUMMARY:Line one\nLine two\, and\; more",
+            "DTSTART:20260715T140000",
+            "END:VEVENT",
+        ]));
+        assert_eq!(ev.title, "Line one\nLine two, and; more");
+    }
+
+    #[test]
+    fn a_trailing_backslash_does_not_eat_the_string() {
+        let ev = one(&ics(&["BEGIN:VEVENT", "UID:b", r"SUMMARY:Ends with a slash\", "DTSTART:20260715T140000", "END:VEVENT"]));
+        assert_eq!(ev.title, r"Ends with a slash\");
+    }
+
+    #[test]
+    fn properties_outside_a_vevent_are_ignored() {
+        // Calendar-level SUMMARY/UID must not leak into the first event.
+        let evs = parse_ics(&ics(&[
+            "BEGIN:VCALENDAR",
+            "SUMMARY:The whole calendar",
+            "UID:cal",
+            "BEGIN:VEVENT",
+            "UID:e1",
+            "SUMMARY:Real event",
+            "DTSTART:20260715T140000",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ]));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].title, "Real event");
+        assert_eq!(evs[0].uid, "e1");
+    }
+
+    #[test]
+    fn a_value_containing_a_colon_is_kept_whole() {
+        // split_prop cuts at the FIRST colon; everything after it is the value.
+        let ev = one(&ics(&["BEGIN:VEVENT", "UID:x", "SUMMARY:Standup: sprint 42", "DTSTART:20260715T140000", "END:VEVENT"]));
+        assert_eq!(ev.title, "Standup: sprint 42");
     }
 
     #[test]
