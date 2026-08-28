@@ -1,6 +1,6 @@
-# Pushin — Agent Handoff
+# Pushin: Agent Handoff
 
-A continuation brief for a fresh agent. **Read [`CLAUDE.md`](CLAUDE.md) first** — it's the canonical,
+A continuation brief for a fresh agent. **Read [`CLAUDE.md`](CLAUDE.md) first.** It's the canonical,
 hard-won knowledge handoff (architecture, gotchas, file map, test suite). This file adds: the current
 release state, the must-know workflow specifics, and the **remaining labeling-system work** (the main
 in-flight feature).
@@ -23,9 +23,9 @@ in-flight feature).
 - **Run the app:** double-click **`scripts/dev.bat`** on Windows (`npm run tauri dev` with Windows Node). Do
   **not** `npm run tauri dev` from WSL (no webkit/display).
 - **Rust tests:** `cd src-tauri && cargo.exe test --lib`. Force a rebuild with `touch src/lib.rs` first
-  — `/mnt/c` mtime skew sometimes makes cargo think nothing changed. If the app is running, the
+  `/mnt/c` mtime skew sometimes makes cargo think nothing changed. If the app is running, the
   `pushin.exe` relink can fail but **test exes still build/run**.
-- **Frontend tests:** `npm test` (Vitest), `npm run coverage`, `npm run test:e2e` (Playwright — **CI
+- **Frontend tests:** `npm test` (Vitest), `npm run coverage`, `npm run test:e2e` (Playwright, **CI
   only**; this sandbox's OS has no Playwright browser). `npx tsc --noEmit` to typecheck.
 - **Live model eval (manual gate):** `cargo test --test llm_eval -- --ignored --nocapture` with the app
   open (serves `:8080`). Baseline ~90% of checks; **judge per-category, not the total** (CLAUDE.md gotcha #1).
@@ -46,19 +46,19 @@ in-flight feature).
 task/event/habit *types*) that is **scheduling-aware**. Locked design decisions: **reach = everything**
 (tasks/events/habits/pages/projects), **actionable** (labels carry scheduling prefs the deterministic
 scheduler honors), **structure = flat labels + an optional `group_name` string** (Context/Area/Energy).
-Don't collapse the structural kinds into labels — labels are orthogonal.
+Don't collapse the structural kinds into labels; labels are orthogonal.
 
-### Built (Phases 1, 2, 4) — `git show v0.3.0`
+### Built (Phases 1, 2, 4): `git show v0.3.0`
 - **Schema** `migrations/0010_labels.sql`: `labels` (name/color/icon/group_name + `pref_window_start/end`,
   `pref_min_chunk`, `pref_max_chunk`, `pref_batch`) + polymorphic `entity_labels(label_id, entity_kind,
-  entity_id)` — mirrors `entity_links` (0009).
+  entity_id)`, mirroring `entity_links` (0009).
 - **Backend** `db.rs`: `list_labels`/`create_label`/`get_or_create_label`/`update_label`/`delete_label`/
   `merge_labels`/`set_entity_labels`/`labels_for`/`entities_for_label`, and **`resolve_task_prefs`**
   (a task's labels → a merged `scheduler::SchedulePref`). `model.rs`: `Label`/`LabelInput`. `commands.rs`
   + `lib.rs`: the 9 label commands.
 - **Actionable scheduling** `scheduler.rs`: `SchedulePref { window, min_chunk, batch }` +
   `schedule_with_prefs(...)` (the old `schedule` now delegates with empty prefs). A label window is a
-  **soft** preference — `partition_by_window` orders the free list window-first for `place`, then falls
+  **soft** preference: `partition_by_window` orders the free list window-first for `place`, then falls
   back; `min_chunk` overrides the task default. `commands::reschedule_inner` resolves prefs and calls it.
 - **Frontend:** `components/LabelPicker.tsx` (shared chip multiselect + create-on-the-fly), attached to
   `TaskListPane`, `HabitsPane`, `ProjectsPane`, `PageEditor`. `panes/LabelPane.tsx` (the cross-cutting
@@ -67,22 +67,22 @@ Don't collapse the structural kinds into labels — labels are orthogonal.
 - **Tested:** db label CRUD/join/merge/`resolve_task_prefs`; scheduler window-pref + min-chunk + soft
   fallback. The IPC contract test enforces the 9 commands.
 
-### TODO (Phases 3, 5, 6) — the actual handoff
-**Phase 3 — Calendar color-by-label + filter chips**
+### TODO (Phases 3, 5, 6): the actual handoff
+**Phase 3: Calendar color-by-label + filter chips**
 - Add a **bulk** query first: `labels_for_entities(kind, ids[]) -> map<id, Label[]>` (db + command +
   ipc) so the calendar doesn't make N `labels_for` calls.
 - `CalendarPane`/`MonthPane`: a **color-by-label** toggle (color blocks/events by their primary label
   instead of `kind`) + **filter chips** that filter the grid to a label set. Reuse the existing toolbar
   (mind the responsive collapse already there).
 
-**Phase 5 — AI auto-labeling (on-device, confirmed not silent)**
+**Phase 5: AI auto-labeling (on-device, confirmed not silent)**
 - A **deterministic keyword→label post-pass** on `parser::plan` output (gym→#health, meeting/standup→
   #work, errands→@errands). **Do not touch the extraction prompt** (small-model reliability, gotcha #1).
 - Surface as **confirm chips** in `ChatPane` (reuse the "Remember this?" memory-chip UI). On confirm,
   `setEntityLabels` on the just-created task/event.
 - Later: a tiny `chat_json` classifier over the existing label set (opt-in).
 
-**Phase 6 — System labels + polish**
+**Phase 6: System labels + polish**
 - **Read-only "system labels"** derived from the structural kinds (Fixed event / Busy / Habit / Task)
   so unified views/filters can include them without storing rows.
 - A **`#`-trigger inline label chip** in the BlockNote editor (mirror the `[[` `pageLink` spec in
@@ -105,7 +105,7 @@ Don't collapse the structural kinds into labels — labels are orthogonal.
   relay for the public booking page, and calendar drag-to-resize are all still open.
 
 ## Working style (the human)
-Wants **fast iteration + honest assessment** — when something is the model's limitation vs. a code bug,
+Wants **fast iteration + honest assessment**: when something is the model's limitation vs. a code bug,
 say which and prove it (test against the live `:8080`, don't just compile). Verify changes *work*, not
 just build. Recommend the 7B model when reliability matters. They release frequently (version tag per
 batch) and like a standalone `.exe` sent over after a release.
