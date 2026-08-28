@@ -32,7 +32,7 @@ export default function AiMemory() {
         </h2>
         <p className="mt-1 text-[11px] text-gray-500">
           Durable facts Pushin has learned about you (from the chat "Remember this?" chips). They stay on your device and
-          inform planning — they're kept out of your vault. Delete anything you'd rather it forgot.
+          inform planning. They're kept out of your vault. Delete anything you'd rather it forgot.
         </p>
       </div>
 

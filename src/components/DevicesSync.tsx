@@ -62,7 +62,7 @@ export default function DevicesSync() {
    */
   const testConnection = async () => {
     setProbing(true);
-    setMsg("Testing the connection — a step that fails has to time out first…");
+    setMsg("Testing the connection. A step that fails has to time out first…");
     try {
       setLog(asLines(await api.syncProbe(joinText.trim() || undefined)));
       setMsg("");
@@ -95,7 +95,7 @@ export default function DevicesSync() {
 
   const createInvite = async () => {
     setBusy(true);
-    setMsg("Creating an invite — finding a reachable network path…");
+    setMsg("Creating an invite, finding a reachable network path…");
     try {
       const t = await api.syncCreateInvite();
       setInvite(t);
@@ -112,7 +112,7 @@ export default function DevicesSync() {
     run(async () => {
       await api.syncJoin(joinText.trim());
       setJoinText("");
-    }, "Joining the network — reaching the other device can take up to a minute…");
+    }, "Joining the network. Reaching the other device can take up to a minute…");
 
   const copyInvite = () => {
     navigator.clipboard.writeText(invite).then(() => {
@@ -135,7 +135,7 @@ export default function DevicesSync() {
         <Laptop className="size-4 text-indigo-400" /> Devices &amp; sync
       </h2>
       <p className="text-xs text-gray-400 -mt-2">
-        Keep Pushin in sync across your devices over a private peer-to-peer network — no cloud, no
+        Keep Pushin in sync across your devices over a private peer-to-peer network, with no cloud and no
         account. Data flows device&nbsp;to&nbsp;device, end-to-end encrypted, joined by a shared key.
         Your calendar, tasks and vault pages all replicate; so do the files in your vault folder
         (attachments, PDFs, images) once you&rsquo;ve set one under Vault.
@@ -286,8 +286,8 @@ export default function DevicesSync() {
           {log.length === 0 ? (
             <p className="text-[11px] text-gray-500">
               Nothing logged yet. If pairing is failing, paste the invite above and hit{" "}
-              <span className="text-gray-400">Test connection</span> — it walks the steps and says
-              which one breaks. Otherwise hit <span className="text-gray-400">Sync now</span>, then Refresh —
+              <span className="text-gray-400">Test connection</span>. It walks the steps and says
+              which one breaks. Otherwise hit <span className="text-gray-400">Sync now</span>, then Refresh:
               each session records what moved, and names the two cases where files are skipped on
               purpose (no vault folder here, or a peer on an older build).
             </p>

@@ -202,7 +202,7 @@ export default function PageEditor({ page }: { page: Page }) {
           )}
           {status === "error" && (
             <span className="text-[11px] text-amber-400 flex items-center gap-1" role="status">
-              <AlertTriangle className="size-3" /> Couldn&apos;t save — retrying
+              <AlertTriangle className="size-3" /> Couldn&apos;t save, retrying
             </span>
           )}
         </div>

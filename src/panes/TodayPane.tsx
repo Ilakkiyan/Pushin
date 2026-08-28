@@ -28,7 +28,7 @@ function summarize(o: PlanOutcome): string {
   if (o.updatedEventTitles.length) parts.push(`updated ${[...new Set(o.updatedEventTitles)].join(", ")}`);
   if (o.removedEventTitles.length) parts.push(`removed ${o.removedEventTitles.length} event${o.removedEventTitles.length === 1 ? "" : "s"}`);
   if (o.clarifications.length && !parts.length) return o.clarifications[0];
-  if (!parts.length) return "Nothing to change — try adding a bit more detail.";
+  if (!parts.length) return "Nothing to change. Try adding a bit more detail.";
   const s = parts.join(", ") + ", and re-planned your day.";
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
@@ -93,7 +93,7 @@ export default function TodayPane() {
       setResult(summarize(o));
       setInput("");
     } catch {
-      setResult("Couldn't plan that — is the AI set up?");
+      setResult("Couldn't plan that. Is the AI set up?");
     } finally {
       setPlanning(false);
     }

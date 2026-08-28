@@ -181,7 +181,7 @@ describe("CalendarPane — placement", () => {
     render(<CalendarPane />);
 
     // The reason is rendered inline on tall blocks AND folded into the hover title.
-    expect(blockCard("Deep work").getAttribute("title")).toMatch(/Deep work — /);
+    expect(blockCard("Deep work").getAttribute("title")).toMatch(/Deep work: /);
   });
 });
 
@@ -337,7 +337,7 @@ describe("CalendarPane — habits and events", () => {
     seed({ events: [event(7, "Morning run", at(7), at(7, 30), "habit")] });
     render(<CalendarPane />);
 
-    expect(screen.getByTitle(/Morning run — drag to set your preferred time/)).toBeInTheDocument();
+    expect(screen.getByTitle(/Morning run: drag to set your preferred time/)).toBeInTheDocument();
   });
 
   it("renders an all-day event as a spanning bar, not a timed card", () => {

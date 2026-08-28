@@ -42,7 +42,7 @@ export default function PeoplePane() {
         </div>
         <div className="flex-1 overflow-y-auto">
           {people.length === 0 ? (
-            <p className="p-4 text-xs leading-relaxed text-gray-500">No people yet. They appear automatically when someone books a time with you — or add one with +.</p>
+            <p className="p-4 text-xs leading-relaxed text-gray-500">No people yet. They appear automatically when someone books a time with you, or add one with +.</p>
           ) : (
             people.map((p) => (
               <button

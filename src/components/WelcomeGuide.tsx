@@ -54,7 +54,7 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
   const steps = [
     {
       title: "A bit about you",
-      subtitle: "Helps your on-device AI understand you from the start. Pick what fits — and add anything else.",
+      subtitle: "Helps your on-device AI understand you from the start. Pick what fits, and add anything else.",
       body: <AboutYou large archetypes={form.archetypes ?? []} aboutMe={form.aboutMe ?? ""} onChange={update} />,
     },
     {
@@ -101,7 +101,7 @@ export default function WelcomeGuide({ onDone }: { onDone: () => void }) {
     },
     {
       title: "Routines & blocked time",
-      subtitle: "Recurring time to protect — lunch, the gym, the commute. Pushin won't book work here.",
+      subtitle: "Recurring time to protect: lunch, the gym, the commute. Pushin won't book work here.",
       body: <CommitmentList items={form.commitments} onChange={(commitments) => update({ commitments })} />,
     },
   ];

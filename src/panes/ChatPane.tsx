@@ -94,7 +94,7 @@ export default function ChatPane() {
         setMessages((m) => [...m, { role: "ai", text: reply || "…" }]);
         api.extractMemories(trimmed).then((facts) => facts.length && setMemSuggestions(facts)).catch(() => {});
       } catch (e) {
-        setMessages((m) => [...m, { role: "ai", text: "I couldn't respond — " + String(e) }]);
+        setMessages((m) => [...m, { role: "ai", text: "I couldn't respond. " + String(e) }]);
       } finally {
         setChatBusy(false);
       }
@@ -122,7 +122,7 @@ export default function ChatPane() {
       if (actions.length) {
         parts.push(actions.join(", ") + ", and re-planned your calendar.");
       } else if (!o.clarifications.length) {
-        parts.push("I didn't catch anything to change — try giving a bit more detail.");
+        parts.push("I didn't catch anything to change. Try giving a bit more detail.");
       }
       if (o.clarifications.length) {
         parts.push("A few things to confirm:\n" + o.clarifications.map((c) => "• " + c).join("\n"));
@@ -154,7 +154,7 @@ export default function ChatPane() {
         .then((facts) => facts.length && setMemSuggestions(facts))
         .catch(() => {});
     } catch (e) {
-      setMessages((m) => [...m, { role: "ai", text: "I couldn't plan that — " + String(e) }]);
+      setMessages((m) => [...m, { role: "ai", text: "I couldn't plan that. " + String(e) }]);
     }
   };
 
@@ -178,7 +178,7 @@ export default function ChatPane() {
             <button
               key={m}
               onClick={() => setMode(m)}
-              title={m === "auto" ? "Auto — pick Plan or Chat per message" : m === "plan" ? "Plan — calendar planner" : "Chat — second-brain assistant"}
+              title={m === "auto" ? "Auto: pick Plan or Chat per message" : m === "plan" ? "Plan: calendar planner" : "Chat: second-brain assistant"}
               className={
                 mode === m
                   ? "px-2.5 py-1 bg-white/90 text-gray-900 font-medium"
@@ -201,7 +201,7 @@ export default function ChatPane() {
             ) : mode === "plan" ? (
               <p>Describe what you’re working on in plain language and I’ll break it into tasks and schedule them.</p>
             ) : (
-              <p>Tell me what to schedule or just talk — I’ll figure out whether to plan it or chat. Use the toggle above to force one.</p>
+              <p>Tell me what to schedule or just talk, and I’ll figure out whether to plan it or chat. Use the toggle above to force one.</p>
             )}
           </div>
         )}

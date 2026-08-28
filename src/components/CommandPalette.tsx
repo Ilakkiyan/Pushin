@@ -156,7 +156,7 @@ export default function CommandPalette() {
     try {
       setPlanMsg(summarizeOutcome(await plan(text, [])));
     } catch {
-      setPlanMsg("Couldn't run that — is the AI set up? Try rephrasing.");
+      setPlanMsg("Couldn't run that. Is the AI set up? Try rephrasing.");
     } finally {
       setRunning(false);
     }

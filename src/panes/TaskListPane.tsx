@@ -60,7 +60,7 @@ function TaskRow({ task, active, now, onStart, onStop }: { task: Task; active: F
           {task.dependsOn.length > 0 && <span>· {task.dependsOn.length} dep</span>}
           {!done && task.missedCount > 0 && (
             <span
-              title={`Its planned time passed unfinished ${task.missedCount} time${task.missedCount === 1 ? "" : "s"} — each one moved it to the next free slot`}
+              title={`Its planned time passed unfinished ${task.missedCount} time${task.missedCount === 1 ? "" : "s"}. Each one moved it to the next free slot`}
               className="inline-flex shrink-0 items-center gap-1 rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300"
             >
               <RotateCcw className="size-2.5" />

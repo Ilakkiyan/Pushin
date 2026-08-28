@@ -75,7 +75,7 @@ export default function HabitsPane() {
           <h1 className="text-lg font-semibold flex items-center gap-2">
             <TrendingUp className="size-5 text-emerald-400" /> Habits
           </h1>
-          <p className="text-sm text-gray-500 mt-1">Build streaks, track consistency, and drop habits onto your calendar — all on-device.</p>
+          <p className="text-sm text-gray-500 mt-1">Build streaks, track consistency, and drop habits onto your calendar, all on-device.</p>
         </header>
 
         {/* Add habit */}
@@ -216,7 +216,7 @@ function HabitCard({ habit }: { habit: HabitStats }) {
         {/* Today toggle — circular ring is a deliberate, conventional habit-completion affordance. */}
         <button
           onClick={() => toggleHabit(habit.id)}
-          title={habit.doneToday ? "Done today — click to undo" : "Mark done for today"}
+          title={habit.doneToday ? "Done today. Click to undo" : "Mark done for today"}
           className={clsx(
             "size-9 shrink-0 rounded-full grid place-items-center border-2 transition",
             habit.doneToday ? "text-white" : "text-transparent hover:text-white/40",
@@ -268,7 +268,7 @@ function HabitCard({ habit }: { habit: HabitStats }) {
           disabled={pending}
           title={
             onCalendar
-              ? `On your calendar for ${habit.scheduledDays} day${habit.scheduledDays === 1 ? "" : "s"} — click to remove`
+              ? `On your calendar for ${habit.scheduledDays} day${habit.scheduledDays === 1 ? "" : "s"}. Click to remove`
               : "Slot this habit into a free space on each of its scheduled days"
           }
           className={clsx(

@@ -44,7 +44,7 @@ export default function SyncBar({ collapsed }: { collapsed: boolean }) {
     return (
       <div
         className="px-1 py-1.5"
-        title={pct === null ? label : `${label} — ${pct}%`}
+        title={pct === null ? label : `${label}: ${pct}%`}
         aria-label={label}
         role="progressbar"
         aria-valuenow={pct ?? undefined}

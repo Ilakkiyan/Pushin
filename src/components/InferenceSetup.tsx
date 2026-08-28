@@ -67,7 +67,7 @@ export default function InferenceSetup() {
         await saveSettings({ ...settings, modelId: id });
       }
       // Auto-start right away — no manual "Start the AI" click needed.
-      setMsg("Model ready — starting…");
+      setMsg("Model ready, starting…");
       await start();
     } catch (e) {
       setMsg(String(e));
@@ -99,7 +99,7 @@ export default function InferenceSetup() {
         Set up the on-device AI
       </div>
       <p className="text-xs text-gray-400 leading-relaxed">
-        Pushin runs a small language model <span className="text-gray-200">entirely on your machine</span> — nothing
+        Pushin runs a small language model <span className="text-gray-200">entirely on your machine</span>. Nothing
         leaves your device. Pick a model to download, then start it. Pushin fetches the inference engine for you
         automatically.
       </p>
@@ -111,7 +111,7 @@ export default function InferenceSetup() {
       {rec && (
         <div className="flex items-start gap-2 rounded-lg border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1.5 text-[11px] text-indigo-200/90">
           <Sparkles className="mt-0.5 size-3.5 shrink-0 text-indigo-300" />
-          <span>Suggested for your machine — {rec.reason}.</span>
+          <span>Suggested for your machine: {rec.reason}.</span>
         </div>
       )}
 

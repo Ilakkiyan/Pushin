@@ -39,13 +39,13 @@ export default function StaleTasks({ tasks, compact = false }: { tasks: Task[]; 
         >
           <ChevronRight className={clsx("size-3 transition-transform", open && "rotate-90")} />
           <span className="tnum">
-            Stale — {tasks.length} item{tasks.length === 1 ? "" : "s"}, {oldest}+ days late
+            Stale: {tasks.length} item{tasks.length === 1 ? "" : "s"}, {oldest}+ days late
           </span>
         </button>
         <button
           onClick={() => archiveTasks(tasks.map((t) => t.id))}
           disabled={busy}
-          title="Archive all — they leave the briefing and stop being scheduled, but stay in your task list"
+          title="Archive all. They leave the briefing and stop being scheduled, but stay in your task list"
           className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-[var(--ink-faint)] hoverable hover:text-white disabled:opacity-50"
         >
           <Archive className="size-3" /> Archive all

@@ -123,7 +123,7 @@ function LabelEditor({ initial, onSave, onDelete }: { initial: { name: string; c
         <input value={f.groupName ?? ""} onChange={(e) => setF({ ...f, groupName: e.target.value || null })} placeholder="Group (Context/Area/Energy)" className={`${inp} w-44`} />
       </div>
       <div className="space-y-2 border-t border-white/10 pt-2">
-        <div className="text-[11px] uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1"><Clock className="size-3" /> Scheduling (optional — biases the planner)</div>
+        <div className="text-[11px] uppercase tracking-[0.12em] text-[var(--ink-faint)] flex items-center gap-1"><Clock className="size-3" /> Scheduling (optional, biases the planner)</div>
         <div className="flex items-center gap-2 flex-wrap text-xs text-gray-400">
           <span>Prefer</span>
           <input type="time" value={f.prefWindowStart ?? ""} onChange={(e) => setF({ ...f, prefWindowStart: e.target.value || null })} className={inp} />

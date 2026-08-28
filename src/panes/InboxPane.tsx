@@ -54,7 +54,7 @@ export default function InboxPane() {
         </div>
 
         {inbox.length === 0 ? (
-          <p className="text-sm text-[var(--ink-muted)] py-10 text-center">Inbox zero. Capture a thought with ⌘/Ctrl+Shift+N — sort it here later.</p>
+          <p className="text-sm text-[var(--ink-muted)] py-10 text-center">Inbox zero. Capture a thought with ⌘/Ctrl+Shift+N, then sort it here later.</p>
         ) : (
           <div className="space-y-2">
             {inbox.map((item) => (

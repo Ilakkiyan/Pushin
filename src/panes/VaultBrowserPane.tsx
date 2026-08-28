@@ -149,7 +149,7 @@ export default function VaultBrowserPane() {
 
   const remove = async (page: Page) => {
     const kids = page.isFolder ? folderCount(pages, page.id) : 0;
-    const warning = kids > 0 ? `\n\nIts ${itemCount(kids)} move to the top level — nothing is deleted with it.` : "";
+    const warning = kids > 0 ? `\n\nIts ${itemCount(kids)} move to the top level. Nothing is deleted with it.` : "";
     if (!confirm(`Delete "${page.title}"?${warning}`)) return;
     await deletePage(page.id);
   };
@@ -464,7 +464,7 @@ export default function VaultBrowserPane() {
 
         {vaultUntouched && !query && (
           <p className="text-sm text-[var(--ink-muted)] pt-2">
-            Your vault is empty. Make a folder to organize things, or start a page — your daily notes
+            Your vault is empty. Make a folder to organize things, or start a page. Your daily notes
             file themselves under Journal.
           </p>
         )}

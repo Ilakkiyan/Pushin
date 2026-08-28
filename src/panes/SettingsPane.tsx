@@ -134,7 +134,7 @@ export default function SettingsPane() {
       const n = await exportAllPages(pages);
       setVaultMsg(`Mirrored ${n} note${n === 1 ? "" : "s"} to this folder.`);
     } catch {
-      setVaultMsg("Folder set — notes will export as you edit them.");
+      setVaultMsg("Folder set. Notes will export as you edit them.");
     }
     // Start watching the new folder so external edits flow back in (files → DB).
     await api.vaultRefreshWatch().catch(() => {});
@@ -303,7 +303,7 @@ export default function SettingsPane() {
     try {
       const n = await api.refreshIcsSubscriptions();
       setIcsSubs(await api.listIcsSubscriptions());
-      setIcsMsg(`Refreshed — ${n} event${n === 1 ? "" : "s"}.`);
+      setIcsMsg(`Refreshed: ${n} event${n === 1 ? "" : "s"}.`);
       await useStore.getState().load();
     } catch (e) {
       setIcsMsg(errMsg(e));
@@ -344,7 +344,7 @@ export default function SettingsPane() {
     setSyncMsg("Syncing…");
     try {
       const s = await syncGoogle();
-      setSyncMsg(`Synced — pulled ${s.pulled}, pushed ${s.pushed} event(s), mirrored ${s.blocksMirrored} task block(s).`);
+      setSyncMsg(`Synced: pulled ${s.pulled}, pushed ${s.pushed} event(s), mirrored ${s.blocksMirrored} task block(s).`);
     } catch (e) {
       setSyncMsg(String(e));
     }
@@ -357,7 +357,7 @@ export default function SettingsPane() {
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><UserRound className="size-4 text-indigo-400" /> About you</h2>
           <p className="text-[11px] text-gray-500">
-            Pick the archetypes that fit and add anything else — it's fed to the on-device AI so it understands you. Never leaves your device.
+            Pick the archetypes that fit and add anything else. It's fed to the on-device AI so it understands you. Never leaves your device.
           </p>
           <AboutYou archetypes={form.archetypes ?? []} aboutMe={form.aboutMe ?? ""} onChange={update} />
         </section>
@@ -399,7 +399,7 @@ export default function SettingsPane() {
         <section className="space-y-4">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Moon className="size-4 text-indigo-400" /> Your routine</h2>
           <p className="text-xs text-gray-500">
-            Time the scheduler keeps free and the AI plans around. Sleep, meals, gym, commute — whatever's yours.
+            Time the scheduler keeps free and the AI plans around. Sleep, meals, gym, commute, whatever's yours.
           </p>
           <SleepFields enabled={form.sleepEnabled} start={form.sleepStart} end={form.sleepEnd} onChange={update} />
           <div className="space-y-2">
@@ -417,7 +417,7 @@ export default function SettingsPane() {
               <div className="min-w-0 flex-1">
                 <p className="text-xs text-gray-200">
                   A more reliable on-device model is available. <span className="text-gray-100">{tunedName}</span> reads
-                  your plans more accurately at the same size — it's Pushin's own fine-tune.
+                  your plans more accurately at the same size: it's Pushin's own fine-tune.
                 </p>
                 <div className="mt-2 flex items-center gap-3">
                   <button
@@ -444,8 +444,8 @@ export default function SettingsPane() {
           {form.modelId !== settings.modelId && !switchingModel && (
             <p className="text-[11px] text-amber-400">
               {present[form.modelId] === false
-                ? `Not downloaded yet — Save will download it (~${Math.round((models.find((m) => m.id === form.modelId)?.sizeMb ?? 0) / 10) / 100} GB), then restart the AI on it.`
-                : "Save to load this model — the AI restarts on the new model."}
+                ? `Not downloaded yet. Save will download it (~${Math.round((models.find((m) => m.id === form.modelId)?.sizeMb ?? 0) / 10) / 100} GB), then restart the AI on it.`
+                : "Save to load this model. The AI restarts on the new model."}
             </p>
           )}
           {dlPct !== null && (
@@ -467,12 +467,12 @@ export default function SettingsPane() {
             Status: {llm?.reachable ? <span className="text-emerald-400">reachable</span> : <span className="text-amber-400">offline</span>}. Point this at a local
             llama-server or an Ollama server (<code>http://127.0.0.1:11434</code>).
           </p>
-          <Field label="Embedding model — Hermes recall">
+          <Field label="Embedding model for Hermes recall">
             <input value={form.embedModel} onChange={(e) => update({ embedModel: e.target.value })} placeholder="bge-small-en-v1.5-q8_0" className={inputCls} />
           </Field>
           <p className="text-[11px] text-gray-500">
             Powers semantic memory recall in <span className="text-gray-300">Hermes</span>. Pushin downloads a small embedding model
-            (~37 MB) and runs it on-device automatically — no setup. Leave blank to use keyword-only recall.
+            (~37 MB) and runs it on-device automatically, with no setup. Leave blank to use keyword-only recall.
           </p>
           <Field label="Unload the model when idle">
             <select
@@ -480,7 +480,7 @@ export default function SettingsPane() {
               onChange={(e) => update({ idleUnloadMinutes: Number(e.target.value) })}
               className={inputCls}
             >
-              <option value="0" className="bg-[var(--raised)]">Never — keep it loaded</option>
+              <option value="0" className="bg-[var(--raised)]">Never, keep it loaded</option>
               <option value="5" className="bg-[var(--raised)]">After 5 minutes idle</option>
               <option value="10" className="bg-[var(--raised)]">After 10 minutes idle</option>
               <option value="30" className="bg-[var(--raised)]">After 30 minutes idle</option>
@@ -496,7 +496,7 @@ export default function SettingsPane() {
         <section className="space-y-3">
           <h2 className="text-sm font-semibold flex items-center gap-2"><Calendar className="size-4 text-sky-400" /> Subscribed calendars</h2>
           <p className="text-[11px] text-gray-500">
-            Add a read-only iCalendar (<code>.ics</code>) feed by URL — a shared calendar, a team
+            Add a read-only iCalendar (<code>.ics</code>) feed by URL: a shared calendar, a team
             schedule, holidays. Its events appear on your calendar and the scheduler plans around them.
             Recurring events currently show their next occurrence.
           </p>
@@ -533,7 +533,7 @@ export default function SettingsPane() {
         <section className="space-y-3">
           <h2 className="text-sm font-semibold flex items-center gap-2"><FolderOpen className="size-4 text-amber-400" /> Vault folder</h2>
           <p className="text-[11px] text-gray-500">
-            Mirror your notes as markdown files in a folder you choose — edit them in Pushin or any editor,
+            Mirror your notes as markdown files in a folder you choose, then edit them in Pushin or any editor,
             and see them in your file manager. Leave unset to keep the vault inside Pushin only.
           </p>
           {form.vaultDir ? (
@@ -570,7 +570,7 @@ export default function SettingsPane() {
                   <li>After connecting, <span className="text-gray-300">Publish app</span> (consent screen → Production) so sync doesn't expire after 7 days.</li>
                 </ol>
                 <p className="pt-0.5">
-                  When the browser opens, you'll see <span className="text-gray-300">"Google hasn't verified this app"</span> — that's expected for your own
+                  When the browser opens, you'll see <span className="text-gray-300">"Google hasn't verified this app"</span>, which is expected for your own
                   app. Click <span className="text-gray-300">Advanced → Go to Pushin (unsafe)</span> to continue. It's safe: this is the client <em>you</em> just
                   created, and the exchange happens locally on your machine.
                 </p>
@@ -614,7 +614,7 @@ export default function SettingsPane() {
         <section className="space-y-3">
           <h2 className="text-sm font-semibold flex items-center gap-2"><BookOpen className="size-4 text-emerald-400" /> Documentation</h2>
           <p className="text-xs text-gray-500">
-            Setup guides, the full Google Calendar walkthrough, and troubleshooting live on GitHub — they open in your browser.
+            Setup guides, the full Google Calendar walkthrough, and troubleshooting live on GitHub. They open in your browser.
           </p>
           <div className="flex flex-wrap gap-2">
             <ExtLink href={DOCS.repo} className="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
@@ -634,7 +634,7 @@ export default function SettingsPane() {
           <h2 className="text-sm font-semibold flex items-center gap-2"><DownloadCloud className="size-4 text-indigo-400" /> Updates</h2>
           <p className="text-xs text-gray-500">
             Pushin checks GitHub for a newer release on launch and offers a one-click update. Installing keeps all your
-            data — tasks, notes, people, and settings live outside the app and aren't touched.
+            data: tasks, notes, people, and settings live outside the app and aren't touched.
           </p>
           <div className="flex items-center gap-2 flex-wrap">
             {appVersion && <span className="tnum text-xs px-2 py-1 bg-white/5 border border-white/10 text-gray-300">v{appVersion}</span>}

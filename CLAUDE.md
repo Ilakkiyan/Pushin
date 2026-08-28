@@ -191,6 +191,20 @@ Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `d
 - **Tested:** Rust `cargo test --lib` (**430**) + httpmock, Vitest (**271**, 30 files) + IPC/bridge contract tests, Playwright E2E (**13**), live `llm_eval` **261/276** across 108 cases — the original tier still scores 100% per category; the **hard tier** (`date-math`, `duration-words`, `pronoun-ref`, `ambiguity`, `restraint-hard`, `noisy-input`, `adversarial`, `overload`) is where the remaining gap lives and is the tuning signal. `model_battery` 57–58/58 (one adversarial case bounces), `real_world_eval` 10/12 (run them with `npm run verify:live`, which skips them when no llama-server is on :8080).
 - **Repo:** GitHub `Ilakkiyan/Pushin`; `main` default; releases are version tags.
 
+## Writing style: no em dashes
+Never use an em dash (the long one) in anything that ships or is read by a person: UI strings and
+labels, release notes, What's New cards, commit messages, `docs/`, and this file. Applies to en
+dashes used as punctuation too. Code comments follow the same rule for anything newly written.
+
+Rewrite rather than swap in a lookalike. An em dash is almost always one of these in disguise, and
+each has a better form:
+- a parenthetical: use commas, or brackets if it is genuinely an aside
+- two joined statements: use a semicolon, a colon, or a full stop
+- a trailing clarification: a colon usually reads better
+
+Do not substitute " - " (a hyphen surrounded by spaces) as a mechanical replacement. It is the same
+habit with worse typography, and it reads as a bullet in UI copy. Recast the sentence instead.
+
 ## Working style with this user
 Wants fast iteration and **honest assessment** — when something flaky is the model's limitation vs. a code
 bug, say which **and prove it** (test against the live `:8080` server, don't just compile). Verify changes

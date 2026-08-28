@@ -260,7 +260,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
   // Open (creating + linking on first use) the vault note for an event, auto-titled "Title — Mon D".
   const makeEventNote = (ev: CalEvent) => {
     const when = parseLocal(ev.start).toLocaleDateString([], { month: "short", day: "numeric" });
-    openEntityNote("event", ev.id, `${ev.title} — ${when}`);
+    openEntityNote("event", ev.id, `${ev.title}: ${when}`);
     setDetail(null);
   };
   // Ctrl/⌘+T → note for the event whose detail is open.
@@ -481,7 +481,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                         background: color + "33",
                         borderColor: color + "aa",
                       }}
-                      title={reasonText ? `${t?.title ?? "Task"} — ${reasonText}` : t?.title}
+                      title={reasonText ? `${t?.title ?? "Task"}: ${reasonText}` : t?.title}
                     >
                       <div className="flex items-center gap-1 font-medium text-gray-100 min-w-0">
                         {b.locked && (
@@ -491,7 +491,7 @@ export default function CalendarPane({ days: dayCount = 7 }: { days?: number }) 
                               e.stopPropagation();
                               unlockBlock(b.id, b.start, b.end);
                             }}
-                            title="Pinned to this time — click to unpin and let Pushin reschedule it"
+                            title="Pinned to this time. Click to unpin and let Pushin reschedule it"
                             className="shrink-0 text-gray-300 hover:text-white"
                           >
                             <Lock className="size-2.5" />
@@ -609,7 +609,7 @@ function RoutineBlock({ seg, top, height }: { seg: RoutineSeg; top: number; heig
     <div
       className="absolute left-0 right-0 z-0 pointer-events-none overflow-hidden border-y border-white/5"
       style={{ top, height, backgroundImage: `repeating-linear-gradient(45deg, ${a} 0 6px, ${b} 6px 12px)` }}
-      title={`${seg.name} — reserved`}
+      title={`${seg.name}: reserved`}
     >
       {height >= 24 && (
         <div className="px-1.5 pt-0.5 text-[10px] text-gray-400/80 flex items-center gap-1 truncate">
@@ -675,7 +675,7 @@ function EventCard({
       // Render 2px short of the true height so back-to-back blocks (especially same-colored ones) show a
       // clear gap instead of merging into one block with a doubled border line.
       style={{ top: top + dragDy, height: Math.max(height - 2, 6), ...(color ? { background: color + "26", borderColor: color + "99", color: "#f9fafb" } : {}) }}
-      title={isHabit ? `${ev.title} — drag to set your preferred time` : ev.title}
+      title={isHabit ? `${ev.title}: drag to set your preferred time` : ev.title}
     >
       <div className="flex w-full min-w-0 items-center gap-1">
         <span className="truncate flex-1">{ev.title}</span>
@@ -769,7 +769,7 @@ function EventDetailModal({ ev, onClose, onDelete, onNotes }: { ev: CalEvent; on
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             rows={3}
-            placeholder="Paste meeting notes — Pushin suggests follow-up tasks you confirm."
+            placeholder="Paste meeting notes and Pushin suggests follow-up tasks you confirm."
             className="w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-xs outline-none focus:border-indigo-500/50 resize-y"
           />
           <button
@@ -823,7 +823,7 @@ function AddEventModal({ start, onClose, onSave }: { start: Date; onClose: () =>
           <button onClick={onClose} className="text-gray-500 hover:text-white"><X className="size-4" /></button>
         </div>
         <p className="text-xs text-[var(--ink-faint)]">
-          <span className="tnum">{start.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</span> — the scheduler will plan around it.
+          <span className="tnum">{start.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}</span>, and the scheduler will plan around it.
         </p>
         <input
           autoFocus

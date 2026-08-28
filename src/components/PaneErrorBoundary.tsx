@@ -52,7 +52,7 @@ export default class PaneErrorBoundary extends Component<Props, State> {
             This view hit a problem
           </div>
           <p className="text-xs text-[var(--ink-muted)]">
-            The rest of Pushin is still running — pick another view in the sidebar, or try this one
+            The rest of Pushin is still running. Pick another view in the sidebar, or try this one
             again. Your data is safe and nothing was lost.
           </p>
           <pre className="text-[11px] text-[var(--ink-muted)] whitespace-pre-wrap break-words max-h-24 overflow-y-auto bg-black/20 p-2">

@@ -50,7 +50,7 @@ describe("SyncBar", () => {
     // No room for words on the rail, so nothing is truncated into nonsense — but the label is still
     // reachable by hover and by a screen reader.
     expect(screen.queryByText("Syncing vault files")).not.toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("title", "Syncing vault files — 50%");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("title", "Syncing vault files: 50%");
   });
 });
 

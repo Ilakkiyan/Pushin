@@ -70,7 +70,7 @@ export function CommitmentList({ items, onChange }: { items: Commitment[]; onCha
   return (
     <div className="space-y-3">
       {items.length === 0 && (
-        <p className="text-xs text-gray-500">Nothing yet — add things like lunch, gym, the school run, or “no work after 6pm.”</p>
+        <p className="text-xs text-gray-500">Nothing yet. Add things like lunch, gym, the school run, or “no work after 6pm.”</p>
       )}
       {items.map((c) => (
         <div key={c.id} className="rounded-lg border border-white/10 bg-white/[0.02] p-2.5 space-y-2">
@@ -89,7 +89,7 @@ export function CommitmentList({ items, onChange }: { items: Commitment[]; onCha
             <input type="time" value={c.start} onChange={(e) => update(c.id, { start: e.target.value })} className={inputCls} />
             <span className="text-xs text-gray-500">to</span>
             <input type="time" value={c.end} onChange={(e) => update(c.id, { end: e.target.value })} className={inputCls} />
-            <div className="ml-auto flex gap-1" title="Tap days to limit to specific weekdays — all lit means every day.">
+            <div className="ml-auto flex gap-1" title="Tap days to limit to specific weekdays. All lit means every day.">
               {DAYS.map((d) => {
                 const on = c.days.length === 0 || c.days.includes(d.n);
                 return (
@@ -104,7 +104,7 @@ export function CommitmentList({ items, onChange }: { items: Commitment[]; onCha
               })}
             </div>
           </div>
-          {c.end <= c.start && <p className="text-[11px] text-amber-400/80">Runs overnight — {c.start} until {c.end} the next day.</p>}
+          {c.end <= c.start && <p className="text-[11px] text-amber-400/80">Runs overnight, {c.start} until {c.end} the next day.</p>}
         </div>
       ))}
       <button onClick={add} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15">
@@ -116,9 +116,9 @@ export function CommitmentList({ items, onChange }: { items: Commitment[]; onCha
 
 /** Selectable user archetypes (multi-select). Keys must match `Settings::profile_prompt` in Rust. */
 export const ARCHETYPES = [
-  { key: "builder", label: "Builder / Founder", icon: Rocket, blurb: "Shipping something — protects deep-work time." },
+  { key: "builder", label: "Builder / Founder", icon: Rocket, blurb: "Shipping something, so it protects deep-work time." },
   { key: "student", label: "Student", icon: GraduationCap, blurb: "Classes, study blocks, exam deadlines." },
-  { key: "creator", label: "Creator", icon: Palette, blurb: "Content or art — project-driven, flexible." },
+  { key: "creator", label: "Creator", icon: Palette, blurb: "Content or art: project-driven and flexible." },
   { key: "operator", label: "Operator / Manager", icon: Users, blurb: "Lots of meetings, coordinating people." },
   { key: "freelancer", label: "Freelancer", icon: Briefcase, blurb: "Multiple clients, varied work." },
   { key: "parent", label: "Parent / Caregiver", icon: Heart, blurb: "Family routines and errands to weave in." },
@@ -169,7 +169,7 @@ export function AboutYou({
         value={aboutMe}
         onChange={(e) => onChange({ aboutMe: e.target.value })}
         rows={large ? 4 : 3}
-        placeholder="Anything that helps the AI understand you — your goals, what you're working on, how you like to work, what matters to you…"
+        placeholder="Anything that helps the AI understand you: your goals, what you're working on, how you like to work, what matters to you…"
         className={clsx(
           "w-full resize-y border border-white/10 bg-white/5 px-3 py-2 outline-none focus:border-white/25 placeholder:text-gray-600",
           large ? "text-base" : "text-sm",
