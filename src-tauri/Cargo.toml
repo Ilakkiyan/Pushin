@@ -1,6 +1,6 @@
 [package]
 name = "pushin"
-version = "0.8.5"
+version = "0.8.6"
 description = "Pushin — local-AI calendar (Motion-style, on-device)"
 authors = ["you"]
 edition = "2021"
@@ -48,7 +48,7 @@ anyhow = "1"
 # length-prefixed wire protocol, sync for channels, net/rt for the Iroh transport).
 tokio = { version = "1", features = ["time", "io-util", "sync", "rt", "rt-multi-thread", "macros", "net"] }
 # Iroh: pure-Rust QUIC peer-to-peer mesh (NAT hole-punching + relay fallback). The "bundled tailnet".
-iroh = "0.90"
+iroh = "1"
 # Base32 for shareable pairing tickets (NodeAddr + mesh secret), QR-friendly + case-insensitive.
 data-encoding = "2"
 # File-system watcher for the two-way markdown vault (files -> DB). Cross-platform (ReadDirectoryChangesW
@@ -59,6 +59,16 @@ notify = "6"
 # behind the `all` feature — so enable it here (feature-unifies into netwatch's socket2) or the macOS
 # build fails to compile. Windows and Linux never compile that file. Not used directly by Pushin.
 socket2 = { version = "0.5", features = ["all"] }
+
+# `wmi` (pulled in on Windows by netwatch, itself pulled in by iroh) declares BOTH `windows` and
+# `windows-core` as `>=0.59, <0.63`. That range spans two incompatible groups, and cargo satisfied
+# the two halves from different ones — `windows 0.61` (unified with Tauri) against
+# `windows-core 0.62` (unified with netwatch) — so wmi compiled 0.61's COM types against 0.62's
+# `Interface` trait and failed with "the trait bound `IWbemObjectSink: Interface` is not satisfied".
+# Naming `windows` 0.62 here puts it unambiguously in the graph so wmi resolves a MATCHED pair.
+# Not used directly by Pushin; same shape as the socket2 pin above.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = "0.62"
 
 # OS keychain (macOS/iOS Keychain / Windows Credential Manager / Linux Secret Service) for Google
 # OAuth tokens + device-sync keys. Excluded on Android (no keyring backend — secrets.rs stubs it).

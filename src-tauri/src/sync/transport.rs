@@ -3,8 +3,8 @@
 //! that touches the Iroh API — everything above it is transport-agnostic and unit-tested.
 
 use anyhow::{Context, Result};
-use iroh::endpoint::Connection;
-use iroh::{Endpoint, NodeAddr, RelayMode, SecretKey, Watcher};
+use iroh::endpoint::{presets, Connection};
+use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -22,22 +22,50 @@ pub fn secret_key(seed: [u8; 32]) -> SecretKey {
 /// Bind a QUIC endpoint. `use_relay` off = LAN/direct-only (no n0 relays see even encrypted
 /// traffic), at the cost of NAT-traversal reach.
 pub async fn bind(secret: SecretKey, use_relay: bool) -> Result<Endpoint> {
-    let relay = if use_relay { RelayMode::Default } else { RelayMode::Disabled };
-    Endpoint::builder()
-        .secret_key(secret)
-        .alpns(vec![ALPN.to_vec(), INFER_ALPN.to_vec()])
-        .relay_mode(relay)
-        .discovery_n0()
-        .bind()
-        .await
-        .context("binding the Iroh endpoint")
+    // iroh 1.x configures relays + discovery through a builder *preset* rather than separate
+    // `relay_mode`/`discovery_n0` calls. `N0` is relays-on with n0 discovery; `N0DisableRelay` is
+    // the LAN/direct-only mode the Settings toggle exposes.
+    let alpns = vec![ALPN.to_vec(), INFER_ALPN.to_vec()];
+    let ep = if use_relay {
+        Endpoint::builder(presets::N0).secret_key(secret).alpns(alpns).bind().await
+    } else {
+        Endpoint::builder(presets::N0DisableRelay).secret_key(secret).alpns(alpns).bind().await
+    };
+    ep.context("binding the Iroh endpoint")
+}
+
+/// Does this address carry a relay path? Used to decide whether an invite is usable off-LAN.
+pub fn has_relay(addr: &EndpointAddr) -> bool {
+    addr.addrs.iter().any(|a| matches!(a, TransportAddr::Relay(_)))
+}
+
+/// The relay URLs in an address, as strings — for logging and diagnostics.
+pub fn relay_urls(addr: &EndpointAddr) -> Vec<String> {
+    addr.addrs
+        .iter()
+        .filter_map(|a| match a {
+            TransportAddr::Relay(u) => Some(u.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The direct (IP) addresses in an address, as strings — for logging and diagnostics.
+pub fn direct_addrs(addr: &EndpointAddr) -> Vec<String> {
+    addr.addrs
+        .iter()
+        .filter_map(|a| match a {
+            TransportAddr::Ip(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A pairing invite: where to reach this device + the shared network key. Base32 so it copy-pastes
 /// and goes into a QR cleanly (case-insensitive, no symbols).
 #[derive(Serialize, Deserialize)]
 struct Ticket {
-    addr: NodeAddr,
+    addr: EndpointAddr,
     mesh: String,
 }
 
@@ -46,27 +74,30 @@ const RELAY_WAIT: Duration = Duration::from_secs(10);
 
 /// Mint an invite ticket: this endpoint's reachable address + the mesh secret.
 ///
-/// `node_addr()` resolves as soon as *any* address is known, and local interface addresses are
-/// discovered in milliseconds while the home-relay handshake takes seconds. Minting immediately
-/// therefore yields a ticket carrying only the LAN address — no relay URL and no public reflexive
-/// address — so the joiner has no path at all if the direct one is blocked (a Windows Firewall
-/// prompt that was dismissed is enough). When relays are on, wait briefly for one; timing out is
-/// fine, we just fall back to the direct-only ticket rather than failing the invite.
+/// `addr()` reports whatever is known *right now*, and local interface addresses appear in
+/// milliseconds while the relay handshake takes seconds. Minting immediately therefore yields a
+/// ticket carrying only the LAN address — no relay path — so the joiner has nothing to work with if
+/// the direct route is blocked (a dismissed Windows Firewall prompt suffices). When relays are on,
+/// poll briefly for one; giving up is fine, we fall back to a direct-only ticket rather than
+/// failing the invite.
 pub async fn make_ticket(ep: &Endpoint, mesh: &str, use_relay: bool) -> Result<String> {
-    if use_relay {
-        let _ = tokio::time::timeout(RELAY_WAIT, ep.home_relay().initialized()).await;
+    let mut addr = ep.addr();
+    if use_relay && !has_relay(&addr) {
+        let deadline = tokio::time::Instant::now() + RELAY_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            addr = ep.addr();
+            if has_relay(&addr) {
+                break;
+            }
+        }
     }
-    let addr = ep
-        .node_addr()
-        .initialized()
-        .await
-        .context("resolving this device's node address")?;
     let body = serde_json::to_vec(&Ticket { addr, mesh: mesh.to_string() })?;
     Ok(data_encoding::BASE32_NOPAD.encode(&body))
 }
 
 /// Decode an invite ticket back into (peer address, mesh secret).
-pub fn parse_ticket(ticket: &str) -> Result<(NodeAddr, String)> {
+pub fn parse_ticket(ticket: &str) -> Result<(EndpointAddr, String)> {
     let cleaned: String = ticket.trim().to_uppercase().chars().filter(|c| !c.is_whitespace()).collect();
     let bytes = data_encoding::BASE32_NOPAD
         .decode(cleaned.as_bytes())
@@ -78,7 +109,7 @@ pub fn parse_ticket(ticket: &str) -> Result<(NodeAddr, String)> {
 /// Dial a peer and open the sync stream. Returns the connection + its (send, recv) halves.
 pub async fn dial(
     ep: &Endpoint,
-    addr: impl Into<NodeAddr>,
+    addr: impl Into<EndpointAddr>,
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     let conn = ep.connect(addr, ALPN).await.context("dialing peer")?;
     let (send, recv) = conn.open_bi().await.context("opening sync stream")?;
@@ -88,7 +119,7 @@ pub async fn dial(
 /// Dial a peer and open an **inference** stream (borrow its model). Same node keys + mesh, different ALPN.
 pub async fn dial_infer(
     ep: &Endpoint,
-    addr: impl Into<NodeAddr>,
+    addr: impl Into<EndpointAddr>,
 ) -> Result<(Connection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
     let conn = ep.connect(addr, INFER_ALPN).await.context("dialing peer for inference")?;
     let (send, recv) = conn.open_bi().await.context("opening inference stream")?;

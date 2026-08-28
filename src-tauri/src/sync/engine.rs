@@ -14,7 +14,7 @@ use super::{identity, state, transport};
 use crate::progress;
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::endpoint::{Connection, Incoming};
-use iroh::{Endpoint, NodeAddr, NodeId};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use rusqlite::Connection as SqlConnection;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -74,7 +74,7 @@ impl SyncEngine {
         let mesh = identity::mesh_secret().context("device has not joined a sync network")?;
         let secret = transport::secret_key(identity::load_or_create_node_key());
         let endpoint = transport::bind(secret, use_relay).await?;
-        let node_id = endpoint.node_id().to_string();
+        let node_id = endpoint.id().to_string();
         {
             let conn = db.lock().map_err(|_| anyhow!("db poisoned"))?;
             state::set_node_id(&conn, &node_id)?;
@@ -130,14 +130,14 @@ impl SyncEngine {
     /// The progress bookends are unconditional: the closing `done` is emitted on the error path too,
     /// or a peer that goes unreachable mid-session would leave the sidebar bar stuck at whatever
     /// fraction it had reached, with nothing left running to ever finish it.
-    pub async fn sync_with(&self, addr: impl Into<NodeAddr>) -> Result<SessionStats> {
+    pub async fn sync_with(&self, addr: impl Into<EndpointAddr>) -> Result<SessionStats> {
         progress::emit(&self.app, progress::SyncProgress::new("device", "rows", ""));
         let out = self.sync_with_inner(addr).await;
         progress::emit(&self.app, progress::SyncProgress::finished("device", ""));
         out
     }
 
-    async fn sync_with_inner(&self, addr: impl Into<NodeAddr>) -> Result<SessionStats> {
+    async fn sync_with_inner(&self, addr: impl Into<EndpointAddr>) -> Result<SessionStats> {
         let (conn, send, recv) = transport::dial(&self.endpoint, addr).await?;
         let blob_store = VaultBlobs::new(self);
         let stats = protocol::run_session_with_blobs(self, &blob_store, true, recv, send).await?;
@@ -157,7 +157,7 @@ impl SyncEngine {
         };
         let mut ok = 0;
         for p in peers {
-            match p.node_id.parse::<NodeId>() {
+            match p.node_id.parse::<EndpointId>() {
                 Ok(id) => match self.sync_with(id).await {
                     Ok(_) => ok += 1,
                     Err(e) => log::error(format!("peer {} failed: {e:#}", p.node_id)),
@@ -221,7 +221,7 @@ impl SyncEngine {
     async fn handle_incoming(&self, incoming: Incoming) -> Result<()> {
         let conn = incoming.await.context("accepting inbound connection")?;
         // Dispatch by ALPN: the inference bridge is a separate channel from changeset sync.
-        if conn.alpn().as_deref() == Some(transport::INFER_ALPN) {
+        if conn.alpn() == transport::INFER_ALPN {
             return self.serve_inference(&conn).await;
         }
         let (send, recv) = transport::accept_stream(&conn).await?;
@@ -296,7 +296,7 @@ impl SyncEngine {
         }
         let (mesh, node, name) = (self.mesh.clone(), self.node_id.clone(), self.device_name());
         for p in peers {
-            let id = match p.node_id.parse::<NodeId>() {
+            let id = match p.node_id.parse::<EndpointId>() {
                 Ok(i) => i,
                 Err(_) => continue,
             };

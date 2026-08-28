@@ -533,8 +533,8 @@ mod tests {
         let ep_a = transport::bind(transport::secret_key([7u8; 32]), false).await.unwrap();
         let ep_b = transport::bind(transport::secret_key([9u8; 32]), false).await.unwrap();
 
-        let a = TestStore::new(&ep_a.node_id().to_string(), "shared-mesh");
-        let b = TestStore::new(&ep_b.node_id().to_string(), "shared-mesh");
+        let a = TestStore::new(&ep_a.id().to_string(), "shared-mesh");
+        let b = TestStore::new(&ep_b.id().to_string(), "shared-mesh");
         a.conn.execute("INSERT INTO tasks(title, created_at) VALUES('from A','t')", []).unwrap();
         b.conn.execute("INSERT INTO events(title, start, end, created_at) VALUES('from B','s','e','t')", []).unwrap();
 
@@ -589,16 +589,13 @@ mod tests {
 
         // No reachable relay (offline / CI without egress) is a legitimate outcome: the invite still
         // carries direct addresses. Only assert the relay landed when one actually came up.
-        let have_relay = tokio::time::timeout(Duration::from_millis(50), ep.home_relay().initialized())
-            .await
-            .is_ok();
-        if !have_relay {
+        if !transport::has_relay(&ep.addr()) {
             eprintln!("no home relay reachable — skipping the relay assertion");
             return;
         }
         assert!(
-            addr.relay_url.is_some(),
-            "an invite must carry the relay URL as a fallback path, not just the LAN address",
+            transport::has_relay(&addr),
+            "an invite must carry the relay path as a fallback, not just the LAN address",
         );
     }
 

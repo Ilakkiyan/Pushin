@@ -16,13 +16,37 @@
 use super::log;
 use super::transport::{self, ALPN};
 use anyhow::Result;
-use iroh::{Endpoint, NodeAddr, RelayMode, RelayUrl, Watcher};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use std::time::Duration;
 
 /// How long to wait for a relay to accept us before calling it unreachable.
 const RELAY_WAIT: Duration = Duration::from_secs(15);
 /// How long to wait for a dial. Longer than the relay wait — hole punching legitimately takes time.
 const DIAL_WAIT: Duration = Duration::from_secs(30);
+
+/// Wait for the endpoint to acquire a relay path, polling its own address.
+///
+/// iroh 1.x reports relays through a watcher of connection *states* rather than one future that
+/// resolves when a relay comes up, and an address gains its relay entry exactly when that relay
+/// becomes usable — so polling the address is both simpler and a truer test of "can I be reached
+/// through a relay".
+async fn wait_for_relay(ep: &Endpoint, wait: Duration) -> Vec<TransportAddr> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let relays: Vec<TransportAddr> = ep
+            .addr()
+            .addrs
+            .iter()
+            .filter(|a| matches!(a, TransportAddr::Relay(_)))
+            .cloned()
+            .collect();
+        if !relays.is_empty() || tokio::time::Instant::now() >= deadline {
+            return relays;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
 
 /// A node id abbreviated for a log line — enough to compare two devices, short enough to read.
 fn short(id: &str) -> String {
@@ -50,10 +74,10 @@ pub async fn run(ticket: Option<String>) {
     let target = match ticket.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => match transport::parse_ticket(t) {
             Ok((addr, _mesh)) => {
-                let relay = addr.relay_url().map(|r| r.to_string());
-                let directs: Vec<String> = addr.direct_addresses().map(|a| a.to_string()).collect();
-                log::info(format!("invite: peer {}", short(&addr.node_id.to_string())));
-                match &relay {
+                let relays = transport::relay_urls(&addr);
+                let directs = transport::direct_addrs(&addr);
+                log::info(format!("invite: peer {}", short(&addr.id.to_string())));
+                match relays.first() {
                     Some(r) => log::info(format!("invite: relay {r}")),
                     None => log::warn(
                         "invite: no relay in this invite — it can only work on the same network",
@@ -85,19 +109,12 @@ pub async fn run(ticket: Option<String>) {
     };
 
     // 3. Can we reach a relay? Without one, only same-network pairing can work.
-    let relay_ok = match tokio::time::timeout(RELAY_WAIT, ep.home_relay().initialized()).await {
-        Ok(Ok(r)) => {
-            log::info(format!("relay: reachable ({r})"));
-            true
-        }
-        Ok(Err(e)) => {
-            log::error(format!("relay: unreachable — {e:#}"));
-            false
-        }
-        Err(_) => {
-            log::error("relay: timed out — no relay path from this network");
-            false
-        }
+    let relay_ok = if wait_for_relay(&ep, RELAY_WAIT).await.is_empty() {
+        log::error("relay: timed out — no relay path from this network");
+        false
+    } else {
+        log::info(format!("relay: reachable ({})", transport::relay_urls(&ep.addr()).join(", ")));
+        true
     };
 
     // 4. Can a relayed connection actually CARRY traffic? Reaching a relay only proves we can talk
@@ -122,10 +139,24 @@ pub async fn run(ticket: Option<String>) {
                 log::info("peer: the network path is fine — pairing should work");
                 conn.close(0u32.into(), b"probe");
             }
-            Ok(Err(e)) => log::error(format!(
-                "peer: refused after {:?} — it answered but would not connect ({e:#})",
-                started.elapsed()
-            )),
+            // iroh reports its own dial timeout as an `Err` rather than letting our outer timeout
+            // fire, so this arm is NOT necessarily a refusal. Calling it one — "it answered" — sends
+            // you to inspect a device that never said anything. Read the error before naming it.
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                if msg.contains("timed out") || msg.contains("timeout") {
+                    log::error(format!(
+                        "peer: timed out after {:?} — nothing answered",
+                        started.elapsed()
+                    ));
+                    log::info("peer: check the other device is open, and that its invite is fresh");
+                } else {
+                    log::error(format!(
+                        "peer: reachable but refused after {:?} — {msg}",
+                        started.elapsed()
+                    ));
+                }
+            }
             Err(_) => {
                 log::error("peer: timed out — nothing answered");
                 log::info("peer: check the other device is open, and that its invite is fresh");
@@ -149,25 +180,26 @@ async fn relay_round_trip() -> Result<bool> {
         getrandom::getrandom(s).map_err(|e| anyhow::anyhow!("random seed: {e}"))?;
     }
     let mk = |seed: [u8; 32]| async move {
-        Endpoint::builder()
+        Endpoint::builder(presets::N0)
             .secret_key(transport::secret_key(seed))
             .alpns(vec![ALPN.to_vec()])
-            .relay_mode(RelayMode::Default)
             .bind()
             .await
     };
     let a = mk(seeds[0]).await?;
     let b = mk(seeds[1]).await?;
-    let relay: RelayUrl = match tokio::time::timeout(RELAY_WAIT, a.home_relay().initialized()).await
-    {
-        Ok(Ok(r)) => r,
-        _ => {
-            a.close().await;
-            b.close().await;
-            anyhow::bail!("the test endpoint could not register with a relay");
-        }
-    };
-    let addr = NodeAddr::new(a.node_id()).with_relay_url(relay);
+
+    // Both sides need a relay path before either can be reached through one.
+    let a_relays = wait_for_relay(&a, RELAY_WAIT).await;
+    let _ = wait_for_relay(&b, RELAY_WAIT).await;
+    if a_relays.is_empty() {
+        a.close().await;
+        b.close().await;
+        anyhow::bail!("the test endpoint never acquired a relay");
+    }
+
+    // Relay addresses ONLY — dropping every direct address is what forces the relay to carry it.
+    let addr = EndpointAddr { id: a.id(), addrs: a_relays.into_iter().collect() };
     let accept = tokio::spawn(async move {
         if let Some(incoming) = a.accept().await {
             let _ = incoming.await;
