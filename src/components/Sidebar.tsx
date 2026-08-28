@@ -14,6 +14,7 @@ import {
   PanelLeftOpen,
   Sun,
   Library,
+  FolderOpen,
   ArrowLeft,
   ChevronRight,
 } from "lucide-react";
@@ -98,6 +99,8 @@ export default function Sidebar() {
   const view = useStore((s) => s.view);
   const space = useStore((s) => s.space);
   const setView = useStore((s) => s.setView);
+  const openFolder = useStore((s) => s.openFolder);
+  const vaultFolderId = useStore((s) => s.vaultFolderId);
   const exitVault = useStore((s) => s.exitVault);
   const openDaily = useStore((s) => s.openDaily);
   const inboxCount = useStore((s) => s.inbox.length);
@@ -164,7 +167,7 @@ export default function Sidebar() {
             <div className="my-2 mx-1 border-t border-white/10" />
             {/* Enter the vault space — the trailing chevron signals it opens a place, not a page. */}
             <button
-              onClick={() => setView("vault")}
+              onClick={() => openFolder(null)}
               title={collapsed ? "Vault" : undefined}
               className={clsx(
                 "w-full flex items-center gap-2.5 text-sm hoverable text-[var(--ink-muted)] hover:text-white",
@@ -197,6 +200,16 @@ export default function Sidebar() {
             </button>
 
             {!collapsed && <SectionLabel>Vault</SectionLabel>}
+            {/* Files = the Drive-style browser (folders + documents); Notes = the editor for whatever
+                page is open. Two destinations because they answer different questions: "where is it?"
+                and "what was I writing?". */}
+            <NavItem
+              active={view === "files"}
+              collapsed={collapsed}
+              onClick={() => openFolder(vaultFolderId)}
+              icon={<FolderOpen className="size-4" />}
+              label="Files"
+            />
             <NavItem active={view === "vault"} collapsed={collapsed} onClick={go("vault")} icon={<Notebook className="size-4" />} label="Notes" />
             <NavItem
               active={false}

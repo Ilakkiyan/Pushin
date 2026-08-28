@@ -8,7 +8,7 @@ type View = ReturnType<typeof useStore.getState>["view"];
 const NAV: Record<string, View> = {
   t: "today", // the your-day landing (home)
   c: "calendar",
-  v: "vault",
+  v: "files", // the vault, entered at its file browser
   p: "projects",
   h: "habits",
   i: "inbox",
