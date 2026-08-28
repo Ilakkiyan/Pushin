@@ -21,7 +21,7 @@ browser with real folders, and device sync learns to carry the vault's *files* a
   price is subtractive and easy to get wrong: a folder rides along in *everything* that reads pages,
   so it has to be explicitly excluded from `search_pages`, `title_index` (or `[[Work]]` resolves to a
   folder named Work instead of the page), `page_graph`, and `entities_for_index`. See CLAUDE.md
-  gotcha 20 — seven SELECTs feed `row_to_page` and two are table-aliased, which is how a version that
+  gotcha 21 — seven SELECTs feed `row_to_page` and two are table-aliased, which is how a version that
   compiled cleanly failed at runtime with `Invalid column name: is_folder`.
 - **`create_folder` / `rename_page` are their own commands.** `update_page` rewrites the body and
   re-embeds it, so renaming through it would blank a folder and force a full document round-trip on
@@ -53,9 +53,17 @@ browser with real folders, and device sync learns to carry the vault's *files* a
   directions, deletes propagating, old-peer and no-vault-folder fallbacks).
 
 **Verification**
-`npm run verify` — Rust **466**, Vitest **308**, tsc + production build clean, Playwright **14**.
+`npm run verify` — Rust **471**, Vitest **371**, tsc + production build clean, Playwright **17**.
 Up from 430 / 271 / 13 in v0.8.3. The browser was also driven by hand through the real app (mocked
 IPC) and screenshotted in both grid and list layouts before release.
+
+The vault's own coverage was then taken from "proves it works" to "proves it cannot break": the
+seven `row_to_page` queries walked in one test (gotcha 21's failure mode), folder exclusion from the
+recall index, the pre-0024 upgrade path, and on the frontend the whole interaction surface — drag
+refusals, delete confirmation wording, rename abandonment, and the switcher dropping a page deleted
+from under it. Two facts turned out to be different from what the implementation commit claimed and
+are pinned as comments rather than quietly corrected: `list_pages` does not filter inbox captures
+(the frontend does), and `search_pages` matches bodies as well as titles.
 
 ---
 
