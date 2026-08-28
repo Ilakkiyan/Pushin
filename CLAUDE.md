@@ -146,6 +146,16 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
     advertise it, so an un-updated peer skips files instead of desynchronising the choreography and
     breaking sync outright.
 
+21. **A vault folder is a page row, so every page query has to opt it back out.** `0024` adds
+    `is_folder` to `notes` rather than a folders table — the tree, `move_page`, sort order and device
+    sync then apply unchanged. The cost is that a folder rides along in *everything* that reads
+    pages: it must be excluded from `search_pages` (an empty container as a search hit), `title_index`
+    (`[[Work]]` resolving to a folder named Work instead of the page), `page_graph` (a degree-0 dot per
+    container) and `entities_for_index`. There are **seven** SELECTs feeding `row_to_page`, and two of
+    them are table-aliased (`n.`) — adding a column to five of them compiles fine and fails at runtime
+    with `Invalid column name`. Grep `row_to_page(r, ` for the full set. Rename is its own
+    `rename_page`, not `update_page`, which rewrites body + embedding.
+
 ---
 
 ## Build / run / test
@@ -174,7 +184,7 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 ## Current status (released **v0.8.3**; `release.yml` builds installers for all platforms)
 Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `docs/notes/DEVLOG.md`. Headline:
 - **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, **missed-task rollover** (a task whose day passed unfinished is kicked to the next free slot; pinned blocks included), tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
-- **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified).
+- **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified), **Drive-style file browser + folders** (0024: `is_folder` pages, virtual Journal folder, sidebar "Open" switcher).
 - **Context Engine + execution loop:** `entity_index` recall spine feeding planner auto-recall + `vault_ask`; People/CRM; keyword auto-labeling; Daily Briefing + Cmd-K "Run" bar; Focus timer + adaptive scheduler; Meeting Companion; hardened public booking page.
 - **Device sync (pairing proven on loopback, cross-machine still unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. `two_real_iroh_endpoints_pair_and_converge` runs a real ticket→dial→session between two endpoints in one process; only NAT traversal is untested. Iroh pinned **0.90**.
 - **Shell polish:** frameless `TitleBar`, opening animation, in-app auto-update (v0.5.0+, signed).
