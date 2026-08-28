@@ -469,6 +469,13 @@ fn apply_upsert(conn: &Connection, ch: &Change, force: bool) -> Result<Option<bo
             if col == id_col {
                 let kind = ch.fields.get(kind_col).and_then(|v| v.as_str());
                 let ref_table = kind.and_then(schema::kind_to_table);
+                // A polymorphic id is the whole point of the row, so it is never legitimately
+                // null — unlike a nullable FK, where null means "no reference". A null here means
+                // the SENDER could not resolve it (a dangling link whose target was deleted), and
+                // the row means nothing on this device either.
+                if jval.is_null() {
+                    return Ok(Some(false));
+                }
                 match ref_table {
                     Some(t) => match resolve_ref(conn, t, jval)? {
                         RefRes::Ok(v) => { cols.push(col.clone()); vals.push(v); }
@@ -483,6 +490,20 @@ fn apply_upsert(conn: &Connection, ch: &Change, force: bool) -> Result<Option<bo
         }
         cols.push(col.clone());
         vals.push(json_to_value(jval));
+    }
+
+    // Never hand SQLite a NULL for a NOT NULL column. The constraint failure it raises aborts the
+    // whole transaction, so ONE malformed row would reject the entire batch and stop every other
+    // change landing — the same way a single unsynced `ics_sub_id` once broke all sync (9ae15ce).
+    // Skipping the row keeps that blast radius at one row.
+    if let Some(bad) = cols
+        .iter()
+        .zip(vals.iter())
+        .find(|(c, v)| matches!(v, Value::Null) && notnull.contains(*c))
+        .map(|(c, _)| c.clone())
+    {
+        eprintln!("sync: skipping {table} row {} — null in NOT NULL column {bad}", ch.uuid);
+        return Ok(Some(false));
     }
 
     // Append sync bookkeeping columns.
@@ -911,6 +932,57 @@ mod tests {
         let changes = build_outbox(from, from_node, from_clock, now).unwrap();
         apply_changes(to, to_clock, now, &changes).unwrap();
         changes
+    }
+
+
+    /// A dangling polymorphic link must cost you that ONE row, not the whole sync.
+    ///
+    /// `entity_labels.entity_id` has no foreign key (it is polymorphic), so deleting the task it
+    /// points at leaves the link behind. The sender then cannot translate that id to a uuid and puts
+    /// a null on the wire; the receiver wrote the null straight into a NOT NULL column, SQLite
+    /// aborted the transaction, and **every other change in the batch was rejected with it** —
+    /// reported to the user as "NOT NULL constraint failed: entity_labels.entity_id". Sync stayed
+    /// broken for as long as the dangling row existed, which is forever.
+    #[test]
+    fn a_dangling_polymorphic_link_does_not_reject_the_whole_batch() {
+        let a = db::test_conn();
+        let b = db::test_conn();
+        let (mut ca, mut cb) = (HlcState::default(), HlcState::default());
+
+        // A label attached to a task, plus unrelated content that must survive regardless.
+        let tid = insert_task(&a, "Doomed", None);
+        a.execute("INSERT INTO labels(name, color, created_at) VALUES('deep', '#000', 't')", []).unwrap();
+        let lid = a.last_insert_rowid();
+        a.execute(
+            "INSERT INTO entity_labels(label_id, entity_kind, entity_id) VALUES(?1, 'task', ?2)",
+            params![lid, tid],
+        ).unwrap();
+        insert_note(&a, "Survivor note", None);
+        a.execute("INSERT INTO events(title, start, end, created_at) VALUES('Survivor event','s','e','t')", []).unwrap();
+
+        // Delete the task the link points at. Nothing cascades: the link is now dangling.
+        a.execute("DELETE FROM tasks WHERE id = ?1", params![tid]).unwrap();
+        let orphans: i64 = a
+            .query_row("SELECT count(*) FROM entity_labels WHERE entity_id = ?1", params![tid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 1, "precondition: the link outlived its target");
+
+        // This used to return Err and land nothing at all.
+        let changes = build_outbox(&a, "A", &mut ca, 1000).unwrap();
+        apply_changes(&b, &mut cb, 1000, &changes).expect("one bad row must not reject the batch");
+
+        let notes: i64 = b
+            .query_row("SELECT count(*) FROM notes WHERE content = 'Survivor note'", [], |r| r.get(0))
+            .unwrap();
+        let events: i64 = b
+            .query_row("SELECT count(*) FROM events WHERE title = 'Survivor event'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(notes, 1, "unrelated content must still land");
+        assert_eq!(events, 1, "unrelated content must still land");
+
+        // And the meaningless link itself is simply not there.
+        let labels_on_b: i64 = b.query_row("SELECT count(*) FROM entity_labels", [], |r| r.get(0)).unwrap();
+        assert_eq!(labels_on_b, 0, "a link to a row that does not exist must not be invented");
     }
 
     #[test]
