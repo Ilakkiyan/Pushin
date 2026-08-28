@@ -1406,6 +1406,29 @@ pub async fn create_page(state: State<'_, AppState>, title: String, parent_id: O
     db::get_page(&conn, id).map_err(err)
 }
 
+/// Create a folder in the vault tree and return it. A folder is a page row with `is_folder` set and
+/// no body, so it moves/renames/deletes through the same plumbing as a page.
+#[tauri::command]
+pub fn create_folder(state: State<AppState>, name: String, parent_id: Option<i64>) -> Result<Page, String> {
+    let name = name.trim();
+    let conn = state.db();
+    let id = db::insert_folder(&conn, if name.is_empty() { "New folder" } else { name }, parent_id).map_err(err)?;
+    db::get_page(&conn, id).map_err(err)
+}
+
+/// Rename a page or folder (title only — the body and its embedding are untouched). Returns the
+/// refreshed tree so the browser and the sidebar re-render from one round trip.
+#[tauri::command]
+pub fn rename_page(state: State<AppState>, id: i64, title: String) -> Result<Vec<Page>, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("A name is required.".into());
+    }
+    let conn = state.db();
+    db::rename_page(&conn, id, title).map_err(err)?;
+    db::list_pages(&conn).map_err(err)
+}
+
 /// Save a page's title/icon/body + outgoing wikilinks, re-embedding the body for semantic recall.
 /// `content` is the rendered plaintext (recall + keyword index); `content_json` is the BlockNote
 /// block array; `link_titles` are the titles this page links to (resolved to edges in `set_page_links`).

@@ -29,6 +29,7 @@ const MIGRATION_0020: &str = include_str!("../migrations/0020_google_link.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_task_missed.sql");
 const MIGRATION_0022: &str = include_str!("../migrations/0022_ics_sync.sql");
 const MIGRATION_0023: &str = include_str!("../migrations/0023_vault_file_sync.sql");
+const MIGRATION_0024: &str = include_str!("../migrations/0024_page_folders.sql");
 
 /// 0022's uuid backfill for `ics_subscriptions`, shared with its test so the two can't drift.
 ///
@@ -184,6 +185,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::sync::schema::table_sync_sql(spec))?;
         conn.execute(VAULT_FILE_UUID_BACKFILL, [])?;
         conn.pragma_update(None, "user_version", 23)?;
+    }
+    if version < 24 {
+        // notes.is_folder — vault folders (a page that holds pages). A plain column on an
+        // already-synced table, so 0015's triggers carry it to paired devices as-is.
+        conn.execute_batch(MIGRATION_0024)?;
+        conn.pragma_update(None, "user_version", 24)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -1410,9 +1417,10 @@ pub fn entities_for_index(conn: &Connection) -> Result<Vec<ContextItem>> {
     for e in list_events(conn)? {
         push(EntityKind::Event, e.id, crate::context::event_text(&e));
     }
-    // Pages live in `notes`; `list_pages` strips bodies, so read title+content directly.
+    // Pages live in `notes`; `list_pages` strips bodies, so read title+content directly. Folders are
+    // empty containers — nothing to recall — so they stay out of the index.
     let pages: Vec<(i64, Option<String>, String)> = {
-        let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0")?;
+        let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0 AND is_folder = 0")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i64>("id")?, r.get::<_, Option<String>>("title")?, r.get::<_, String>("content")?))
         })?;
@@ -1658,6 +1666,7 @@ fn row_to_page(r: &Row, indexed: bool, with_body: bool) -> rusqlite::Result<Page
         archived: r.get::<_, i64>("archived")? != 0,
         daily_date: r.get("daily_date")?,
         inbox: r.get::<_, i64>("inbox")? != 0,
+        is_folder: r.get::<_, i64>("is_folder")? != 0,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         indexed,
@@ -1668,7 +1677,7 @@ fn row_to_page(r: &Row, indexed: bool, with_body: bool) -> rusqlite::Result<Page
 /// All non-archived pages (lightweight: no bodies), ordered for the sidebar tree.
 pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE archived = 0 AND (origin IS NULL OR origin != 'memory') ORDER BY sort_order, created_at",
     )?;
@@ -1682,7 +1691,7 @@ pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
 /// A single page with its full body.
 pub fn get_page(conn: &Connection, id: i64) -> Result<Page> {
     let page = conn.query_row(
-        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox,
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE id = ?1",
         params![id],
@@ -1716,6 +1725,34 @@ pub fn insert_page(
         params![content, title, parent_id, content_json, next_order, embedding, model, now],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Create a FOLDER — a page row flagged `is_folder`, with no body and no embedding. Placed after
+/// existing siblings under the same parent, exactly like a page.
+pub fn insert_folder(conn: &Connection, name: &str, parent_id: Option<i64>) -> Result<i64> {
+    let now = now_iso();
+    let next_order: f64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM notes WHERE parent_id IS ?1",
+        params![parent_id],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO notes(content, title, parent_id, sort_order, is_folder, created_at, updated_at)
+         VALUES('', ?1, ?2, ?3, 1, ?4, ?4)",
+        params![name, parent_id, next_order, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Rename a page or folder — title only. Deliberately NOT `update_page`: that one rewrites the body
+/// and the embedding, so using it to rename would blank a folder's (absent) content and, on a page,
+/// require the caller to round-trip the whole document just to change its name.
+pub fn rename_page(conn: &Connection, id: i64, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET title = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, title, now_iso()],
+    )?;
+    Ok(())
 }
 
 /// Update a page's title/icon/body. The embedding is rewritten only when a fresh one is supplied
@@ -1757,7 +1794,9 @@ pub fn move_page(conn: &Connection, id: i64, parent_id: Option<i64>, sort_order:
 /// A (title → id) map over all pages, used to resolve wikilink targets by title (titles may be
 /// derived, so resolution happens in Rust rather than SQL). Lowercased keys for case-insensitivity.
 fn title_index(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
-    let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0")?;
+    // Folders are containers, not link targets — a `[[Projects]]` wikilink must resolve to the PAGE
+    // named Projects, never to a folder that happens to share its name.
+    let mut stmt = conn.prepare("SELECT id, title, content FROM notes WHERE archived = 0 AND is_folder = 0")?;
     let rows = stmt.query_map([], |r| {
         let id: i64 = r.get("id")?;
         let title: Option<String> = r.get("title")?;
@@ -1798,7 +1837,7 @@ pub fn page_backlinks(conn: &Connection, target_id: i64) -> Result<Vec<Page>> {
     let this_title = this.title.to_lowercase();
     let mut stmt = conn.prepare(
         "SELECT DISTINCT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived,
-                n.daily_date, n.inbox, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+                n.daily_date, n.inbox, n.is_folder, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
          FROM page_links l JOIN notes n ON n.id = l.source_id
          WHERE n.archived = 0 AND (l.target_id = ?1 OR (l.target_id IS NULL AND lower(l.target_title) = ?2))
          ORDER BY n.updated_at DESC, n.id DESC",
@@ -1820,7 +1859,7 @@ pub fn unlinked_mentions(conn: &Connection, page_id: i64) -> Result<Vec<Page>> {
         return Ok(vec![]); // too-short titles ("a") would match everything
     }
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes
          WHERE archived = 0 AND id != ?1 AND instr(lower(content), ?2) > 0
@@ -1841,9 +1880,9 @@ pub fn unlinked_mentions(conn: &Connection, page_id: i64) -> Result<Vec<Page>> {
 pub fn search_pages(conn: &Connection, query: &str) -> Result<Vec<Page>> {
     let like = format!("%{}%", query.trim());
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
-         FROM notes WHERE archived = 0 AND (title LIKE ?1 OR content LIKE ?1)
+         FROM notes WHERE archived = 0 AND is_folder = 0 AND (title LIKE ?1 OR content LIKE ?1)
          ORDER BY updated_at DESC, id DESC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![like], |r| {
@@ -1891,7 +1930,7 @@ pub fn capture(conn: &Connection, content: &str, embedding: Option<&[u8]>, model
 /// The unsorted Inbox, newest first.
 pub fn list_inbox(conn: &Connection) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox,
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE inbox = 1 ORDER BY created_at DESC, id DESC",
     )?;
@@ -1939,7 +1978,7 @@ pub fn page_entities(conn: &Connection, page_id: i64) -> Result<Vec<EntityRef>> 
 pub fn entity_pages(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
         "SELECT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived, n.daily_date,
-                n.inbox, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+                n.inbox, n.is_folder, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
          FROM entity_links l JOIN notes n ON n.id = l.page_id
          WHERE n.archived = 0 AND l.entity_kind = ?1 AND l.entity_id = ?2
          ORDER BY n.updated_at DESC, n.id DESC",
@@ -2211,7 +2250,9 @@ pub fn resolve_task_prefs(conn: &Connection, task_ids: &[i64]) -> Result<std::co
 /// Ghost links (target_id NULL) are resolved by title here so the graph reflects current pages.
 pub fn page_graph(conn: &Connection) -> Result<PageGraph> {
     let index = title_index(conn)?;
-    let pages = list_pages(conn)?;
+    // Folders hold pages, they don't link to them — including them would scatter degree-0 dots
+    // through the graph, one per container.
+    let pages: Vec<Page> = list_pages(conn)?.into_iter().filter(|p| !p.is_folder).collect();
     let valid: std::collections::HashSet<i64> = pages.iter().map(|p| p.id).collect();
 
     // Collect distinct, resolved, self-loop-free directed edges.
@@ -2316,6 +2357,71 @@ mod tests {
 
     fn mem() -> Connection {
         super::test_conn()
+    }
+
+    /// A folder is a page row, so it must travel the same tree — but it must NOT behave like a
+    /// document anywhere a document's content matters. Both halves in one test because getting the
+    /// first right while quietly getting the second wrong is exactly how an empty container ends up
+    /// as a search hit and a stranded dot in the graph.
+    #[test]
+    fn a_folder_holds_pages_but_never_acts_like_one() {
+        let conn = mem();
+        let folder = insert_folder(&conn, "Work", None).unwrap();
+        let child = insert_page(&conn, "Kickoff", Some(folder), "kickoff notes for work", None, None, None).unwrap();
+        let loose = insert_page(&conn, "Work log", None, "unrelated work notes", None, None, None).unwrap();
+
+        // It's in the tree, flagged, and holds its child.
+        let pages = list_pages(&conn).unwrap();
+        let f = pages.iter().find(|p| p.id == folder).unwrap();
+        assert!(f.is_folder, "the folder reads back as a folder");
+        assert_eq!(f.title, "Work");
+        assert!(!pages.iter().find(|p| p.id == child).unwrap().is_folder);
+        assert_eq!(pages.iter().find(|p| p.id == child).unwrap().parent_id, Some(folder));
+
+        // ...but it is not a document: "Work" matches the folder's title exactly, and search must
+        // still only return the two real pages.
+        let hits = search_pages(&conn, "work").unwrap();
+        let hit_ids: Vec<i64> = hits.iter().map(|p| p.id).collect();
+        assert!(hit_ids.contains(&child) && hit_ids.contains(&loose), "pages are found");
+        assert!(!hit_ids.contains(&folder), "a folder is never a search result");
+
+        // ...and it is not a link target or a graph node.
+        set_page_links(&conn, loose, &["Work".to_string()]).unwrap();
+        let resolved: Option<i64> = conn
+            .query_row("SELECT target_id FROM page_links WHERE source_id = ?1", params![loose], |r| r.get(0))
+            .unwrap();
+        assert_eq!(resolved, None, "[[Work]] does not resolve to the folder named Work");
+        let graph = page_graph(&conn).unwrap();
+        assert!(!graph.nodes.iter().any(|n| n.id == folder), "folders stay out of the graph");
+        assert!(graph.nodes.iter().any(|n| n.id == child), "pages are still in it");
+    }
+
+    /// Deleting a folder must never take its contents with it — the schema reparents them to the
+    /// top level, which is what the UI promises in its confirm dialog.
+    #[test]
+    fn deleting_a_folder_frees_its_children_instead_of_destroying_them() {
+        let conn = mem();
+        let folder = insert_folder(&conn, "Work", None).unwrap();
+        let child = insert_page(&conn, "Kickoff", Some(folder), "notes", None, None, None).unwrap();
+
+        delete_note(&conn, folder).unwrap();
+
+        let pages = list_pages(&conn).unwrap();
+        let kid = pages.iter().find(|p| p.id == child).expect("the child page survives its folder");
+        assert_eq!(kid.parent_id, None, "it comes back to the top level rather than vanishing");
+    }
+
+    /// Renaming must not touch the body. `update_page` would have blanked it — which is why rename
+    /// is its own function rather than a call into the full page save.
+    #[test]
+    fn renaming_a_page_leaves_its_body_alone() {
+        let conn = mem();
+        let id = insert_page(&conn, "Draft", None, "the body worth keeping", Some("[]"), None, None).unwrap();
+        rename_page(&conn, id, "Final").unwrap();
+        let page = get_page(&conn, id).unwrap();
+        assert_eq!(page.title, "Final");
+        assert_eq!(page.content, "the body worth keeping");
+        assert_eq!(page.content_json.as_deref(), Some("[]"));
     }
 
     #[test]
