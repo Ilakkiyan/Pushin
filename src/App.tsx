@@ -14,6 +14,7 @@ import MonthPane from "./panes/MonthPane";
 import ProjectsPane from "./panes/ProjectsPane";
 import HabitsPane from "./panes/HabitsPane";
 import VaultPane from "./panes/VaultPane";
+import VaultBrowserPane from "./panes/VaultBrowserPane";
 import GraphPane from "./panes/GraphPane";
 import InboxPane from "./panes/InboxPane";
 import LabelPane from "./panes/LabelPane";
@@ -338,6 +339,7 @@ export default function App() {
               )}
               {view === "projects" && <ProjectsPane />}
               {view === "habits" && <HabitsPane />}
+              {view === "files" && <VaultBrowserPane />}
               {view === "vault" && <VaultPane />}
               {view === "graph" && <GraphPane />}
               {view === "inbox" && <InboxPane />}
