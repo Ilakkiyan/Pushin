@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Search, FileText, Plus, CalendarDays, FolderKanban, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, Zap, ArrowLeft, Loader2, Sun } from "lucide-react";
+import { Search, FileText, Plus, CalendarDays, FolderKanban, FolderOpen, Flame, CalendarClock, Network, Settings as SettingsIcon, Sparkles, Zap, ArrowLeft, Loader2, Sun } from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type Page, type PlanOutcome, type VaultAnswer } from "../lib/ipc";
@@ -110,6 +110,7 @@ export default function CommandPalette() {
     { key: "v:projects", label: "Projects", icon: <FolderKanban className="size-4" />, run: () => setView("projects") },
     { key: "v:habits", label: "Habits", icon: <Flame className="size-4" />, run: () => setView("habits") },
     { key: "v:booking", label: "Booking", icon: <CalendarClock className="size-4" />, run: () => setView("booking") },
+    { key: "v:files", label: "Vault files", icon: <FolderOpen className="size-4" />, run: () => setView("files") },
     { key: "v:graph", label: "Graph", icon: <Network className="size-4" />, run: () => setView("graph") },
     { key: "v:settings", label: "Settings", icon: <SettingsIcon className="size-4" />, run: () => setView("settings") },
   ].filter((v) => !q || v.label.toLowerCase().includes(q));

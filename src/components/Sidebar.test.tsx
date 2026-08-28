@@ -34,7 +34,7 @@ describe("Sidebar", () => {
   it("entering the Vault space reveals the second-brain destinations", async () => {
     render(<Sidebar />);
     await userEvent.click(screen.getByText("Vault"));
-    for (const label of ["Back to app", "Notes", "Today's note", "Inbox", "Graph"]) {
+    for (const label of ["Back to app", "Files", "Notes", "Today's note", "Inbox", "Graph"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
   });
@@ -48,9 +48,12 @@ describe("Sidebar", () => {
     render(<Sidebar />);
     await userEvent.click(screen.getByText("Projects"));
     expect(useStore.getState().view).toBe("projects");
+    // The Vault button opens the vault at its FILE BROWSER, rooted — not at whichever document
+    // happened to be open last. That's the whole point of it being a "place" you step into.
     await userEvent.click(screen.getByText("Vault"));
-    expect(useStore.getState().view).toBe("vault");
+    expect(useStore.getState().view).toBe("files");
     expect(useStore.getState().space).toBe("vault");
+    expect(useStore.getState().vaultFolderId).toBe(null);
     await userEvent.click(screen.getByText("Graph"));
     expect(useStore.getState().view).toBe("graph");
     // Back returns to the planner, at the view we left.

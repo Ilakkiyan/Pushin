@@ -237,6 +237,16 @@ export async function installMockBridge(page: Page) {
         state.pages.push(p);
         return p;
       },
+      create_folder: ({ name, parentId }: any) => {
+        const f = { id: state.nextId++, title: name || "New folder", parentId: parentId ?? undefined, content: "", sortOrder: 0, archived: false, inbox: false, isFolder: true, indexed: false, createdAt: "", updatedAt: "" };
+        state.pages.push(f);
+        return f;
+      },
+      rename_page: ({ id, title }: any) => {
+        const p = state.pages.find((x: any) => x.id === id);
+        if (p) p.title = title;
+        return state.pages.filter((x: any) => !x.inbox).map(lite);
+      },
       update_page: ({ id, title, content, contentJson }: any) => {
         const p = state.pages.find((x: any) => x.id === id);
         if (p) Object.assign(p, { title, content, contentJson });

@@ -32,11 +32,13 @@ test("boots and navigates the sidebar across views", async ({ page }) => {
     await nav(page).getByRole("button", { name: label, exact: true }).click();
   }
   await enterVault(page);
-  for (const label of ["Graph", "Notes"]) {
+  for (const label of ["Graph", "Notes", "Files"]) {
     await nav(page).getByRole("button", { name: label, exact: true }).click();
   }
-  // Landing on Notes with an empty vault shows the empty state.
-  await expect(page.getByText(/vault is empty|Select a page/i)).toBeVisible();
+  // Files is the Drive-style browser — a fresh vault shows the Journal folder plus a starting nudge,
+  // not an editor.
+  await expect(page.locator("main").getByText("Journal").first()).toBeVisible();
+  await expect(page.getByText(/Your vault is empty/i)).toBeVisible();
 
   // Back returns to the planner view we left (Today), not a hardcoded default.
   await nav(page).getByRole("button", { name: "Back to app", exact: true }).click();
@@ -53,6 +55,29 @@ test("creates a vault page from the sidebar", async ({ page }) => {
   await expect(title).toBeVisible();
   await title.fill("My first note");
   await expect(title).toHaveValue("My first note");
+});
+
+test("makes a folder in the vault browser and files a page into it", async ({ page }) => {
+  // Scoped to <main>: the sidebar carries its own New folder / New page buttons, and an unscoped
+  // `.first()` picks the sidebar's — which creates the folder but never opens the rename field.
+  const browser = page.locator("main");
+  await enterVault(page); // the Vault button lands on the file browser
+  await browser.getByRole("button", { name: "New folder" }).click();
+  // A new folder opens straight into its rename field — name it and commit.
+  const rename = browser.getByLabel("Rename");
+  await rename.fill("Work");
+  await rename.press("Enter");
+  await expect(browser.getByText("Work")).toBeVisible();
+
+  // Step into it; a page created here belongs to it, so the root no longer lists it.
+  await browser.getByText("Work").click();
+  await browser.getByRole("button", { name: "New page" }).first().click();
+  const title = page.getByPlaceholder("Untitled");
+  await expect(title).toBeVisible();
+  await title.fill("Kickoff");
+
+  // The page is now in the sidebar's Open switcher — the whole point of it.
+  await expect(nav(page).getByText("Open")).toBeVisible();
 });
 
 test("quick-capture lands in the Inbox", async ({ page }) => {

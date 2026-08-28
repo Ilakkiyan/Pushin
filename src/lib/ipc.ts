@@ -397,6 +397,9 @@ export interface Page {
   dailyDate?: string;
   /** True while the page is an unsorted quick-capture in the Inbox. */
   inbox: boolean;
+  /** True when this row is a FOLDER — a container in the vault tree, not a document. Optional so
+   *  rows minted before 0024 (and the E2E mock bridge) read as plain pages. */
+  isFolder?: boolean;
   createdAt: string;
   updatedAt: string;
   indexed: boolean;
@@ -566,6 +569,10 @@ export const api = {
   getPage: (id: number) => invoke<Page>("get_page", { id }),
   createPage: (title: string, parentId: number | null, content?: string) =>
     invoke<Page>("create_page", { title, parentId, content: content ?? null }),
+  /** Create a folder (a bodiless page flagged `isFolder`) in the vault tree. */
+  createFolder: (name: string, parentId: number | null) => invoke<Page>("create_folder", { name, parentId }),
+  /** Rename a page OR folder — title only, body/embedding untouched. Returns the refreshed tree. */
+  renamePage: (id: number, title: string) => invoke<Page[]>("rename_page", { id, title }),
   updatePage: (id: number, title: string, icon: string | null, content: string, contentJson: string | null, linkTitles: string[]) =>
     invoke<Page>("update_page", { id, title, icon, content, contentJson, linkTitles }),
   deletePage: (id: number) => invoke<Page[]>("delete_page", { id }),

@@ -24,13 +24,13 @@ import {
   type Task,
 } from "../lib/ipc";
 
-type View = "today" | "calendar" | "projects" | "habits" | "vault" | "graph" | "inbox" | "label" | "people" | "booking" | "settings";
+type View = "today" | "calendar" | "projects" | "habits" | "files" | "vault" | "graph" | "inbox" | "label" | "people" | "booking" | "settings";
 type CalMode = "week" | "month";
 // The app is split into two spaces so the primary nav stays lean: the "planner" (run-your-day: Today,
 // Calendar, Projects, Habits, People) and the "vault" (second brain: notes, journal, inbox, graph,
 // labels). Clicking Vault swaps the sidebar into the vault space; Back returns to the last planner view.
 type Space = "planner" | "vault";
-const VAULT_VIEWS = new Set<View>(["vault", "graph", "inbox", "label"]);
+const VAULT_VIEWS = new Set<View>(["files", "vault", "graph", "inbox", "label"]);
 
 // One turn in the chat transcript. Kept in the store (not ChatPane's local state) so the
 // conversation survives navigating away from the calendar; it lives only for the session and
@@ -75,6 +75,11 @@ interface State {
   // Vault: the page tree (lightweight rows) + which page is open in the editor.
   pages: Page[];
   currentPageId: number | null;
+  /** Which folder the Drive-style browser (`files` view) is looking at; null = the vault root. */
+  vaultFolderId: number | null;
+  /** Pages currently open, most-recently-opened last — the sidebar's "Open" switcher. Session-only
+   *  (the store isn't persisted), so it's a working set, not a saved workspace. */
+  openPageIds: number[];
   // Inbox: unsorted quick captures + the quick-capture modal's open flag.
   inbox: Page[];
   captureOpen: boolean;
@@ -115,9 +120,15 @@ interface State {
 
   loadPages: () => Promise<void>;
   openPage: (id: number) => void;
+  /** Point the Drive-style browser at a folder (null = root) and show it. */
+  openFolder: (id: number | null) => void;
+  /** Drop a page from the "Open" switcher; closing the active one falls back to its neighbour. */
+  closePage: (id: number) => void;
   openDaily: (date: string) => Promise<void>;
   openEntityNote: (kind: "task" | "event", id: number, title: string) => Promise<void>;
   createPage: (parentId?: number | null) => Promise<Page>;
+  createFolder: (name: string, parentId?: number | null) => Promise<Page>;
+  renamePage: (id: number, title: string) => Promise<void>;
   savePage: (id: number, title: string, icon: string | null, content: string, contentJson: string | null, linkTitles: string[]) => Promise<void>;
   deletePage: (id: number) => Promise<void>;
   movePage: (id: number, parentId: number | null, sortOrder: number) => Promise<void>;
@@ -223,6 +234,17 @@ export const useStore = create<State>((set, get) => {
     }
   };
 
+  // Every route into the editor (a tree click, a daily note, an entity note, a fresh page) has to do
+  // the same three things: show the page, enter the vault space, and add it to the "Open" switcher.
+  // One helper so a new entry point can't forget the third and leave the switcher lying about what's
+  // open. Re-opening an already-open page moves it to the end (most recent), it never duplicates.
+  const openState = (s: State, id: number) => ({
+    currentPageId: id,
+    view: "vault" as View,
+    space: "vault" as Space,
+    openPageIds: [...s.openPageIds.filter((x) => x !== id), id],
+  });
+
   // Run a mutation that returns a ScheduleResult, store conflicts, then refresh.
   const mutate = async (fn: () => Promise<ScheduleResult>) => {
     set({ busy: true });
@@ -265,6 +287,8 @@ export const useStore = create<State>((set, get) => {
     habits: [],
     pages: [],
     currentPageId: null,
+    vaultFolderId: null,
+    openPageIds: [],
     inbox: [],
     captureOpen: false,
     labels: [],
@@ -398,12 +422,23 @@ export const useStore = create<State>((set, get) => {
 
     // Vault pages. The tree is lightweight (no bodies); the editor fetches a full page via getPage.
     loadPages: async () => set({ pages: await api.listPages() }),
-    openPage: (id) => set({ currentPageId: id, view: "vault", space: "vault" }),
+    openPage: (id) => set((s) => openState(s, id)),
+    openFolder: (id) => set({ vaultFolderId: id, view: "files", space: "vault" }),
+    closePage: (id) =>
+      set((s) => {
+        const rest = s.openPageIds.filter((x) => x !== id);
+        // Closing the page you're looking at lands on the next-most-recent open one rather than an
+        // empty editor; closing the last one drops you back to the file browser.
+        if (s.currentPageId !== id) return { openPageIds: rest };
+        const next = rest[rest.length - 1] ?? null;
+        return { openPageIds: rest, currentPageId: next, view: next == null ? "files" : s.view };
+      }),
     // Open (creating on first access) the note for a calendar day, then refresh the tree so it
     // appears under the Journal section.
     openDaily: async (date) => {
       const page = await api.dailyNote(date);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
+      const pages = await api.listPages();
+      set((s) => ({ pages, ...openState(s, page.id) }));
     },
     // Open the page a task/event is linked to, creating + linking one (titled after the entity) on
     // first use — the bridge from the calendar into the vault.
@@ -411,13 +446,22 @@ export const useStore = create<State>((set, get) => {
       const existing = await api.entityPages(kind, id);
       const page = existing[0] ?? (await api.createPage(title, null));
       if (!existing.length) await api.linkPageEntity(page.id, kind, id);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
+      const pages = await api.listPages();
+      set((s) => ({ pages, ...openState(s, page.id) }));
     },
     createPage: async (parentId = null) => {
       const page = await api.createPage("Untitled", parentId ?? null);
-      set({ pages: await api.listPages(), currentPageId: page.id, view: "vault", space: "vault" });
+      const pages = await api.listPages();
+      set((s) => ({ pages, ...openState(s, page.id) }));
       return page;
     },
+    // A new folder doesn't open an editor — it appears in the browser you're already standing in.
+    createFolder: async (name, parentId = null) => {
+      const folder = await api.createFolder(name, parentId ?? null);
+      set({ pages: await api.listPages() });
+      return folder;
+    },
+    renamePage: async (id, title) => set({ pages: await api.renamePage(id, title) }),
     savePage: async (id, title, icon, content, contentJson, linkTitles) => {
       await api.updatePage(id, title, icon, content, contentJson, linkTitles);
       // Refresh the tree so the sidebar title/order stays in sync (cheap, no bodies).
@@ -425,7 +469,13 @@ export const useStore = create<State>((set, get) => {
     },
     deletePage: async (id) => {
       const pages = await api.deletePage(id);
-      set((s) => ({ pages, currentPageId: s.currentPageId === id ? null : s.currentPageId }));
+      set((s) => ({
+        pages,
+        currentPageId: s.currentPageId === id ? null : s.currentPageId,
+        openPageIds: s.openPageIds.filter((x) => x !== id),
+        // Standing inside a folder that just went away → back to the vault root.
+        vaultFolderId: s.vaultFolderId === id ? null : s.vaultFolderId,
+      }));
     },
     movePage: async (id, parentId, sortOrder) => set({ pages: await api.movePage(id, parentId, sortOrder) }),
     askVault: async (question) => {

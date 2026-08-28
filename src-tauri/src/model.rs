@@ -366,6 +366,9 @@ pub struct Page {
     pub daily_date: Option<String>,
     /// True while the page is an unsorted quick-capture in the Inbox.
     pub inbox: bool,
+    /// True when this row is a FOLDER — a container in the vault tree rather than a document. It has
+    /// no body, is never embedded, and is skipped by search + the link graph.
+    pub is_folder: bool,
     pub created_at: String,
     pub updated_at: String,
     pub indexed: bool,
