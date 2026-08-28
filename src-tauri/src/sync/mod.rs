@@ -21,6 +21,7 @@ pub mod frame;
 pub mod hlc;
 pub mod identity;
 pub mod log;
+pub mod probe;
 pub mod infer;
 pub mod protocol;
 pub mod schema;

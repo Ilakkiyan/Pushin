@@ -102,3 +102,8 @@ pub async fn accept_stream(
     let (send, recv) = conn.accept_bi().await.context("accepting sync stream")?;
     Ok((send, recv))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+}

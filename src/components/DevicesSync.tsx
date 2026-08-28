@@ -30,6 +30,7 @@ export default function DevicesSync() {
   const [nameDraft, setNameDraft] = useState("");
   const [log, setLog] = useState<SyncLogLine[]>([]);
   const [copiedLog, setCopiedLog] = useState(false);
+  const [probing, setProbing] = useState(false);
 
   const refresh = async () => {
     try {
@@ -41,11 +42,34 @@ export default function DevicesSync() {
     }
   };
 
+  /** Diagnostics are never allowed to break the pane they live in — hence both the catch and the
+   *  shape check. A stub or a malformed reply must render as "nothing logged", not tear the tab
+   *  down. (This pane once took the whole app out on a null payload; see PeoplePane.) */
+  const asLines = (v: unknown): SyncLogLine[] => (Array.isArray(v) ? (v as SyncLogLine[]) : []);
+
   const loadLog = async () => {
     try {
-      setLog(await api.syncLog());
+      setLog(asLines(await api.syncLog()));
     } catch {
-      /* diagnostics are never allowed to break the pane they live in */
+      /* leave whatever is already on screen */
+    }
+  };
+
+  /**
+   * Walk the connection steps and write the result into the log below. Uses whatever invite is in
+   * the Join box, so "paste the code, press Test" answers the question the pairing screen cannot:
+   * WHICH step fails. Takes up to a minute when a step has to time out.
+   */
+  const testConnection = async () => {
+    setProbing(true);
+    setMsg("Testing the connection — a step that fails has to time out first…");
+    try {
+      setLog(asLines(await api.syncProbe(joinText.trim() || undefined)));
+      setMsg("");
+    } catch (e) {
+      setMsg(String(e));
+    } finally {
+      setProbing(false);
     }
   };
 
@@ -223,13 +247,19 @@ export default function DevicesSync() {
       {/* Diagnostics — what sync actually did, on THIS device.
           A cross-device failure happens on one of two machines, and the misbehaving one is usually
           the installed build with no console attached. Without this there is nothing to read. */}
-      {enabled && (
+      {/* Deliberately NOT gated on `enabled`: the failure this exists to explain is "I cannot join",
+          and a device that cannot join has never been enabled. Hiding the test until pairing
+          succeeds would hide it from everyone who needs it. */}
+      {(
         <div className="rounded-lg border border-white/10 p-3 space-y-2">
           <div className="flex items-center justify-between">
             <div className="text-xs font-medium text-gray-300 flex items-center gap-1.5">
               <ScrollText className="size-3.5 text-gray-500" /> Diagnostics
             </div>
             <div className="flex items-center gap-2">
+              <button className={btn} onClick={testConnection} disabled={busy || probing}>
+                {probing ? "Testing…" : "Test connection"}
+              </button>
               <button className={btn} onClick={loadLog} disabled={busy}>
                 Refresh
               </button>
@@ -255,7 +285,9 @@ export default function DevicesSync() {
           </div>
           {log.length === 0 ? (
             <p className="text-[11px] text-gray-500">
-              Nothing logged yet. Hit <span className="text-gray-400">Sync now</span>, then Refresh —
+              Nothing logged yet. If pairing is failing, paste the invite above and hit{" "}
+              <span className="text-gray-400">Test connection</span> — it walks the steps and says
+              which one breaks. Otherwise hit <span className="text-gray-400">Sync now</span>, then Refresh —
               each session records what moved, and names the two cases where files are skipped on
               purpose (no vault folder here, or a peer on an older build).
             </p>

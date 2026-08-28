@@ -661,4 +661,7 @@ export const api = {
   /** What sync actually did, newest last — the thing to read when a device "isn't syncing". */
   syncLog: () => invoke<SyncLogLine[]>("sync_log"),
   syncLogClear: () => invoke<void>("sync_log_clear"),
+  /** Run the transport self-test and return the diagnostics ring with its results. Pass the invite
+   *  being tried to test reaching that peer; omit it to test only this device's own reach. */
+  syncProbe: (ticket?: string) => invoke<SyncLogLine[]>("sync_probe", { ticket: ticket ?? null }),
 };

@@ -235,6 +235,7 @@ pub fn run() {
             commands::sync_leave,
             commands::sync_log,
             commands::sync_log_clear,
+            commands::sync_probe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -2218,6 +2218,17 @@ pub fn sync_log_clear() {
     sync::log::clear();
 }
 
+/// Run the transport self-test and return the diagnostics ring with its results.
+///
+/// Optionally takes the invite the user is trying to use, so the test can try to reach that peer
+/// specifically rather than only checking this device's own reach. Inert by construction — see
+/// [`crate::sync::probe`].
+#[tauri::command]
+pub async fn sync_probe(ticket: Option<String>) -> Result<Vec<sync::log::SyncLogLine>, String> {
+    sync::probe::run(ticket).await;
+    Ok(sync::log::lines())
+}
+
 #[tauri::command]
 pub async fn sync_leave(state: State<'_, AppState>) -> Result<(), String> {
     let old = state.sync_engine.lock().map_err(err)?.take();
