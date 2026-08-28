@@ -5,10 +5,13 @@
 //! DB access stays behind the app's `Mutex<Connection>` and is never held across an `.await`
 //! (gotcha #8): each [`SyncStore`] method takes a short lock, does its work, and releases.
 
+use super::blobs;
+use super::log;
 use super::changeset::{self, Change};
 use super::infer::{self, InferReply, InferRequest};
 use super::protocol::{self, SessionStats, SyncStore};
 use super::{identity, state, transport};
+use crate::progress;
 use anyhow::{anyhow, bail, Context, Result};
 use iroh::endpoint::{Connection, Incoming};
 use iroh::{Endpoint, NodeAddr, NodeId};
@@ -41,6 +44,16 @@ pub struct SyncEngine {
     infer_sem: Arc<Semaphore>,
     /// Whether this endpoint was bound with relays enabled (invite minting needs to know).
     use_relay: bool,
+}
+
+/// One line summarising a finished session — the thing you actually want to read when a device
+/// "isn't syncing": whether rows moved, whether files moved, and how much.
+fn describe(s: &SessionStats) -> String {
+    let who = if s.peer_name.is_empty() { s.peer.chars().take(8).collect() } else { s.peer_name.clone() };
+    format!(
+        "session with {who}: rows {} in / {} out, files {} in ({} bytes) / {} out",
+        s.received, s.sent, s.files_received, s.bytes_received, s.files_sent
+    )
 }
 
 fn now_ms() -> u64 {
@@ -113,9 +126,22 @@ impl SyncEngine {
     }
 
     /// Dial one peer and run a full sync session.
+    ///
+    /// The progress bookends are unconditional: the closing `done` is emitted on the error path too,
+    /// or a peer that goes unreachable mid-session would leave the sidebar bar stuck at whatever
+    /// fraction it had reached, with nothing left running to ever finish it.
     pub async fn sync_with(&self, addr: impl Into<NodeAddr>) -> Result<SessionStats> {
+        progress::emit(&self.app, progress::SyncProgress::new("device", "rows", ""));
+        let out = self.sync_with_inner(addr).await;
+        progress::emit(&self.app, progress::SyncProgress::finished("device", ""));
+        out
+    }
+
+    async fn sync_with_inner(&self, addr: impl Into<NodeAddr>) -> Result<SessionStats> {
         let (conn, send, recv) = transport::dial(&self.endpoint, addr).await?;
-        let stats = protocol::run_session(self, true, recv, send).await?;
+        let blob_store = VaultBlobs::new(self);
+        let stats = protocol::run_session_with_blobs(self, &blob_store, true, recv, send).await?;
+        log::info(describe(&stats));
         self.note_peer(&stats);
         conn.close(0u32.into(), b"done");
         Ok(stats)
@@ -134,12 +160,32 @@ impl SyncEngine {
             match p.node_id.parse::<NodeId>() {
                 Ok(id) => match self.sync_with(id).await {
                     Ok(_) => ok += 1,
-                    Err(e) => eprintln!("sync: peer {} failed: {e:#}", p.node_id),
+                    Err(e) => log::error(format!("peer {} failed: {e:#}", p.node_id)),
                 },
-                Err(_) => eprintln!("sync: bad node id {}", p.node_id),
+                Err(_) => log::error(format!("bad node id {}", p.node_id)),
             }
         }
         ok
+    }
+
+    /// Reconcile the vault folder with the shared file index (a no-op when no vault folder is set).
+    ///
+    /// Errors are logged and swallowed on purpose: a vault folder that has been renamed, unmounted,
+    /// or is momentarily unreadable must not take row sync down with it. The files simply do not
+    /// move this round.
+    fn reindex_vault(&self) {
+        let Ok(conn) = self.db.lock() else { return };
+        let Some(dir) = crate::db::get_settings(&conn).ok().and_then(|s| s.vault_dir) else { return };
+        match blobs::reindex(&conn, &dir) {
+            // Only worth a line when it did something — a quiet scan every 20 seconds would bury
+            // the entries that actually explain a failure.
+            Ok(s) if s.hashed > 0 || s.removed > 0 => log::info(format!(
+                "vault scan: {} file(s) indexed, {} newly hashed, {} removed",
+                s.indexed, s.hashed, s.removed
+            )),
+            Ok(_) => {}
+            Err(e) => log::error(format!("vault reindex failed: {e:#}")),
+        }
     }
 
     /// Close the endpoint on shutdown.
@@ -156,7 +202,7 @@ impl SyncEngine {
                 let engine = self.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = engine.handle_incoming(incoming).await {
-                        eprintln!("sync: inbound session failed: {e:#}");
+                        log::error(format!("inbound session failed: {e:#}"));
                     }
                 });
             }
@@ -179,7 +225,12 @@ impl SyncEngine {
             return self.serve_inference(&conn).await;
         }
         let (send, recv) = transport::accept_stream(&conn).await?;
-        let stats = protocol::run_session(self, false, recv, send).await?;
+        progress::emit(&self.app, progress::SyncProgress::new("device", "rows", ""));
+        let blob_store = VaultBlobs::new(self);
+        let stats = protocol::run_session_with_blobs(self, &blob_store, false, recv, send).await;
+        progress::emit(&self.app, progress::SyncProgress::finished("device", ""));
+        let stats = stats?;
+        log::info(describe(&stats));
         self.note_peer(&stats);
         // We sent the closing `Bye`; the initiator closes as soon as it reads that. Wait for the
         // close rather than returning, because dropping `conn` abandons unacknowledged stream data
@@ -276,6 +327,68 @@ impl SyncEngine {
     }
 }
 
+/// The engine's [`BlobStore`]: the vault folder on this device, if one is configured.
+///
+/// Constructed per session and handed to [`protocol::run_session_with_blobs`]. When no vault folder
+/// is set, `enabled()` is false and the session never enters the file phase — a device that keeps
+/// its vault in SQLite only still syncs rows exactly as before.
+pub struct VaultBlobs<'a> {
+    engine: &'a SyncEngine,
+    vault_dir: Option<String>,
+}
+
+impl<'a> VaultBlobs<'a> {
+    fn new(engine: &'a SyncEngine) -> Self {
+        let vault_dir = engine
+            .db
+            .lock()
+            .ok()
+            .and_then(|c| crate::db::get_settings(&c).ok())
+            .and_then(|s| s.vault_dir);
+        VaultBlobs { engine, vault_dir }
+    }
+}
+
+impl protocol::BlobStore for VaultBlobs<'_> {
+    fn enabled(&self) -> bool {
+        self.vault_dir.is_some()
+    }
+
+    fn wanted(&self) -> Vec<blobs::WantedFile> {
+        let Some(dir) = &self.vault_dir else { return Vec::new() };
+        let Ok(conn) = self.engine.db.lock() else { return Vec::new() };
+        // The peer's changeset has just landed, so this is the moment their deletions are real.
+        // Settling them BEFORE computing the want-list is what stops us asking for the bytes of a
+        // file they told us in the same breath to delete.
+        if let Err(e) = blobs::apply_index_deletions(&conn, dir) {
+            log::error(format!("couldn't apply vault file deletions: {e:#}"));
+        }
+        blobs::wanted(&conn, dir).unwrap_or_default()
+    }
+
+    fn read(&self, hash: &str) -> Option<Vec<u8>> {
+        let dir = self.vault_dir.as_ref()?;
+        let conn = self.engine.db.lock().ok()?;
+        blobs::read_blob(&conn, dir, hash)
+    }
+
+    fn store(&self, rel_path: &str, hash: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.vault_dir.as_ref().ok_or_else(|| anyhow!("no vault folder"))?;
+        let conn = self.engine.db.lock().map_err(|_| anyhow!("db poisoned"))?;
+        // Writing the file fires the vault watcher, which would otherwise read our own write as an
+        // external edit. `write_blob` records it in `vault_file_seen` with the landed mtime, so the
+        // next reindex recognises the bytes as ours and does not re-hash or re-ship them.
+        blobs::write_blob(&conn, dir, rel_path, hash, bytes)
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        progress::emit(
+            &self.engine.app,
+            progress::SyncProgress::new("device", "files", "").at(done, total),
+        );
+    }
+}
+
 impl SyncStore for SyncEngine {
     fn mesh_secret(&self) -> String {
         self.mesh.clone()
@@ -299,6 +412,11 @@ impl SyncStore for SyncEngine {
         }
     }
     fn changes_since(&self, since: &str) -> Result<Vec<Change>> {
+        // Bring the vault file index in line with the folder BEFORE stamping, so a file added or
+        // deleted on this device ships in this session rather than the next one. Hashing is skipped
+        // for anything whose (mtime, size) is unchanged, so the steady-state cost is a directory
+        // walk — the first scan of a large vault is the slow one.
+        self.reindex_vault();
         let conn = self.db.lock().map_err(|_| anyhow!("db poisoned"))?;
         // Stamp local edits (advance + persist the clock), then collect the delta.
         let mut clock = state::load_clock(&conn)?;
@@ -316,7 +434,7 @@ impl SyncStore for SyncEngine {
             // onto this device's local Google state so pairing auto-applies the connection.
             // Idempotent and cheap, so it runs unconditionally rather than sniffing the batch.
             if let Err(e) = crate::db::adopt_google_link(&conn) {
-                eprintln!("sync: couldn't adopt the shared Google link: {e}");
+                log::error(format!("couldn't adopt the shared Google link: {e}"));
             }
             (stats.applied, stats.max_hlc)
         };

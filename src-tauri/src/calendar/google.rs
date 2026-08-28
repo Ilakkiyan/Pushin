@@ -491,9 +491,26 @@ pub struct SyncSummary {
     pub blocks_mirrored: usize,
 }
 
+/// A progress sink for [`sync_with_progress`]: `(phase, done, total)`. `total == 0` means the size
+/// of this phase is not known yet — see [`crate::progress`].
+pub type OnProgress<'a> = &'a (dyn Fn(&'static str, u64, u64) + Sync);
+
+/// Run a full two-way sync, reporting nothing. See [`sync_with_progress`].
+pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Result<SyncSummary> {
+    sync_with_progress(db_mutex, http, &|_, _, _| {}).await
+}
+
 /// Run a full two-way sync. Pulls Google → Pushin (incremental), then pushes local
 /// events + task blocks → Google (primary calendar). Returns a small summary.
-pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Result<SyncSummary> {
+///
+/// `on` is called as each phase advances. The counts are real work items, not a timer: the pull is
+/// indeterminate until Google has answered (we cannot know how many events are coming), and the two
+/// push phases each know their own length before they start.
+pub async fn sync_with_progress(
+    db_mutex: &Mutex<Connection>,
+    http: &reqwest::Client,
+    on: OnProgress<'_>,
+) -> Result<SyncSummary> {
     // 1. Snapshot account + credentials.
     let (account, settings) = {
         let conn = db_mutex.lock().unwrap();
@@ -519,6 +536,7 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
     let time_max = (now + Duration::days(settings.horizon_days.max(7))).to_rfc3339();
 
     // 3. PULL (incremental; fall back to a full window if the sync token expired).
+    on("pull", 0, 0);
     let (events, next_sync) = match list_events(http, &access, &cal_id, &time_min, &time_max, account.sync_token.as_deref()).await {
         Ok(r) => r,
         Err(e) if e.to_string().contains("SYNC_TOKEN_EXPIRED") => {
@@ -530,6 +548,7 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
         }
         Err(e) => return Err(e),
     };
+    let total_pulled = events.len() as u64;
     {
         let conn = db_mutex.lock().unwrap();
         for ev in &events {
@@ -549,6 +568,7 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
                 }
             }
             summary.pulled += 1;
+            on("pull", (summary.pulled + summary.removed) as u64, total_pulled);
         }
         db::update_google_sync_token(&conn, account.id, next_sync.as_deref())?;
     }
@@ -567,6 +587,8 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
             .collect()
     };
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let total_push = to_push.len() as u64;
+    on("push", 0, total_push);
     for (id, title, start, end, ext) in to_push {
         // An event a peer pushed already exists on Google; adopt its id instead of duplicating it.
         let ext = ext.or_else(|| adopt_existing(&title, &start, &end, &window, &mut claimed));
@@ -583,6 +605,7 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
             }
         }
         summary.pushed += 1;
+        on("push", summary.pushed as u64, total_push);
     }
 
     // 6. MIRROR task blocks, reconciling by block uuid so concurrent devices converge.
@@ -599,7 +622,10 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
             })
             .collect()
     };
-    for op in plan_block_mirror(&targets, &window) {
+    let ops = plan_block_mirror(&targets, &window);
+    let total_mirror = ops.len() as u64;
+    on("mirror", 0, total_mirror);
+    for (i, op) in ops.into_iter().enumerate() {
         match op {
             MirrorOp::Insert(i) => {
                 let t = &targets[i];
@@ -613,6 +639,7 @@ pub async fn sync(db_mutex: &Mutex<Connection>, http: &reqwest::Client) -> Resul
             }
             MirrorOp::Delete(ext_id) => delete_event(http, &access, &cal_id, &ext_id).await?,
         }
+        on("mirror", i as u64 + 1, total_mirror);
     }
 
     Ok(summary)

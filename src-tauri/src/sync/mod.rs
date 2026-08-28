@@ -4,6 +4,9 @@
 //! - [`schema`]   — the synced-table registry + the generated `0015_sync` migration.
 //! - [`hlc`]      — Hybrid Logical Clock for last-writer-wins ordering across devices.
 //! - [`changeset`] — read local changes → wire payloads (FK→uuid) and apply remote ones (LWW).
+//! - [`blobs`]     — file-level vault sync: the index syncs as rows, the BYTES in their own phase.
+//! - [`log`]       — an in-app ring of what sync did, because a cross-device failure happens on the
+//!                  device whose console you cannot see.
 //!
 //! Change capture is done with SQLite triggers (see [`schema`]), so the ~50 existing `db.rs`
 //! mutation functions are untouched. The triggers consult [`sync_capturing`] so that our OWN writes
@@ -11,11 +14,13 @@
 //! forever. All DB access is serialized behind the app's `Mutex<Connection>`, so a process-global
 //! flag is sufficient and race-free.
 
+pub mod blobs;
 pub mod changeset;
 pub mod engine;
 pub mod frame;
 pub mod hlc;
 pub mod identity;
+pub mod log;
 pub mod infer;
 pub mod protocol;
 pub mod schema;

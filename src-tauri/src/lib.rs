@@ -14,6 +14,7 @@ mod meeting;
 pub mod model;
 mod model_manager;
 pub mod parser;
+mod progress;
 mod scheduler;
 // Public so the model regression battery (`tests/model_battery.rs`) can run the same post-plan
 // reschedule the app does, then project the resulting calendar. No external consumers otherwise.
@@ -230,6 +231,8 @@ pub fn run() {
             commands::sync_set_device_name,
             commands::sync_set_relay,
             commands::sync_leave,
+            commands::sync_log,
+            commands::sync_log_clear,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

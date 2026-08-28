@@ -9,7 +9,7 @@ use crate::model_manager::{self, ModelInfo};
 use crate::parser::{self, PlanOutcome};
 use crate::schedule_service::reschedule_inner;
 use crate::scheduler::{self, Interval};
-use crate::{db, habits, hermes, llm};
+use crate::{db, habits, hermes, llm, progress};
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -941,8 +941,19 @@ pub fn disconnect_google(state: State<AppState>) -> Result<(), String> {
 
 /// Two-way sync with Google Calendar, then re-plan around anything newly pulled in.
 #[tauri::command]
-pub async fn sync_google(state: State<'_, AppState>) -> Result<google::SyncSummary, String> {
-    let summary = google::sync(state.db.as_ref(), &state.http).await.map_err(err)?;
+pub async fn sync_google(app: AppHandle, state: State<'_, AppState>) -> Result<google::SyncSummary, String> {
+    // Report the same `sync-progress` shape the device mesh uses, so the sidebar bar renders either
+    // one without knowing which. The closing `done` is emitted before the `?`, so a failed sync
+    // retires the bar instead of freezing it mid-fill.
+    let on = |phase: &'static str, done: u64, total: u64| {
+        progress::emit(
+            &app,
+            progress::SyncProgress::new("google", phase, "Google Calendar").at(done, total),
+        );
+    };
+    let result = google::sync_with_progress(state.db.as_ref(), &state.http, &on).await;
+    progress::emit(&app, progress::SyncProgress::finished("google", "Google Calendar"));
+    let summary = result.map_err(err)?;
     {
         let mut conn = state.db();
         let settings = db::get_settings(&conn).map_err(err)?;
@@ -2169,6 +2180,21 @@ pub async fn sync_set_relay(app: AppHandle, state: State<'_, AppState>, use_rela
 }
 
 /// Leave the network: stop the engine, forget the mesh key + peers (the device keeps its identity).
+/// The in-app sync diagnostics ring (Settings ▸ Devices ▸ Diagnostics).
+///
+/// Exists because the device that misbehaves in a cross-device sync is usually the one you have no
+/// console for — an installed build has no stderr to read.
+#[tauri::command]
+pub fn sync_log() -> Vec<sync::log::SyncLogLine> {
+    sync::log::lines()
+}
+
+/// Empty the diagnostics ring so a reproduction starts from a clean slate.
+#[tauri::command]
+pub fn sync_log_clear() {
+    sync::log::clear();
+}
+
 #[tauri::command]
 pub async fn sync_leave(state: State<'_, AppState>) -> Result<(), String> {
     let old = state.sync_engine.lock().map_err(err)?.take();

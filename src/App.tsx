@@ -30,7 +30,7 @@ import MobileShell from "./components/MobileShell";
 import { useIsMobile } from "./lib/useIsMobile";
 import { useHotkeys } from "./lib/useHotkeys";
 import { applyVaultChange } from "./lib/vaultImport";
-import { api, type VaultChange } from "./lib/ipc";
+import { api, type SyncProgress, type VaultChange } from "./lib/ipc";
 import { getVersion } from "@tauri-apps/api/app";
 
 export default function App() {
@@ -235,6 +235,27 @@ export default function App() {
       un.then((f) => f());
     };
   }, [load]);
+
+  // Sync progress → the sidebar bar. Both engines (device mesh and Google) emit the same event, so
+  // this is the single subscription for either.
+  //
+  // The watchdog matters: the backend emits a closing `done` on its error paths too, but nothing can
+  // emit it if the process dies mid-session — and a bar frozen at 40% forever is the one failure the
+  // user would actually notice. Any gap longer than STALE_MS retires it.
+  useEffect(() => {
+    const STALE_MS = 30_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const un = listen<SyncProgress>("sync-progress", (e) => {
+      const p = e.payload;
+      clearTimeout(timer);
+      useStore.getState().setSyncProgress(p.active ? p : null);
+      if (p.active) timer = setTimeout(() => useStore.getState().setSyncProgress(null), STALE_MS);
+    });
+    return () => {
+      clearTimeout(timer);
+      un.then((f) => f());
+    };
+  }, []);
 
   // Subscribed .ics feeds refresh on a background timer. The backend only emits when a feed actually
   // changed (and has already re-planned around it), so this is a plain reload, not a poll.

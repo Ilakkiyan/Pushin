@@ -109,6 +109,28 @@
   }
 }
 
+/* Sidebar sync bar, indeterminate state: a short segment sweeping the track, used for a phase whose
+   size the backend does not know yet (the Google pull, before Google has answered). Reduced-motion
+   swaps the sweep for a dimmed full bar — still legible as "working", with nothing moving. */
+.sync-sweep {
+  animation: syncSweep 1.1s ease-in-out infinite;
+}
+@keyframes syncSweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sync-sweep {
+    animation: none;
+    width: 100%;
+    opacity: 0.55;
+  }
+}
+
 /* Quick scrim fade for modal backdrops. */
 .fade-in {
   animation: fadeIn 130ms var(--ease-out) both;

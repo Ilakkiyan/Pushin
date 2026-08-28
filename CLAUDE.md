@@ -131,6 +131,21 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
     extending the parser, compose fixtures from lines (`ics(&[...])`) rather than inline literals — a
     hand-written one hid a folded-line bug in the *test data*.
 
+20. **Vault FILES sync separately from vault PAGES, and the two must not both own a path.** Pages
+    replicate as `notes` rows; everything else in the vault folder (attachments, PDFs, images)
+    replicates through `sync/blobs.rs` — the index as LWW rows, the bytes in their own chunked phase
+    after the row exchange (migration `0023`). Three things are load-bearing. `vault_file_seen` holds
+    only paths *this* device has actually had on disk, which is the ONLY thing separating "the peer's
+    file, not fetched yet" from "a file I deleted" — get it wrong and a file deletes itself moments
+    after arriving. The want-list is the receiver's **whitelist**: a blob's bytes are written to the
+    path *we* recorded for that hash, never the one the sender chose, and the SHA-256 is re-verified
+    before anything lands. And a path that is a page mirror is skipped by both `wanted` and
+    `apply_index_deletions` — a loose `.md` that the watcher later folds into a page leaves a frozen
+    index row behind, and without the guard two devices ask each other every 20 seconds for a file
+    neither can serve. `Hello.blobs` is `#[serde(default)]` and the phase runs only when both sides
+    advertise it, so an un-updated peer skips files instead of desynchronising the choreography and
+    breaking sync outright.
+
 ---
 
 ## Build / run / test

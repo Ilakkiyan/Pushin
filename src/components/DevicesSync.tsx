@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Laptop, Copy, Check, RefreshCw, Trash2, Wifi, WifiOff } from "lucide-react";
-import { api, type SyncStatus } from "../lib/ipc";
+import { Laptop, Copy, Check, RefreshCw, Trash2, Wifi, WifiOff, ScrollText } from "lucide-react";
+import { api, type SyncLogLine, type SyncStatus } from "../lib/ipc";
 
 const inputCls = "w-full rounded-md bg-white/5 border border-white/10 px-2 py-1.5 text-sm outline-none focus:border-indigo-500/50";
 const btn = "rounded-md bg-white/5 border border-white/10 px-3 py-1.5 text-sm hover:bg-white/10 disabled:opacity-50";
@@ -8,6 +8,11 @@ const btnPrimary = "rounded-md bg-white/90 hover:bg-white text-gray-900 px-3 py-
 
 function shortId(id: string) {
   return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
+/** The log as one pasteable block — what you send when asking someone to look at a failure. */
+function logText(log: SyncLogLine[]) {
+  return log.map((l) => `${l.at} [${l.level}] ${l.text}`).join("\n");
 }
 
 /**
@@ -23,6 +28,8 @@ export default function DevicesSync() {
   const [msg, setMsg] = useState("");
   const [copied, setCopied] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
+  const [log, setLog] = useState<SyncLogLine[]>([]);
+  const [copiedLog, setCopiedLog] = useState(false);
 
   const refresh = async () => {
     try {
@@ -34,8 +41,17 @@ export default function DevicesSync() {
     }
   };
 
+  const loadLog = async () => {
+    try {
+      setLog(await api.syncLog());
+    } catch {
+      /* diagnostics are never allowed to break the pane they live in */
+    }
+  };
+
   useEffect(() => {
     refresh();
+    loadLog();
   }, []);
 
   const run = async (fn: () => Promise<unknown>, working: string) => {
@@ -49,6 +65,7 @@ export default function DevicesSync() {
     } finally {
       setBusy(false);
       await refresh();
+      await loadLog();
     }
   };
 
@@ -96,6 +113,8 @@ export default function DevicesSync() {
       <p className="text-xs text-gray-400 -mt-2">
         Keep Pushin in sync across your devices over a private peer-to-peer network — no cloud, no
         account. Data flows device&nbsp;to&nbsp;device, end-to-end encrypted, joined by a shared key.
+        Your calendar, tasks and vault pages all replicate; so do the files in your vault folder
+        (attachments, PDFs, images) once you&rsquo;ve set one under Vault.
       </p>
 
       {/* This device */}
@@ -198,6 +217,62 @@ export default function DevicesSync() {
           >
             Leave this sync network
           </button>
+        </div>
+      )}
+
+      {/* Diagnostics — what sync actually did, on THIS device.
+          A cross-device failure happens on one of two machines, and the misbehaving one is usually
+          the installed build with no console attached. Without this there is nothing to read. */}
+      {enabled && (
+        <div className="rounded-lg border border-white/10 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-medium text-gray-300 flex items-center gap-1.5">
+              <ScrollText className="size-3.5 text-gray-500" /> Diagnostics
+            </div>
+            <div className="flex items-center gap-2">
+              <button className={btn} onClick={loadLog} disabled={busy}>
+                Refresh
+              </button>
+              <button
+                className={btn}
+                onClick={() => {
+                  navigator.clipboard.writeText(logText(log));
+                  setCopiedLog(true);
+                  setTimeout(() => setCopiedLog(false), 1500);
+                }}
+                disabled={log.length === 0}
+              >
+                {copiedLog ? <Check className="size-3.5 inline" /> : <Copy className="size-3.5 inline" />} Copy
+              </button>
+              <button
+                className={btn}
+                onClick={() => api.syncLogClear().then(() => setLog([]))}
+                disabled={log.length === 0}
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          {log.length === 0 ? (
+            <p className="text-[11px] text-gray-500">
+              Nothing logged yet. Hit <span className="text-gray-400">Sync now</span>, then Refresh —
+              each session records what moved, and names the two cases where files are skipped on
+              purpose (no vault folder here, or a peer on an older build).
+            </p>
+          ) : (
+            <pre className="max-h-56 overflow-auto rounded-md bg-black/30 p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap">
+              {log.map((l, i) => (
+                <div
+                  key={i}
+                  className={
+                    l.level === "error" ? "text-red-400" : l.level === "warn" ? "text-amber-400" : "text-gray-400"
+                  }
+                >
+                  {l.at} {l.text}
+                </div>
+              ))}
+            </pre>
+          )}
         </div>
       )}
 

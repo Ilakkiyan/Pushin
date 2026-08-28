@@ -18,6 +18,7 @@ import {
   type PlanOutcome,
   type Project,
   type ScheduleResult,
+  type SyncProgress,
   type Settings,
   type SyncSummary,
   type Task,
@@ -160,6 +161,13 @@ interface State {
   cancelBooking: (id: number) => Promise<void>;
 
   syncing: boolean;
+  /**
+   * The latest `sync-progress` tick, or null when nothing is syncing. Written by the listener in
+   * App.tsx and read by the sidebar's SyncBar — deliberately the only place either engine's
+   * progress lives, so device sync and Google sync can never fight over the bar.
+   */
+  syncProgress: SyncProgress | null;
+  setSyncProgress: (p: SyncProgress | null) => void;
   connectGoogle: () => Promise<string>;
   disconnectGoogle: () => Promise<void>;
   syncGoogle: () => Promise<SyncSummary>;
@@ -232,6 +240,7 @@ export const useStore = create<State>((set, get) => {
     loaded: false,
     busy: false,
     syncing: false,
+    syncProgress: null,
     view: "today",
     space: "planner",
     prevPlannerView: "today",
@@ -485,6 +494,7 @@ export const useStore = create<State>((set, get) => {
       await refreshData();
     },
 
+    setSyncProgress: (p) => set({ syncProgress: p }),
     syncGoogle: async () => {
       if (get().syncing) return { pulled: 0, pushed: 0, removed: 0, blocksMirrored: 0 };
       set({ syncing: true });

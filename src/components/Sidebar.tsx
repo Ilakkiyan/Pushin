@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { useState } from "react";
+import SyncBar from "./SyncBar";
 import { useStore } from "../state/store";
 import { api } from "../lib/ipc";
 import { toLocalDate } from "../lib/time";
@@ -212,8 +213,10 @@ export default function Sidebar() {
         )}
       </nav>
 
-      {/* Bottom: AI status + settings */}
+      {/* Bottom: sync progress + AI status + settings */}
       <div className="shrink-0 border-t border-white/10 p-2 space-y-1">
+        {/* Renders itself away when nothing is syncing, so the footer keeps its usual height. */}
+        <SyncBar collapsed={collapsed} />
         <button
           onClick={connect}
           title="Click to connect / start the local inference server"

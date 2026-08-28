@@ -48,6 +48,23 @@ export interface VaultChange {
   kind: "update" | "remove";
 }
 
+/**
+ * One tick of sync progress, emitted as `sync-progress` by BOTH the device mesh and Google
+ * Calendar so the sidebar bar has a single shape to render.
+ *
+ * `total === 0` means indeterminate — work is happening but its size isn't known yet (the Google
+ * pull, before Google has answered). The bar shows motion without a number rather than inventing a
+ * percentage. `active: false` is the closing event and retires the bar.
+ */
+export interface SyncProgress {
+  source: "device" | "google";
+  phase: "rows" | "files" | "pull" | "push" | "mirror" | "done";
+  label: string;
+  done: number;
+  total: number;
+  active: boolean;
+}
+
 export interface SyncSummary {
   pulled: number;
   pushed: number;
@@ -61,6 +78,13 @@ export interface SyncPeer {
   name: string;
   lastSeen: string | null;
   lastAckedHlc: string;
+}
+
+/** One line of the backend's sync diagnostics ring (Settings ▸ Devices ▸ Diagnostics). */
+export interface SyncLogLine {
+  at: string; // local HH:MM:SS, so two devices' logs line up against each other
+  level: "info" | "warn" | "error";
+  text: string;
 }
 
 /** State of the device-sync mesh for this device. */
@@ -627,4 +651,7 @@ export const api = {
   syncSetDeviceName: (name: string) => invoke<void>("sync_set_device_name", { name }),
   syncSetRelay: (useRelay: boolean) => invoke<void>("sync_set_relay", { useRelay }),
   syncLeave: () => invoke<void>("sync_leave"),
+  /** What sync actually did, newest last — the thing to read when a device "isn't syncing". */
+  syncLog: () => invoke<SyncLogLine[]>("sync_log"),
+  syncLogClear: () => invoke<void>("sync_log_clear"),
 };

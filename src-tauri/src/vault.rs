@@ -64,6 +64,137 @@ pub fn read_file(vault_dir: &str, rel_path: &str) -> Result<String> {
     Ok(std::fs::read_to_string(abs)?)
 }
 
+/// The largest file the vault will replicate to another device. Above this the file stays local:
+/// the whole batch travels over one QUIC session held in memory, and a multi-gigabyte video would
+/// stall every other change behind it. Skipped files are simply not indexed, so they never appear
+/// in a peer's want-list.
+pub const MAX_SYNC_FILE: u64 = 100 * 1024 * 1024;
+
+/// One file found by [`scan_files`], with everything the index needs to decide whether it changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedFile {
+    /// Vault-relative path, always `/`-separated (the wire form — a Windows backslash would not
+    /// match the same file on a peer's mac).
+    pub rel_path: String,
+    /// SHA-256 of the bytes, lowercase hex. `None` until [`hash_file`] runs — a scan that can reuse
+    /// the previous hash (same mtime + size) leaves it unset rather than re-reading the bytes.
+    pub hash: Option<String>,
+    pub size: u64,
+    /// Modification time as whole seconds since the epoch; `0` when the platform won't say.
+    pub mtime: i64,
+}
+
+/// SHA-256 of a file's contents, lowercase hex — the content address a peer asks for a blob by.
+/// Streamed in 64 KB reads so hashing a 100 MB attachment doesn't materialise it in memory.
+pub fn hash_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// SHA-256 of bytes already in memory — the check a received blob has to pass before it is allowed
+/// to land in the vault.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Is this a path the vault should never replicate?
+///
+/// Dot-files and dot-folders are editor/OS bookkeeping (`.obsidian/`, `.git/`, `.DS_Store`) — local
+/// state that means nothing on another machine. `pages` holds the `rel_path` of every page mirror:
+/// those files are re-derived from a `notes` row on each device, so replicating the file as well
+/// would put two writers on one path (see the `vault_file_index` TableSpec).
+pub fn is_excluded(rel_path: &str, pages: &std::collections::HashSet<String>) -> bool {
+    if pages.contains(rel_path) {
+        return true;
+    }
+    rel_path.split('/').any(|c| c.starts_with('.'))
+}
+
+/// Walk `vault_dir` and return every file eligible for sync.
+///
+/// Deliberately does NOT hash: hashing is the expensive half, and the caller skips it for files
+/// whose `(mtime, size)` match what it saw last time. Symlinks are not followed — `symlink_metadata`
+/// keeps a link that points back at an ancestor from walking forever, and a link's *target* is
+/// either already inside the vault (so it gets visited on its own) or outside it (so it is not
+/// vault content). Unreadable entries are skipped rather than failing the scan: one
+/// permission-denied folder must not stop the other 300 files from syncing.
+pub fn scan_files(vault_dir: &str, pages: &std::collections::HashSet<String>) -> Vec<ScannedFile> {
+    let root = PathBuf::from(vault_dir);
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(&root) else { continue };
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
+            if rel_path.is_empty() || is_excluded(&rel_path, pages) {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() && meta.len() <= MAX_SYNC_FILE {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                out.push(ScannedFile { rel_path, hash: None, size: meta.len(), mtime });
+            }
+        }
+    }
+    // Stable order so a scan is reproducible and its tests can assert on it.
+    out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    out
+}
+
+/// Write bytes to `<vault>/<rel_path>`, creating parent folders. The binary counterpart of
+/// [`write_file`], used when a peer's attachment lands.
+pub fn write_bytes(vault_dir: &str, rel_path: &str, bytes: &[u8]) -> Result<()> {
+    let abs = safe_join(vault_dir, rel_path).ok_or_else(|| anyhow::anyhow!("unsafe vault path: {rel_path}"))?;
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&abs, bytes)?;
+    Ok(())
+}
+
+/// Read a vault file's raw bytes (the blob a peer asked for).
+pub fn read_bytes(vault_dir: &str, rel_path: &str) -> Result<Vec<u8>> {
+    let abs = safe_join(vault_dir, rel_path).ok_or_else(|| anyhow::anyhow!("unsafe vault path: {rel_path}"))?;
+    Ok(std::fs::read(abs)?)
+}
+
+/// Delete a vault file that a peer tombstoned. Missing is success — the end state is the same, and
+/// a delete that races another device's delete must not error.
+pub fn delete_file(vault_dir: &str, rel_path: &str) -> Result<()> {
+    let abs = safe_join(vault_dir, rel_path).ok_or_else(|| anyhow::anyhow!("unsafe vault path: {rel_path}"))?;
+    match std::fs::remove_file(&abs) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A change the watcher saw on disk, forwarded to the frontend (which owns md→blocks). `kind` is
 /// "update" (create/modify) or "remove".
 #[derive(Clone, Serialize)]
@@ -250,5 +381,114 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pushin_vault_missing_{}", std::process::id()));
         let root = dir.to_string_lossy().to_string();
         assert!(read_file(&root, "nope.md").is_err());
+    }
+
+    /// A throwaway folder for the scan tests (the suite runs tests in parallel threads).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pushin_scan_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put(root: &Path, rel: &str, body: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn a_scan_finds_nested_files_with_forward_slash_paths() {
+        // The path is the identity of a file on the wire, so it has to be the SAME string on Windows
+        // and macOS — a backslash here would make one device's `Work/a.pdf` a different file from
+        // the other's.
+        let root = scratch("nested");
+        put(&root, "a.txt", b"1");
+        put(&root, "Work/Q3/plan.pdf", b"2");
+        let found = scan_files(&root.to_string_lossy(), &std::collections::HashSet::new());
+
+        let paths: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["Work/Q3/plan.pdf", "a.txt"], "sorted, and always '/'-separated");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scan_skips_dot_folders_and_page_mirrors() {
+        let root = scratch("skip");
+        put(&root, ".obsidian/workspace.json", b"{}");
+        put(&root, ".DS_Store", b"junk");
+        put(&root, "Daily/2026-08-27.md", b"# today");
+        put(&root, "Daily/photo.jpg", b"img");
+
+        let mut pages = std::collections::HashSet::new();
+        pages.insert("Daily/2026-08-27.md".to_string());
+        let found = scan_files(&root.to_string_lossy(), &pages);
+
+        let paths: Vec<&str> = found.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["Daily/photo.jpg"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_scan_of_a_folder_that_is_not_there_is_empty_not_an_error() {
+        // The vault folder can be on a drive that isn't mounted yet. That must degrade to "no files
+        // this round", never take sync down with it.
+        let missing = std::env::temp_dir().join("pushin_scan_definitely_not_here");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(scan_files(&missing.to_string_lossy(), &std::collections::HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn hashing_a_file_and_hashing_its_bytes_agree() {
+        // `hash_file` streams in 64 KB reads and `hash_bytes` works in memory; the receiver verifies
+        // with one what the sender indexed with the other, so a disagreement would reject every
+        // file over 64 KB.
+        let root = scratch("hash");
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+        put(&root, "big.bin", &body);
+        assert_eq!(hash_file(&root.join("big.bin")).unwrap(), hash_bytes(&body));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_excluded_covers_dot_components_at_any_depth() {
+        let pages = std::collections::HashSet::new();
+        assert!(is_excluded(".git/config", &pages));
+        assert!(is_excluded("Work/.git/config", &pages));
+        assert!(is_excluded("Work/.hidden.pdf", &pages));
+        assert!(!is_excluded("Work/visible.pdf", &pages));
+        // A page mirror is excluded by exact path, not by extension: another .md is fair game.
+        let mut pages = std::collections::HashSet::new();
+        pages.insert("Work/Plan.md".to_string());
+        assert!(is_excluded("Work/Plan.md", &pages));
+        assert!(!is_excluded("Work/Other.md", &pages));
+    }
+
+    #[test]
+    fn deleting_a_file_that_is_already_gone_is_success() {
+        // Two devices can delete the same attachment at once; the second delete to arrive must not
+        // error, because the end state it wanted is already true.
+        let root = scratch("delete");
+        assert!(delete_file(&root.to_string_lossy(), "never-existed.txt").is_ok());
+        put(&root, "real.txt", b"x");
+        assert!(delete_file(&root.to_string_lossy(), "real.txt").is_ok());
+        assert!(!root.join("real.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bytes_written_through_an_unsafe_path_never_land() {
+        // Same boundary as `write_file`, on the path a PEER supplies rather than a page title.
+        let root = scratch("unsafebytes");
+        let err = write_bytes(&root.to_string_lossy(), "../escaped.bin", b"nope").unwrap_err();
+        assert!(err.to_string().contains("unsafe vault path"), "got {err}");
+        assert!(!root.parent().unwrap().join("escaped.bin").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

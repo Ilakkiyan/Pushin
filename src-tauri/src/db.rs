@@ -28,6 +28,7 @@ const MIGRATION_0019: &str = include_str!("../migrations/0019_ics_subscriptions.
 const MIGRATION_0020: &str = include_str!("../migrations/0020_google_link.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_task_missed.sql");
 const MIGRATION_0022: &str = include_str!("../migrations/0022_ics_sync.sql");
+const MIGRATION_0023: &str = include_str!("../migrations/0023_vault_file_sync.sql");
 
 /// 0022's uuid backfill for `ics_subscriptions`, shared with its test so the two can't drift.
 ///
@@ -37,6 +38,23 @@ const MIGRATION_0022: &str = include_str!("../migrations/0022_ics_sync.sql");
 /// merges them. Restricted to URLs appearing once locally: a pre-existing local duplicate would
 /// otherwise collide on the unique index mid-migration.
 pub(crate) const ICS_UUID_BACKFILL: &str = "UPDATE ics_subscriptions SET uuid = 'ics-' || lower(hex(url))      WHERE url IN (SELECT url FROM ics_subscriptions GROUP BY url HAVING count(*) = 1)";
+
+/// 0023's uuid derivation for `vault_file_index`, shared with its test so the two can't drift.
+/// Same reasoning as [`ICS_UUID_BACKFILL`]: the id must be a pure function of the file's path so
+/// two devices holding the same attachment independently agree on it instead of colliding on the
+/// UNIQUE(rel_path) index. Applied on migrate for any pre-existing rows; new rows get it from
+/// [`vault_file_uuid`] at insert time.
+pub(crate) const VAULT_FILE_UUID_BACKFILL: &str =
+    "UPDATE vault_file_index SET uuid = 'vf-' || lower(hex(rel_path)) WHERE uuid IS NULL";
+
+/// The deterministic sync id for a vault file, derived from its vault-relative path.
+pub fn vault_file_uuid(rel_path: &str) -> String {
+    let mut out = String::from("vf-");
+    for b in rel_path.as_bytes() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
 
 pub fn open(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -157,6 +175,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute(ICS_UUID_BACKFILL, [])?;
         conn.pragma_update(None, "user_version", 22)?;
     }
+    if version < 23 {
+        // File-level vault sync: `vault_file_index` (shared, synced) + `vault_file_seen`
+        // (device-local scan cache). Same late-arrival dance as 0020/0022 — the table is created
+        // here, then given 0015's sync columns/triggers from its own TableSpec.
+        conn.execute_batch(MIGRATION_0023)?;
+        let spec = crate::sync::schema::spec("vault_file_index").expect("vault_file_index is a synced table");
+        conn.execute_batch(&crate::sync::schema::table_sync_sql(spec))?;
+        conn.execute(VAULT_FILE_UUID_BACKFILL, [])?;
+        conn.pragma_update(None, "user_version", 23)?;
+    }
     ensure_booking_public_fields(conn)?;
     Ok(())
 }
@@ -253,6 +281,84 @@ pub fn page_id_for_rel_path(conn: &Connection, rel_path: &str) -> Result<Option<
     Ok(conn
         .query_row("SELECT id FROM notes WHERE rel_path = ?1 LIMIT 1", params![rel_path], |r| r.get(0))
         .optional()?)
+}
+
+// ---------- Vault file index (file-level vault sync) ----------
+
+/// One row of the shared vault file index: a file that exists in the vault on some device, and the
+/// content address its bytes are fetched by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultFileRow {
+    pub rel_path: String,
+    pub hash: String,
+    pub size: i64,
+}
+
+/// Every page-mirror path in the vault, as the exclusion set [`crate::vault::scan_files`] wants.
+/// A page's `.md` file is re-derived from its `notes` row on each device, so the file itself must
+/// never enter the file index.
+pub fn page_rel_paths(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT rel_path FROM notes WHERE rel_path IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// The whole shared file index, keyed by vault-relative path.
+pub fn vault_file_index(conn: &Connection) -> Result<std::collections::HashMap<String, VaultFileRow>> {
+    let mut stmt = conn.prepare("SELECT rel_path, hash, size FROM vault_file_index")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(VaultFileRow { rel_path: r.get(0)?, hash: r.get(1)?, size: r.get(2)? })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).map(|f| (f.rel_path.clone(), f)).collect())
+}
+
+/// Record a file's current content hash in the shared index.
+///
+/// The `WHERE hash <> excluded.hash` guard is load-bearing, not an optimisation: SQLite fires
+/// `AFTER UPDATE` even when an UPDATE writes identical values, so an unguarded upsert would mark
+/// the row dirty on every rescan and have two devices pushing an unchanged file to each other
+/// forever. The `uuid` is supplied (not left to the insert trigger) so both devices derive the same
+/// id for the same path — see [`VAULT_FILE_UUID_BACKFILL`].
+pub fn upsert_vault_file(conn: &Connection, rel_path: &str, hash: &str, size: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO vault_file_index(rel_path, hash, size, updated_at, uuid) VALUES(?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(rel_path) DO UPDATE SET hash = excluded.hash, size = excluded.size, updated_at = excluded.updated_at \
+         WHERE vault_file_index.hash <> excluded.hash",
+        params![rel_path, hash, size, now_iso(), vault_file_uuid(rel_path)],
+    )?;
+    Ok(())
+}
+
+/// Drop a file from the shared index — the delete trigger leaves a tombstone, so peers remove their
+/// copy of the file too.
+pub fn remove_vault_file(conn: &Connection, rel_path: &str) -> Result<()> {
+    conn.execute("DELETE FROM vault_file_index WHERE rel_path = ?1", params![rel_path])?;
+    Ok(())
+}
+
+/// The device-local scan cache: `rel_path -> (mtime, size, hash)` as of the last time we hashed it.
+/// Lets a rescan skip re-reading an unchanged 80 MB attachment. Never synced (see the 0023
+/// migration) — mtime differs on every device by construction.
+pub fn vault_file_seen(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64, String)>> {
+    let mut stmt = conn.prepare("SELECT rel_path, mtime, size, hash FROM vault_file_seen")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn set_vault_file_seen(conn: &Connection, rel_path: &str, mtime: i64, size: i64, hash: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO vault_file_seen(rel_path, mtime, size, hash) VALUES(?1, ?2, ?3, ?4) \
+         ON CONFLICT(rel_path) DO UPDATE SET mtime = excluded.mtime, size = excluded.size, hash = excluded.hash",
+        params![rel_path, mtime, size, hash],
+    )?;
+    Ok(())
+}
+
+pub fn forget_vault_file_seen(conn: &Connection, rel_path: &str) -> Result<()> {
+    conn.execute("DELETE FROM vault_file_seen WHERE rel_path = ?1", params![rel_path])?;
+    Ok(())
 }
 
 // ---------- Projects ----------

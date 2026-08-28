@@ -70,6 +70,19 @@ pub const TABLES: &[TableSpec] = &[
     // Embeddings are re-derived locally; never ship 384-dim vectors.
     TableSpec { name: "notes", fks: &[("parent_id", "notes")], poly: None,
         skip: &["embedding", "embedding_model"], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
+    // The vault's FILE index — one row per file in the vault folder that is not a page mirror
+    // (attachments, PDFs, images). The row carries the content hash + size; the BYTES travel
+    // separately, in the blob phase of a session (see `sync::blobs` and `protocol::run_session`),
+    // because a changeset is metadata and a 40 MB PDF is not.
+    //
+    // Page `.md` files are deliberately NOT indexed: a page already replicates as a `notes` row and
+    // each device rewrites its own file from the rule-based path, so syncing the file too would put
+    // two writers on one path and fight the vault watcher's echo guard. Same reasoning that keeps
+    // embeddings and mirrored .ics events off the wire — re-derivable locally, so shipping them
+    // buys nothing and costs churn.
+    //
+    // `uuid` is derived from `rel_path` (`db::vault_file_uuid`), not random — see the 0023 migration.
+    TableSpec { name: "vault_file_index", fks: &[], poly: None, skip: &[], secrets: &[], added_in: 23 },
     TableSpec { name: "tasks", fks: &[("project_id", "projects")], poly: None, skip: &[], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
     TableSpec { name: "bookings",
         fks: &[("event_type_id", "event_types"), ("event_id", "events")], poly: None, skip: &[], secrets: &[], added_in: SYNC_MIGRATION_VERSION },
