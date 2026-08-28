@@ -26,6 +26,8 @@ vi.mock("../lib/ipc", () => {
       updatePage: vi.fn().mockResolvedValue(page(1)),
       deletePage: vi.fn().mockResolvedValue([page(2)]),
       movePage: vi.fn().mockResolvedValue([page(1)]),
+      createFolder: vi.fn().mockResolvedValue(page(6, { title: "Work", isFolder: true })),
+      renamePage: vi.fn().mockResolvedValue([page(1, { title: "Renamed" })]),
       entityPages: vi.fn().mockResolvedValue([]),
       linkPageEntity: vi.fn().mockResolvedValue(undefined),
       captureNote: vi.fn().mockResolvedValue(undefined),
@@ -40,7 +42,16 @@ import { useStore } from "./store";
 import { api } from "../lib/ipc";
 
 const reset = () =>
-  useStore.setState({ view: "calendar", currentPageId: null, pages: [], inbox: [], captureOpen: false });
+  useStore.setState({
+    view: "calendar",
+    space: "planner",
+    currentPageId: null,
+    pages: [],
+    inbox: [],
+    captureOpen: false,
+    openPageIds: [],
+    vaultFolderId: null,
+  });
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -108,6 +119,146 @@ describe("store navigation + vault actions", () => {
     useStore.setState({ currentPageId: 2 });
     await useStore.getState().deletePage(99);
     expect(useStore.getState().currentPageId).toBe(2);
+  });
+});
+
+// The "Open" switcher is a working set, so its invariants are about ORDER and about never
+// outliving the pages it names. Every route into the editor funnels through one helper
+// (`openState`) precisely so these hold no matter which entry point was used.
+describe("store — the open-pages switcher", () => {
+  it("tracks each opened page, most-recently-opened last", () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.openPage(2);
+    expect(useStore.getState().openPageIds).toEqual([1, 2]);
+  });
+
+  it("re-opening a page moves it to the end instead of duplicating it", () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.openPage(2);
+    s.openPage(1);
+    expect(useStore.getState().openPageIds).toEqual([2, 1]);
+  });
+
+  it("registers pages opened by every other route, not just openPage", async () => {
+    // A new entry point that forgets to register leaves the switcher lying about what is open.
+    await useStore.getState().createPage(null);
+    await useStore.getState().openDaily("2026-06-14");
+    await useStore.getState().openEntityNote("task", 42, "Write slides");
+    // 5 from createPage, 9 from the daily note, then openEntityNote reuses 5 — which moves it back
+    // to the end rather than duplicating it, across two different entry points.
+    expect(useStore.getState().openPageIds).toEqual([9, 5]);
+    expect(useStore.getState().currentPageId).toBe(5);
+  });
+
+  it("closing a background page leaves the active one alone", () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.openPage(2);
+    s.closePage(1);
+    const after = useStore.getState();
+    expect(after.openPageIds).toEqual([2]);
+    expect(after.currentPageId).toBe(2);
+    expect(after.view).toBe("vault");
+  });
+
+  it("closing the active page falls back to the previous one", () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.openPage(2);
+    s.closePage(2);
+    const after = useStore.getState();
+    expect(after.openPageIds).toEqual([1]);
+    expect(after.currentPageId).toBe(1);
+    expect(after.view).toBe("vault"); // still in the editor, on the neighbour
+  });
+
+  it("closing the last open page returns to the browser rather than an empty editor", () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.closePage(1);
+    const after = useStore.getState();
+    expect(after.openPageIds).toEqual([]);
+    expect(after.currentPageId).toBeNull();
+    expect(after.view).toBe("files");
+  });
+
+  it("closing a page that was never open changes nothing", () => {
+    useStore.getState().openPage(1);
+    useStore.getState().closePage(99);
+    expect(useStore.getState().openPageIds).toEqual([1]);
+    expect(useStore.getState().currentPageId).toBe(1);
+  });
+
+  it("deleting a page drops it from the switcher", async () => {
+    const s = useStore.getState();
+    s.openPage(1);
+    s.openPage(2);
+    await useStore.getState().deletePage(1);
+    expect(useStore.getState().openPageIds).toEqual([2]);
+  });
+});
+
+describe("store — the file browser", () => {
+  it("openFolder points the browser at a folder and enters the vault space", () => {
+    useStore.getState().openFolder(6);
+    const s = useStore.getState();
+    expect(s.vaultFolderId).toBe(6);
+    expect(s.view).toBe("files");
+    expect(s.space).toBe("vault");
+  });
+
+  it("openFolder(null) is the vault root", () => {
+    useStore.setState({ vaultFolderId: 6 });
+    useStore.getState().openFolder(null);
+    expect(useStore.getState().vaultFolderId).toBeNull();
+  });
+
+  it("creating a folder refreshes the tree WITHOUT opening an editor", async () => {
+    // A folder is a container, not a document — creating one must leave you where you are.
+    useStore.setState({ view: "files", vaultFolderId: null });
+    const folder = await useStore.getState().createFolder("Work", null);
+    expect(api.createFolder).toHaveBeenCalledWith("Work", null);
+    expect(folder.isFolder).toBe(true);
+    const s = useStore.getState();
+    expect(s.currentPageId).toBeNull();
+    expect(s.view).toBe("files");
+    expect(s.openPageIds).toEqual([]);
+    expect(api.listPages).toHaveBeenCalled();
+  });
+
+  it("createFolder defaults to the vault root when no parent is given", async () => {
+    await useStore.getState().createFolder("Work");
+    expect(api.createFolder).toHaveBeenCalledWith("Work", null);
+  });
+
+  it("renamePage stores the refreshed tree the backend returns", async () => {
+    await useStore.getState().renamePage(1, "Renamed");
+    expect(api.renamePage).toHaveBeenCalledWith(1, "Renamed");
+    expect(useStore.getState().pages[0].title).toBe("Renamed");
+  });
+
+  it("deleting the folder you are standing in returns you to the root", async () => {
+    useStore.setState({ vaultFolderId: 6, view: "files" });
+    await useStore.getState().deletePage(6);
+    expect(useStore.getState().vaultFolderId).toBeNull();
+  });
+
+  it("deleting some other folder leaves your location alone", async () => {
+    useStore.setState({ vaultFolderId: 6 });
+    await useStore.getState().deletePage(99);
+    expect(useStore.getState().vaultFolderId).toBe(6);
+  });
+
+  it("the files view belongs to the vault space, and Back still restores the planner", () => {
+    useStore.getState().setView("projects");
+    useStore.getState().setView("files");
+    expect(useStore.getState().space).toBe("vault");
+    useStore.getState().exitVault();
+    const s = useStore.getState();
+    expect(s.space).toBe("planner");
+    expect(s.view).toBe("projects");
   });
 });
 

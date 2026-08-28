@@ -2396,6 +2396,104 @@ mod tests {
         assert!(graph.nodes.iter().any(|n| n.id == child), "pages are still in it");
     }
 
+    /// EVERY query that builds a `Page` must select `is_folder`, including the two that alias the
+    /// table as `n.`. Adding the column to five of the seven compiles perfectly and fails at runtime
+    /// with `Invalid column name: is_folder` — which is exactly how this shipped the first time, and
+    /// only on the code paths a test happened to exercise. This walks all seven so the next column
+    /// added to `Page` cannot repeat it.
+    #[test]
+    fn every_query_that_returns_a_page_selects_the_whole_row() {
+        let conn = mem();
+        let folder = insert_folder(&conn, "Work", None).unwrap();
+        let target = insert_page(&conn, "Target", Some(folder), "the target page", None, None, None).unwrap();
+        let source = insert_page(&conn, "Source", None, "mentions Target in its body", None, None, None).unwrap();
+        set_page_links(&conn, source, &["Target".to_string()]).unwrap();
+        link_entity(&conn, target, "task", 42).unwrap();
+        capture(&conn, "an inbox capture", None, None).unwrap();
+
+        // Each of these maps rows through `row_to_page`; a missing column throws rather than
+        // returning an empty set, so a bare unwrap is the assertion.
+        // 4 = folder + 2 pages + the inbox capture. `list_pages` filters archived and AI-memory
+        // rows but NOT inbox ones; the frontend's `browsablePages` is what keeps captures out of
+        // the tree. Pinned because it looks like an off-by-one until you know.
+        assert_eq!(list_pages(&conn).unwrap().len(), 4, "list_pages");
+        assert_eq!(get_page(&conn, target).unwrap().id, target, "get_page");
+        // 2 = "Target" by title + "Source" whose body mentions it. Never the folder.
+        let hits = search_pages(&conn, "target").unwrap();
+        assert_eq!(hits.len(), 2, "search_pages covers title and body");
+        assert!(!hits.iter().any(|p| p.id == folder), "and still never returns a folder");
+        assert_eq!(page_backlinks(&conn, target).unwrap().len(), 1, "page_backlinks (aliased)");
+        assert_eq!(entity_pages(&conn, "task", 42).unwrap().len(), 1, "entity_pages (aliased)");
+        assert_eq!(list_inbox(&conn).unwrap().len(), 1, "list_inbox");
+        unlinked_mentions(&conn, target).unwrap(); // may be empty; it must not throw
+    }
+
+    /// The Context Engine's recall spine must not index folders. A folder has no body, so it would
+    /// enter the index as a bare title and could then surface as "relevant context" in the planner
+    /// prompt or an ask-your-vault answer — an empty container cited as a source.
+    #[test]
+    fn folders_stay_out_of_the_recall_index() {
+        let conn = mem();
+        let folder = insert_folder(&conn, "Groceries", None).unwrap();
+        let page = insert_page(&conn, "Groceries list", None, "milk, bread, coffee", None, None, None).unwrap();
+
+        let indexed = entities_for_index(&conn).unwrap();
+        let page_ids: Vec<i64> = indexed.iter().filter(|i| i.kind == EntityKind::Page).map(|i| i.id).collect();
+        assert!(page_ids.contains(&page), "a real page is indexed");
+        assert!(!page_ids.contains(&folder), "a folder is not");
+    }
+
+    /// The upgrade path, not the fresh-install one: a note that existed before 0024 must come back
+    /// as a plain page. `NOT NULL DEFAULT 0` makes this true, and a future migration that forgets
+    /// the default would turn every existing note into a folder on upgrade.
+    #[test]
+    fn notes_that_predate_the_folder_column_are_not_folders() {
+        let conn = mem();
+        // Insert bypassing `insert_page` so nothing sets `is_folder` explicitly.
+        conn.execute(
+            "INSERT INTO notes(content, title, sort_order, created_at, updated_at)
+             VALUES('legacy body', 'Legacy', 0, '2026-01-01T00:00:00', '2026-01-01T00:00:00')",
+            [],
+        )
+        .unwrap();
+        let page = list_pages(&conn).unwrap().into_iter().next().unwrap();
+        assert!(!page.is_folder, "an existing note stays a document across the migration");
+        assert_eq!(search_pages(&conn, "legacy").unwrap().len(), 1, "and is still findable");
+    }
+
+    /// Folders nest, and a folder placed in a folder is reachable by walking `parent_id` — the
+    /// browser's breadcrumb and the sidebar tree both depend on it.
+    #[test]
+    fn folders_nest_and_reparent_like_any_other_page() {
+        let conn = mem();
+        let outer = insert_folder(&conn, "Work", None).unwrap();
+        let inner = insert_folder(&conn, "Q3", None).unwrap();
+        let leaf = insert_page(&conn, "Kickoff", None, "", None, None, None).unwrap();
+
+        move_page(&conn, inner, Some(outer), 0.0).unwrap();
+        move_page(&conn, leaf, Some(inner), 0.0).unwrap();
+
+        let pages = list_pages(&conn).unwrap();
+        let by = |id: i64| pages.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(by(inner).parent_id, Some(outer));
+        assert_eq!(by(leaf).parent_id, Some(inner));
+        assert!(by(inner).is_folder, "a folder stays a folder after being moved");
+    }
+
+    /// New siblings land after the existing ones rather than all sharing sort_order 0, which is what
+    /// keeps the browser's ordering stable instead of falling back on insertion id.
+    #[test]
+    fn a_new_folder_is_placed_after_its_existing_siblings() {
+        let conn = mem();
+        let first = insert_folder(&conn, "A", None).unwrap();
+        let second = insert_folder(&conn, "B", None).unwrap();
+        let page = insert_page(&conn, "C", None, "", None, None, None).unwrap();
+        let pages = list_pages(&conn).unwrap();
+        let order = |id: i64| pages.iter().find(|p| p.id == id).unwrap().sort_order;
+        assert!(order(first) < order(second), "the second folder sorts after the first");
+        assert!(order(second) < order(page), "a page added later sorts after both");
+    }
+
     /// Deleting a folder must never take its contents with it — the schema reparents them to the
     /// top level, which is what the UI promises in its confirm dialog.
     #[test]

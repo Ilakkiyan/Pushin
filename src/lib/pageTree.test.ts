@@ -92,6 +92,62 @@ describe("journalEntries", () => {
   });
 });
 
+describe("browsablePages — the boundaries", () => {
+  it("keeps a folder that is itself inside a folder", () => {
+    const pages = [mk(1, { isFolder: true }), mk(2, { isFolder: true, parentId: 1 })];
+    expect(browsablePages(pages).map((p) => p.id)).toEqual([1, 2]);
+  });
+  it("drops a daily note even if something parented it to a folder", () => {
+    // Nothing should do this, but a daily note belongs to the Journal wherever its parent points.
+    const pages = [mk(1, { isFolder: true }), mk(2, { dailyDate: "2026-06-14", parentId: 1 })];
+    expect(browsablePages(pages).map((p) => p.id)).toEqual([1]);
+  });
+  it("is empty for an empty vault rather than throwing", () => {
+    expect(browsablePages([])).toEqual([]);
+  });
+});
+
+describe("folderPath — the awkward inputs", () => {
+  it("is empty for an id that no longer exists", () => {
+    // A folder deleted on another device while you were standing in it.
+    expect(folderPath([mk(1)], 404)).toEqual([]);
+  });
+  it("handles a folder whose parent has been deleted", () => {
+    const orphan = [mk(2, { title: "Q3", isFolder: true, parentId: 99 })];
+    expect(folderPath(orphan, 2).map((p) => p.title)).toEqual(["Q3"]);
+  });
+  it("walks a deep chain in root-first order", () => {
+    const deep = [
+      mk(1, { title: "A", isFolder: true }),
+      mk(2, { title: "B", isFolder: true, parentId: 1 }),
+      mk(3, { title: "C", isFolder: true, parentId: 2 }),
+      mk(4, { title: "D", isFolder: true, parentId: 3 }),
+    ];
+    expect(folderPath(deep, 4).map((p) => p.title)).toEqual(["A", "B", "C", "D"]);
+  });
+});
+
+describe("JOURNAL_ID", () => {
+  it("is negative so it can never collide with a real page id", () => {
+    // Page ids come from SQLite rowids, which start at 1.
+    expect(JOURNAL_ID).toBeLessThan(0);
+  });
+});
+
+describe("sortEntries — the tie-breaks", () => {
+  it("sorts case-insensitively", () => {
+    const entries = [mk(1, { title: "banana" }), mk(2, { title: "Apple" })];
+    expect(sortEntries(entries).map((p) => p.title)).toEqual(["Apple", "banana"]);
+  });
+  it("keeps folders ahead of pages even when the page sorts first alphabetically", () => {
+    const entries = [mk(1, { title: "aaa" }), mk(2, { title: "zzz", isFolder: true })];
+    expect(sortEntries(entries).map((p) => p.title)).toEqual(["zzz", "aaa"]);
+  });
+  it("handles an empty list", () => {
+    expect(sortEntries([])).toEqual([]);
+  });
+});
+
 describe("folderCount", () => {
   const pages = [
     mk(1, { isFolder: true }),

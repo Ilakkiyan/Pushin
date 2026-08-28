@@ -396,6 +396,7 @@ export default function VaultBrowserPane() {
             {visible.map((page) => (
               <div
                 key={page.id}
+                data-entry-id={page.id}
                 {...dragProps(page)}
                 {...dropProps(page)}
                 onClick={() => renaming !== page.id && open(page)}
@@ -431,6 +432,7 @@ export default function VaultBrowserPane() {
             {visible.map((page) => (
               <div
                 key={page.id}
+                data-entry-id={page.id}
                 {...dragProps(page)}
                 {...dropProps(page)}
                 onClick={() => renaming !== page.id && open(page)}
