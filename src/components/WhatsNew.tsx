@@ -36,7 +36,7 @@ const FEATURES: Feature[] = [
     icon: FolderSync,
     since: "0.8.4",
     title: "Your files travel with your notes",
-    body: "Your notes already travelled between paired devices. Now the things sitting next to them do too — the attachments, PDFs and images in your vault folder. Set that folder under Settings ▸ Vault folder. A device still on the old version keeps syncing everything else exactly as before.",
+    body: "Your notes already travelled between paired devices. Now the things sitting next to them do too — the attachments, PDFs and images in your vault folder. Set that folder under Settings ▸ Vault folder. Both devices need this version for files to move between them; one still on the old version keeps syncing everything else exactly as before.",
   },
   {
     icon: Combine,
