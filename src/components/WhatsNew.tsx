@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ArrowRight, CalendarPlus, Combine, Link2, MessagesSquare, RotateCcw, Sparkles, Sun, Zap } from "lucide-react";
+import { ArrowRight, CalendarPlus, Combine, FolderOpen, FolderSync, Layers, Link2, MessagesSquare, RotateCcw, Sparkles, Sun, Zap } from "lucide-react";
 import { isNewer } from "../lib/version";
 
 export type Feature = {
@@ -20,6 +20,24 @@ export type Feature = {
  * headline few — this is a welcome, not release notes. Newest first.
  */
 const FEATURES: Feature[] = [
+  {
+    icon: FolderOpen,
+    since: "0.8.4",
+    title: "Your vault is a place now",
+    body: "Open the vault and you land in a file browser rather than whatever page you had open last — folders and documents as cards or a list, with a breadcrumb back to the top. Make folders, drag things into them, rename in place. Your daily notes file themselves under Journal.",
+  },
+  {
+    icon: Layers,
+    since: "0.8.4",
+    title: "The pages you're working across",
+    body: "Everything you open stays listed under Open in the sidebar, so moving between two documents is one click instead of hunting the tree for them again. Close one and you land back on the one before it.",
+  },
+  {
+    icon: FolderSync,
+    since: "0.8.4",
+    title: "Your files travel with your notes",
+    body: "Your notes already travelled between paired devices. Now the things sitting next to them do too — the attachments, PDFs and images in your vault folder. Set that folder under Settings ▸ Vault folder. A device still on the old version keeps syncing everything else exactly as before.",
+  },
   {
     icon: Combine,
     since: "0.8.3",

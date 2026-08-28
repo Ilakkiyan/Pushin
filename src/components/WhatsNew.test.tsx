@@ -110,6 +110,17 @@ describe("WhatsNew — rendering", () => {
     expect(screen.getByText("Version 0.8.3")).toBeInTheDocument();
   });
 
+  it("announces this release's headline changes", () => {
+    // The one assertion tied to the REAL card list: a release that forgets to add its cards ships an
+    // update whose "what's new" screen is silently empty, and nobody notices until it's out.
+    render(<WhatsNew version="0.8.4" from="0.8.3" onDone={() => {}} />);
+    expect(screen.getByText(/Your vault is a place now/)).toBeInTheDocument();
+    expect(screen.getByText(/The pages you're working across/)).toBeInTheDocument();
+    expect(screen.getByText(/Your files travel with your notes/)).toBeInTheDocument();
+    // ...and not the previous release's, which this user already saw.
+    expect(screen.queryByText(/One task, however it's split/)).not.toBeInTheDocument();
+  });
+
   it("still renders its heading and CTA when the range is empty", () => {
     // App skips mounting it in this case, but the component must not break if it is mounted anyway.
     render(<WhatsNew version="0.8.3" from="0.8.3" onDone={() => {}} />);

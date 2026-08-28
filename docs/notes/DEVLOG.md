@@ -11,6 +11,54 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ## 2026-08-27
 
+### v0.8.4 — the vault becomes a place, and files follow the notes ✅
+Two changesets, built in parallel sessions against one working tree: the vault gets a Drive-style
+browser with real folders, and device sync learns to carry the vault's *files* and not just its rows.
+
+**The vault browser + folders (migration `0024_page_folders`)**
+- **A folder is a `notes` row with `is_folder = 1`**, not a table of its own. The page tree,
+  `move_page`, `sort_order` and 0015's device-sync triggers therefore all applied unchanged. The
+  price is subtractive and easy to get wrong: a folder rides along in *everything* that reads pages,
+  so it has to be explicitly excluded from `search_pages`, `title_index` (or `[[Work]]` resolves to a
+  folder named Work instead of the page), `page_graph`, and `entities_for_index`. See CLAUDE.md
+  gotcha 20 — seven SELECTs feed `row_to_page` and two are table-aliased, which is how a version that
+  compiled cleanly failed at runtime with `Invalid column name: is_folder`.
+- **`create_folder` / `rename_page` are their own commands.** `update_page` rewrites the body and
+  re-embeds it, so renaming through it would blank a folder and force a full document round-trip on
+  a page.
+- **The Journal is a virtual folder** (`JOURNAL_ID = -1`), not a row. Daily notes are keyed by
+  `daily_date` and created parentless by `get_or_create_daily`; giving them a physical parent would
+  have meant teaching `daily_note`, the markdown file mirror and the graph about it. It is always
+  present at the root — a folder that appears only once you have used the thing it holds is one
+  nobody discovers — so the root is never an empty grid and the first-run nudge sits *alongside* the
+  listing rather than replacing it.
+- **Two entry points, two questions.** The sidebar's Vault button and `g v` land on `files` (the
+  browser, rooted) — "where is it?"; `vault` is the editor — "what was I writing?". Opening a folder
+  browses, opening a document hands off.
+- **`openPageIds`** backs the sidebar's "Open" switcher: session-only, most-recent-last, fed by one
+  `openState` helper that every route into the editor passes through, so a new entry point cannot
+  leave the switcher lying about what is open.
+- One React trap worth recording: the rename field was first written as a component defined inside
+  the pane's render. That is a new component *type* every render, so React remounted it and the input
+  lost focus after the first keystroke. It is a plain render function now, and the test types a whole
+  word rather than one character precisely to catch a regression.
+
+**Vault file sync (migration `0023_vault_file_sync`)**
+- The vault's files replicate alongside its rows: the index syncs as ordinary rows, the bytes move in
+  their own capability-negotiated phase, so a v0.8.4 device paired with a v0.8.3 one syncs pages
+  exactly as before and skips the file step. Files over `MAX_SYNC_FILE` (100 MB) stay local.
+- A Diagnostics panel under Settings ▸ Devices surfaces what sync actually did on this device.
+- **Status: live-unverified across two physical machines**, the same footing as cross-device row
+  sync. Exercised end to end in tests (attachments crossing, multi-chunk reassembly, both
+  directions, deletes propagating, old-peer and no-vault-folder fallbacks).
+
+**Verification**
+`npm run verify` — Rust **466**, Vitest **308**, tsc + production build clean, Playwright **14**.
+Up from 430 / 271 / 13 in v0.8.3. The browser was also driven by hand through the real app (mocked
+IPC) and screenshotted in both grid and list layouts before release.
+
+---
+
 ### v0.8.3 — a split task that comes back together, and seven quiet failures ✅
 A correctness pass across every surface, driven by building the tests that were missing. The suite
 grew from 329/109/10 to **430 Rust / 271 Vitest / 13 Playwright**, and the model eval from 72 cases
