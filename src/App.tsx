@@ -4,7 +4,7 @@ import { useStore } from "./state/store";
 import Sidebar from "./components/Sidebar";
 import PaneErrorBoundary from "./components/PaneErrorBoundary";
 import ConflictBanner from "./components/ConflictBanner";
-import UpdateBanner from "./components/UpdateBanner";
+import UpdatePrompt from "./components/UpdatePrompt";
 import OpeningAnimation from "./components/OpeningAnimation";
 import WelcomeBack from "./components/WelcomeBack";
 import WhatsNew, { hasNewFeatures } from "./components/WhatsNew";
@@ -300,6 +300,9 @@ export default function App() {
       {guide}
       {welcome}
       {whatsNewEl}
+      {/* Updates land by themselves: this checks, downloads in the background, and only then
+          asks. Held back while the opening sequence owns the window. Desktop only. */}
+      {!isMobile && <UpdatePrompt hold={!splashDone || !!guide || !!welcome || !!whatsNewEl} />}
       {!isMobile && <TitleBar />}
       {isMobile ? (
         <div className="flex-1 min-h-0 flex flex-col">
@@ -312,7 +315,6 @@ export default function App() {
         <div className="flex-1 min-h-0 flex">
           <Sidebar />
           <div className="flex-1 min-w-0 flex flex-col">
-            <UpdateBanner />
             <ConflictBanner />
             <main className="flex-1 min-h-0 flex">
               <PaneErrorBoundary resetKey={view}>

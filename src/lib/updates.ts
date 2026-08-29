@@ -25,26 +25,50 @@ export async function checkForUpdate(): Promise<Update | null> {
   }
 }
 
-/**
- * Download + install the pending update, then relaunch into the new version. `relaunch()` ends the
- * current process, so nothing after a successful call runs. Rejects if the download/install fails.
- */
-export async function installUpdate(update: Update, onProgress?: (p: UpdateProgress) => void): Promise<void> {
+/** Translate the plugin's raw download events into a running {@link UpdateProgress}. */
+function progressReporter(onProgress?: (p: UpdateProgress) => void) {
   let downloaded = 0;
   let total = 0;
-  await update.downloadAndInstall((event) => {
+  return (event: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => {
     switch (event.event) {
       case "Started":
-        total = event.data.contentLength ?? 0;
+        total = event.data?.contentLength ?? 0;
         break;
       case "Progress":
-        downloaded += event.data.chunkLength;
+        downloaded += event.data?.chunkLength ?? 0;
         onProgress?.({ downloaded, total, pct: total > 0 ? Math.round((downloaded / total) * 100) : null });
         break;
       case "Finished":
         onProgress?.({ downloaded: total, total, pct: total > 0 ? 100 : null });
         break;
     }
-  });
+  };
+}
+
+/**
+ * Fetch the update package and stop there, leaving it staged in the backend for a later
+ * {@link installDownloaded}. This is the unattended half: it runs on its own, in the background,
+ * with no UI, so that by the time the user is asked anything there is nothing left to wait for.
+ * Rejects if the download fails, leaving the caller to decide whether that is worth showing.
+ */
+export async function downloadUpdate(update: Update, onProgress?: (p: UpdateProgress) => void): Promise<void> {
+  await update.download(progressReporter(onProgress));
+}
+
+/**
+ * Install an update already fetched by {@link downloadUpdate}, then relaunch into the new version.
+ * `relaunch()` ends the current process, so nothing after a successful call runs.
+ */
+export async function installDownloaded(update: Update): Promise<void> {
+  await update.install();
+  await relaunch();
+}
+
+/**
+ * Download + install the pending update, then relaunch into the new version. `relaunch()` ends the
+ * current process, so nothing after a successful call runs. Rejects if the download/install fails.
+ */
+export async function installUpdate(update: Update, onProgress?: (p: UpdateProgress) => void): Promise<void> {
+  await update.downloadAndInstall(progressReporter(onProgress));
   await relaunch();
 }

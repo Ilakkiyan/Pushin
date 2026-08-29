@@ -9,6 +9,7 @@ import clsx from "clsx";
 import { useStore } from "../state/store";
 import { api, type IcsSubscription, type Settings } from "../lib/ipc";
 import { checkForUpdate, installUpdate } from "../lib/updates";
+import { autoUpdateEnabled, setAutoUpdateEnabled } from "../components/UpdatePrompt";
 import { exportAllPages } from "../lib/vaultExport";
 import { AboutYou, CommitmentList, SleepFields } from "../components/Personalization";
 import AiMemory from "../components/AiMemory";
@@ -144,13 +145,15 @@ export default function SettingsPane() {
   };
 
   // In-app auto-update (desktop). `appVersion` is the running build; `pendingUpdate` holds a found
-  // newer release so the user can install it from here as well as from the launch banner.
+  // newer release so the user can install it from here as well as from the popup that offers it
+  // unprompted. `autoUpdate` governs that popup: off, and nothing downloads until asked.
   const [appVersion, setAppVersion] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateMsg, setUpdateMsg] = useState("");
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installPct, setInstallPct] = useState<number | null>(null);
+  const [autoUpdate, setAutoUpdate] = useState(autoUpdateEnabled);
 
   useEffect(() => {
     api.listIcsSubscriptions().then(setIcsSubs).catch(() => {});
@@ -633,9 +636,22 @@ export default function SettingsPane() {
         <section className="space-y-3">
           <h2 className="text-sm font-semibold flex items-center gap-2"><DownloadCloud className="size-4 text-indigo-400" /> Updates</h2>
           <p className="text-xs text-gray-500">
-            Pushin checks GitHub for a newer release on launch and offers a one-click update. Installing keeps all your
-            data: tasks, notes, people, and settings live outside the app and aren't touched.
+            Pushin looks for a newer release by itself, downloads it in the background, and then asks whether to install
+            it. Installing keeps all your data: tasks, notes, people, and settings live outside the app and aren't
+            touched. You can still check by hand below.
           </p>
+          <label className="flex items-center gap-2 text-sm cursor-pointer">
+            <input
+              type="checkbox"
+              checked={autoUpdate}
+              onChange={(e) => {
+                setAutoUpdateEnabled(e.target.checked);
+                setAutoUpdate(e.target.checked);
+              }}
+              className="accent-indigo-500"
+            />
+            Download updates automatically
+          </label>
           <div className="flex items-center gap-2 flex-wrap">
             {appVersion && <span className="tnum text-xs px-2 py-1 bg-white/5 border border-white/10 text-gray-300">v{appVersion}</span>}
             {pendingUpdate ? (

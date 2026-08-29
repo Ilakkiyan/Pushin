@@ -503,10 +503,12 @@ over a few minutes as the slower platforms finish.
 
 ### Automatic in‑app updates
 
-Once installed, Pushin checks GitHub for a newer release **on launch** and shows an "Update &
-restart" banner (there's also a **Check for updates** button in *Settings → Updates*). Installing an
-update **never touches your data** — your database, downloaded models, and notes live in the OS
-app‑data folder, while the updater only swaps the app itself. This is the official
+Once installed, Pushin keeps itself up to date without being asked. It checks GitHub for a newer
+release on launch and every few hours, downloads it quietly in the background, and then asks once:
+**Install now** or **Later**. Installing takes a few seconds and reopens the app. *Later* asks again
+in eight hours, or on the next launch. You can turn the background download off, or check by hand,
+in *Settings → Updates*. Installing an update **never touches your data**: your database, downloaded
+models, and notes live in the OS app‑data folder, while the updater only swaps the app itself. This is the official
 [Tauri updater](https://v2.tauri.app/plugin/updater/); update artifacts are signed and described by a
 `latest.json` manifest attached to each Release.
 

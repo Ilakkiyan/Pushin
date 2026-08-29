@@ -5,7 +5,7 @@ const relaunch = vi.fn();
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: (...a: unknown[]) => check(...a) }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: (...a: unknown[]) => relaunch(...a) }));
 
-import { checkForUpdate, installUpdate } from "./updates";
+import { checkForUpdate, downloadUpdate, installDownloaded, installUpdate } from "./updates";
 
 // The updater runs unattended on every launch, on machines that are offline, on dev builds with no
 // updater configured, and on mobile where the plugin isn't compiled in at all. A throw on any of
@@ -133,5 +133,40 @@ describe("installUpdate", () => {
       ),
     ).resolves.toBeUndefined();
     expect(seen).toHaveLength(1); // just the Finished report
+  });
+});
+
+describe("downloadUpdate / installDownloaded", () => {
+  // The unattended path fetches first and installs later, so that the popup asking "install now?"
+  // has nothing left to wait for. The two halves must stay separable: downloading must never
+  // install or relaunch behind the user's back.
+  it("downloads without installing or relaunching", async () => {
+    const update = {
+      download: vi.fn(async (cb: (e: unknown) => void) => {
+        cb({ event: "Started", data: { contentLength: 200 } });
+        cb({ event: "Progress", data: { chunkLength: 100 } });
+        cb({ event: "Finished", data: {} });
+      }),
+      install: vi.fn(),
+    } as never;
+    const seen: Array<number | null> = [];
+    await downloadUpdate(update, (p) => seen.push(p.pct));
+
+    expect(seen).toEqual([50, 100]);
+    expect((update as unknown as { install: ReturnType<typeof vi.fn> }).install).not.toHaveBeenCalled();
+    expect(relaunch).not.toHaveBeenCalled();
+  });
+
+  it("installs the staged package and relaunches", async () => {
+    const update = { install: vi.fn(async () => {}) } as never;
+    await installDownloaded(update);
+    expect((update as unknown as { install: ReturnType<typeof vi.fn> }).install).toHaveBeenCalledTimes(1);
+    expect(relaunch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not relaunch when installing the staged package fails", async () => {
+    const update = { install: vi.fn(async () => Promise.reject(new Error("signature mismatch"))) } as never;
+    await expect(installDownloaded(update)).rejects.toThrow(/signature mismatch/);
+    expect(relaunch).not.toHaveBeenCalled();
   });
 });
