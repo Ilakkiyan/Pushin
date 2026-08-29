@@ -167,7 +167,7 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
   over running the suites by hand: it also captures output the `rtk` wrapper would otherwise compress
   away, which once silently ate a full 14-minute `llm_eval` run.
 - Environment specifics (WSL uses the Windows `cargo.exe`; no live llama-server there): memory `build-test-env`.
-- **Backend:** `cargo build`/`cargo test --lib` (**430** tests) with `--manifest-path src-tauri/Cargo.toml`. The Bash cwd resets to project root between calls — use absolute paths or `--manifest-path`.
+- **Backend:** `cargo build`/`cargo test --lib` (**476** tests) with `--manifest-path src-tauri/Cargo.toml`. The Bash cwd resets to project root between calls — use absolute paths or `--manifest-path`.
 - **Frontend:** `npm run build` (`tsc && vite build`); tests `npm test` (Vitest), `npm run test:e2e` (Playwright).
   "CI-only" means CI *runs* it, NOT that you may skip it: **run it locally before tagging a release, and
   after ANY change to nav structure, pane copy, or `_mockBridge.ts`.** It is the only suite that renders the
@@ -181,14 +181,14 @@ See `docs/notes/ARCHITECTURE_NOTES.md` for the per-file map and each subsystem's
 ## Local data (outside the repo, gitignored) — app-data dir `com.pushin.app/`
 `models/*.gguf` (downloaded models) · `bin/llama-server` (+libs, auto-downloaded engine) · `pushin.db` (SQLite).
 
-## Current status (released **v0.8.3**; `release.yml` builds installers for all platforms)
+## Current status (released **v0.8.8**; `release.yml` builds installers for all platforms)
 Full changelog + per-feature status in `docs/notes/ARCHITECTURE_NOTES.md` and `docs/notes/DEVLOG.md`. Headline:
 - **Calendar core:** on-device planning pipeline, auto-scheduler, week/month calendar with drag-to-move/pin + re-plan, conversational create/update/remove, **missed-task rollover** (a task whose day passed unfinished is kicked to the next free slot; pinned blocks included), tasks, habits (draggable + learned time, `0017`), first-run model+engine auto-download, two-way Google sync (leaf fns httpmock-tested; first live connect unverified) — now **shared across paired devices** (`0020_google_link`: one link + a keychain-borne refresh token replicate over the mesh, so connecting once connects them all).
 - **Second brain:** sidebar + Cmd-K palette, Notion vault + `[[wikilinks]]` + backlinks + graph, daily notes, entity links, semantic recall, chat→memory chips, ask-your-vault RAG, quick capture → Inbox, Markdown import, two-way markdown file vault (0016, live-unverified), **Drive-style file browser + folders** (0024: `is_folder` pages, virtual Journal folder, sidebar "Open" switcher).
 - **Context Engine + execution loop:** `entity_index` recall spine feeding planner auto-recall + `vault_ask`; People/CRM; keyword auto-labeling; Daily Briefing + Cmd-K "Run" bar; Focus timer + adaptive scheduler; Meeting Companion; hardened public booking page.
 - **Device sync (pairing proven on loopback, cross-machine still unverified):** private Iroh mesh + changeset log (`0015`), pairing-by-invite, LWW. `two_real_iroh_endpoints_pair_and_converge` runs a real ticket→dial→session between two endpoints in one process. Iroh runs **1.x**: the previous `0.90` pin meant relays accepted the connection but would not route, so cross-network pairing could never work — see ARCHITECTURE_NOTES ▸ Device sync before touching the iroh version.
 - **Shell polish:** frameless `TitleBar`, opening animation, in-app auto-update (v0.5.0+, signed).
-- **Tested:** Rust `cargo test --lib` (**430**) + httpmock, Vitest (**271**, 30 files) + IPC/bridge contract tests, Playwright E2E (**13**), live `llm_eval` **261/276** across 108 cases — the original tier still scores 100% per category; the **hard tier** (`date-math`, `duration-words`, `pronoun-ref`, `ambiguity`, `restraint-hard`, `noisy-input`, `adversarial`, `overload`) is where the remaining gap lives and is the tuning signal. `model_battery` 57–58/58 (one adversarial case bounces), `real_world_eval` 10/12 (run them with `npm run verify:live`, which skips them when no llama-server is on :8080).
+- **Tested:** Rust `cargo test --lib` (**476**) + httpmock, Vitest (**406**, 33 files) + IPC/bridge contract tests, Playwright E2E (**19**), live `llm_eval` **261/276** across 108 cases — the original tier still scores 100% per category; the **hard tier** (`date-math`, `duration-words`, `pronoun-ref`, `ambiguity`, `restraint-hard`, `noisy-input`, `adversarial`, `overload`) is where the remaining gap lives and is the tuning signal. `model_battery` 57–58/58 (one adversarial case bounces), `real_world_eval` 10/12 (run them with `npm run verify:live`, which skips them when no llama-server is on :8080).
 - **Repo:** GitHub `Ilakkiyan/Pushin`; `main` default; releases are version tags.
 
 ## Writing style: no em dashes

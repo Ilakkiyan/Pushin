@@ -9,6 +9,67 @@ Conventions: one `###` entry per change-set; always note verification (tests/bui
 
 ---
 
+## 2026-08-29
+
+### v0.8.8: filing by hand, spell check per page, and updates that arrive on their own ✅
+Three changesets, built in parallel sessions against one working tree, each owned end to end by a
+different session and verified separately before the cut.
+
+**Filing things by hand (`components/ContextMenu.tsx`, `lib/pageDrag.ts`)**
+- The vault browser and the sidebar tree now share one drag vocabulary, so a page can be dragged
+  between them. Drop targets: folder cards and rows, the pane background (files into the folder you
+  are standing in), the **breadcrumb crumbs**, which are the only way to move something back *out* of
+  a folder without navigating there first, and the sidebar's Pages container (top level).
+- **A browser withholds `dataTransfer.getData` during `dragover`**, handing the payload over only on
+  `drop`, so a target that wants to decide whether to accept cannot read the drag it is offered. The
+  old code sidestepped this by accepting any folder on hover. Once targets started refusing invalid
+  drops, that gap became load-bearing: `lib/pageDrag.ts` records the source on `dragstart` in module
+  state (module, not React state, since the drag crosses component trees and a re-render per
+  `dragover` is churn for a value nothing renders), and the `text/page` payload is still what a drop
+  reads. Refusing a target means *not* calling `preventDefault`, so the drag falls through to the
+  container behind it instead of dead-ending.
+- **Two things never move:** the virtual Journal (no row to reparent) and a daily note. The Journal
+  gathers a daily by `daily_date`, not by parent, so filing one into a folder used to look like the
+  note vanishing. It is no longer draggable at all.
+- **Right-click menus** on both surfaces: open, rename in place, new page or folder inside, move back
+  to the vault root, delete. `ContextMenu` is portalled to `document.body` so no scroll container
+  clips it and no transformed ancestor breaks its `position: fixed`; it flips rather than clamps near
+  a viewport edge so the cursor stays outside it, closes on anything that would make its position a
+  lie (click away, Escape, scroll, resize, blur), and is arrow-key walkable. A right-click on a text
+  field is left alone so the rename field keeps its own cut/copy/paste. The sidebar tree gained
+  in-place rename, which it never had.
+- Verified: Vitest +21 on the two vault suites, plus a Playwright test that right-clicks a folder in
+  the real app and renames through the menu.
+
+**Per-page spell check (migration `0025_page_spellcheck`)**
+- `notes.spellcheck INTEGER NOT NULL DEFAULT 1`, the same shape as 0024's `is_folder`, so 0015's
+  dynamic change capture replicates it and every existing note stays checked. The toggle sits at the
+  editor's top left and is remembered for that page alone: a vault holds both prose worth checking
+  and notes full of identifiers, where a squiggle under every second word hides the real typos.
+
+**Updates that arrive on their own**
+- Update checks now download in the background with no UI and only then raise a modal offering
+  Install now or Later, replacing the old always-on banner (`UpdateBanner` is gone, `UpdatePrompt`
+  replaces it). Background download can be turned off under Settings, Updates.
+- **Unproven live:** `check()` throws outside a signed bundle pointed at a real release, so the
+  GitHub round trip cannot be exercised locally and mocked contract tests cover the logic instead.
+  It degrades to silence (`checkForUpdate` swallows errors, so the worst case is no popup and
+  Settings still works). This release is what proves it.
+
+**What's New card versions are a real trap.** `featuresSince` filters with
+`isNewer(f.since, from) && !isNewer(f.since, to)`, so a card tagged with the version the user is
+upgrading *from* is filtered out as already seen. The updater card shipped tagged `0.8.7`, which is
+already released, and would have been invisible to exactly the people upgrading to it. Tag a card
+with the version that carries it, not the one in `package.json` while you write it.
+
+Verified before the cut: `cargo test --lib` 476, Vitest 406 across 33 files, tsc + production build
+clean, Playwright 19. A full `npm run verify` reported Vitest failing, but all 33 suites had died at
+the runner ("Vitest failed to find the runner", then `Cannot read properties of undefined`), not on
+assertions: three sessions were sharing the machine. Re-running it alone was green. Same cause as the
+E2E flake in that window, worth remembering as a shape rather than re-debugging.
+
+---
+
 ## 2026-08-27
 
 ### v0.8.4: the vault becomes a place, and files follow the notes ✅

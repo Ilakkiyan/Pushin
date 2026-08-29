@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { ArrowRight, CalendarPlus, Combine, FolderOpen, FolderSync, Layers, Link2, MessagesSquare, RotateCcw, Sparkles, Sun, Zap } from "lucide-react";
+import { ArrowRight, CalendarPlus, Combine, DownloadCloud, FolderInput, FolderOpen, FolderSync, Layers, Link2, MessagesSquare, RotateCcw, Sparkles, SpellCheck, Sun, Zap } from "lucide-react";
 import { isNewer } from "../lib/version";
 
 export type Feature = {
@@ -20,6 +20,24 @@ export type Feature = {
  * headline few — this is a welcome, not release notes. Newest first.
  */
 const FEATURES: Feature[] = [
+  {
+    icon: FolderInput,
+    since: "0.8.8",
+    title: "File things where you want them",
+    body: "Drag a page onto a folder to file it, in the browser or the sidebar tree, and drag it onto a breadcrumb to lift it back out. Right-click anything for the rest: open, rename in place, make a page or a folder inside, move it back to the top, delete. The sidebar can rename in place now too.",
+  },
+  {
+    icon: SpellCheck,
+    since: "0.8.8",
+    title: "Spell check, per page",
+    body: "Some pages are prose and some are half identifiers and jargon, where a squiggle under every second word hides the real typos. The toggle at the top left of the editor is remembered for that page alone, so lecture notes can stay quiet while everything else keeps being checked.",
+  },
+  {
+    icon: DownloadCloud,
+    since: "0.8.8",
+    title: "Updates arrive on their own",
+    body: "Pushin looks for new versions itself and downloads them quietly in the background. When one is ready it asks, once: install now, and you are on it a few seconds later. No more finding out in Settings that you were three versions behind. If you would rather choose, turn the background download off under Settings, Updates.",
+  },
   {
     icon: FolderOpen,
     since: "0.8.4",
