@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, within, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { Page } from "../lib/ipc";
 
@@ -9,6 +9,8 @@ vi.mock("../lib/ipc", () => ({
     createFolder: vi.fn().mockResolvedValue({ id: 8, title: "New folder", isFolder: true }),
     listPages: vi.fn().mockResolvedValue([]),
     deletePage: vi.fn().mockResolvedValue([]),
+    renamePage: vi.fn().mockResolvedValue([]),
+    movePage: vi.fn().mockResolvedValue([]),
   },
 }));
 // Stub the BlockNote-backed importer so this stays a light jsdom test.
@@ -17,6 +19,7 @@ vi.mock("../lib/import", () => ({ importMarkdownFolder: vi.fn() }));
 import VaultTree, { isAncestor } from "./VaultTree";
 import { JOURNAL_ID } from "../lib/pageTree";
 import { useStore } from "../state/store";
+import { setPageDrag } from "../lib/pageDrag";
 
 const mk = (id: number, over: Partial<Page> = {}): Page => ({
   id,
@@ -244,5 +247,80 @@ describe("VaultTree", () => {
       render(<VaultTree />);
       expect(screen.queryByText("Journal")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("VaultTree - right-click menu", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setPageDrag(null);
+    useStore.setState({
+      pages: [
+        mk(1, { title: "Roadmap" }),
+        mk(2, { title: "Work", isFolder: true }),
+        mk(3, { title: "Kickoff", parentId: 2 }),
+        mk(50, { dailyDate: "2026-06-14", title: "2026-06-14" }),
+      ] as never,
+      currentPageId: null,
+      openPageIds: [],
+      vaultFolderId: null,
+    });
+  });
+
+  /** Right-click the tree row carrying `title`, and hand back the menu that opens. */
+  const rowMenu = (title: string): HTMLElement => {
+    fireEvent.contextMenu(screen.getByText(title).closest("div")!, { clientX: 5, clientY: 5 });
+    return screen.getByRole("menu");
+  };
+
+  it("offers a folder row the create-inside actions a page row has no use for", () => {
+    render(<VaultTree />);
+    const labels = within(rowMenu("Work")).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open", "New page inside", "New folder inside", "Rename", "Move to Vault", "Delete"]);
+  });
+
+  it("offers a page row a sub-page instead of a folder", () => {
+    render(<VaultTree />);
+    const labels = within(rowMenu("Roadmap")).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open", "Add sub-page", "Rename", "Move to Vault", "Delete"]);
+  });
+
+  it("renames a row in place rather than through a prompt", async () => {
+    render(<VaultTree />);
+    await userEvent.click(within(rowMenu("Roadmap")).getByText("Rename"));
+    const field = screen.getByLabelText("Rename");
+    await userEvent.clear(field);
+    await userEvent.type(field, "Plan{Enter}");
+    const { api } = await import("../lib/ipc");
+    expect(api.renamePage).toHaveBeenCalledWith(1, "Plan");
+  });
+
+  it("does not open the page you were only renaming", async () => {
+    render(<VaultTree />);
+    await userEvent.click(within(rowMenu("Roadmap")).getByText("Rename"));
+    await userEvent.click(screen.getByLabelText("Rename"));
+    expect(useStore.getState().currentPageId).toBe(null);
+  });
+
+  it("files a nested page back out to the vault root", async () => {
+    render(<VaultTree />);
+    // Open Work with its twisty (clicking the row itself browses to the folder, it does not expand).
+    const workRow = screen.getByText("Work").closest("div")!;
+    await userEvent.click(within(workRow).getAllByRole("button")[0]);
+    await userEvent.click(within(rowMenu("Kickoff")).getByText("Move to Vault"));
+    const { api } = await import("../lib/ipc");
+    expect(api.movePage).toHaveBeenCalledWith(3, null, 0);
+  });
+
+  it("greys out Move to Vault for a row already at the top level", () => {
+    render(<VaultTree />);
+    expect(within(rowMenu("Roadmap")).getByText("Move to Vault").closest("button")).toBeDisabled();
+  });
+
+  it("offers a journal entry only what a date-filed note can do", () => {
+    render(<VaultTree />);
+    fireEvent.contextMenu(screen.getByText("Jun 14").closest("div")!, { clientX: 5, clientY: 5 });
+    const labels = within(screen.getByRole("menu")).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open", "Delete"]);
   });
 });

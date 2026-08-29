@@ -2,9 +2,12 @@ import { useMemo, useRef, useState } from "react";
 import {
   CalendarHeart,
   ChevronRight,
+  Download,
   FileText,
   Folder,
+  FolderOpen,
   FolderPlus,
+  FolderUp,
   Grid2x2,
   Library,
   List,
@@ -28,9 +31,14 @@ import {
   journalEntries,
   sortEntries,
 } from "../lib/pageTree";
+import ContextMenu, { type MenuAnchor, type MenuItem } from "../components/ContextMenu";
+import { dragSource, setPageDrag } from "../lib/pageDrag";
 import type { Page } from "../lib/ipc";
 
 type Layout = "grid" | "list";
+
+/** Which breadcrumb a drag is hovering: a folder id, the root crumb, or nothing. */
+type Crumb = number | "root" | null;
 
 /** "3 items" / "1 item" — a folder's weight at a glance, the way Drive shows it. */
 function itemCount(n: number): string {
@@ -80,6 +88,8 @@ export default function VaultBrowserPane() {
   const [renaming, setRenaming] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [dropTarget, setDropTarget] = useState<number | null>(null);
+  const [dropCrumb, setDropCrumb] = useState<Crumb>(null);
+  const [menu, setMenu] = useState<MenuAnchor | null>(null);
   const [importing, setImporting] = useState<{ done: number; total: number } | null>(null);
   const renameRef = useRef<HTMLInputElement | null>(null);
 
@@ -154,52 +164,113 @@ export default function VaultBrowserPane() {
     await deletePage(page.id);
   };
 
-  const newFolder = async () => {
-    const folder = await createFolder("New folder", inJournal ? null : folderId);
+  // A folder made from a menu appears where you asked for it, so the browser follows it in. A new
+  // folder you cannot see is a folder you cannot name, and naming it is the next thing you want.
+  const newFolderIn = async (parentId: number | null) => {
+    const folder = await createFolder("New folder", parentId);
+    if (parentId !== folderId) openFolder(parentId);
     startRename(folder);
   };
 
   // Drag & drop. Only folders accept a drop, and a folder can't swallow its own ancestor — that
-  // would orphan the whole subtree from the root. The Journal is virtual, so it never takes one.
-  const canDrop = (target: Page, srcId: number) =>
-    !!target.isFolder && target.id !== JOURNAL_ID && srcId !== target.id && !isAncestor(pages, srcId, target.id);
+  // would orphan the whole subtree from the root. The Journal is virtual, so it never takes one, and
+  // a daily note can't be filed anywhere: the Journal gathers it by date rather than by parent, so
+  // the move would read as the note simply vanishing.
+  const canDropInto = (destId: number | null, srcId: number) => {
+    const src = pages.find((p) => p.id === srcId);
+    if (!src || src.dailyDate) return false;
+    if (destId === JOURNAL_ID) return false;
+    if (destId != null && (srcId === destId || isAncestor(pages, srcId, destId))) return false;
+    return (src.parentId ?? null) !== destId; // already filed there
+  };
+
+  const canDrop = (target: Page, srcId: number) => !!target.isFolder && canDropInto(target.id, srcId);
+
+  const srcOf = (e: React.DragEvent): number | null => dragSource(e);
+
+  const endDrag = () => {
+    setPageDrag(null);
+    setDropTarget(null);
+    setDropCrumb(null);
+  };
 
   const onDropInto = async (target: Page, e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setDropTarget(null);
-    const src = Number(e.dataTransfer.getData("text/page"));
+    const src = srcOf(e);
+    endDrag();
     if (src && canDrop(target, src)) await movePage(src, target.id, 0);
   };
 
   // Dropping on the pane background (not on a card) moves the page into the folder you're browsing.
   const onDropHere = async (e: React.DragEvent) => {
-    const src = Number(e.dataTransfer.getData("text/page"));
+    const src = srcOf(e);
+    endDrag();
     if (!src || inJournal) return;
     if (folderId != null && (src === folderId || isAncestor(pages, src, folderId))) return;
-    const current = pages.find((p) => p.id === src);
-    if (current && (current.parentId ?? null) === folderId) return; // already here
+    if (!canDropInto(folderId, src)) return;
     await movePage(src, folderId, 0);
   };
 
+  const isDraggable = (page: Page) => page.id !== JOURNAL_ID && !page.dailyDate;
+
   const dragProps = (page: Page) =>
-    page.id === JOURNAL_ID
+    !isDraggable(page)
       ? {}
       : {
           draggable: true,
-          onDragStart: (e: React.DragEvent) => e.dataTransfer.setData("text/page", String(page.id)),
+          onDragStart: (e: React.DragEvent) => {
+            setPageDrag(page.id);
+            e.dataTransfer.setData("text/page", String(page.id));
+            e.dataTransfer.effectAllowed = "move";
+          },
+          onDragEnd: endDrag,
         };
 
   const dropProps = (page: Page) => ({
     onDragOver: (e: React.DragEvent) => {
-      if (!page.isFolder || page.id === JOURNAL_ID) return;
+      const src = srcOf(e);
+      // Not a target: leave the event alone so it bubbles to the pane, which files the drop into the
+      // folder you are standing in. The cursor reads "no drop here" in the meantime.
+      if (src == null || !canDrop(page, src)) {
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
+      e.dataTransfer.dropEffect = "move";
       setDropTarget(page.id);
     },
     onDragLeave: () => setDropTarget((t) => (t === page.id ? null : t)),
     onDrop: (e: React.DragEvent) => void onDropInto(page, e),
   });
+
+  // Breadcrumbs take drops too. Dragging onto an ancestor is how you move something back OUT of a
+  // folder without navigating there first, which is the one direction card targets cannot express.
+  const crumbDropProps = (id: number | null) => {
+    const key: Crumb = id ?? "root";
+    return {
+      onDragOver: (e: React.DragEvent) => {
+        const src = srcOf(e);
+        if (src == null || !canDropInto(id, src)) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = "move";
+        setDropCrumb(key);
+      },
+      onDragLeave: () => setDropCrumb((c) => (c === key ? null : c)),
+      onDrop: (e: React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const src = srcOf(e);
+        endDrag();
+        if (src && canDropInto(id, src)) void movePage(src, id, 0);
+      },
+    };
+  };
 
   const renameField = () => (
     <input
@@ -245,6 +316,75 @@ export default function VaultBrowserPane() {
       </div>
     );
 
+  const showMenu = (e: React.MouseEvent, items: MenuItem[]) => {
+    // A text field keeps its own menu: cut/copy/paste on the name you are typing is more use than
+    // "New folder", and taking it away is the kind of small theft that makes an app feel wrong.
+    if ((e.target as HTMLElement).closest("input, textarea, [contenteditable='true']")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, items });
+  };
+
+  /** The right-click menu for one entry: everything the hover buttons do, plus what there was never
+   *  room for on a card: filing it back out of a folder, and creating inside the folder you clicked. */
+  const entryMenu = (page: Page): MenuItem[] => {
+    if (page.id === JOURNAL_ID) {
+      return [{ label: "Open", icon: FolderOpen, onSelect: () => openFolder(JOURNAL_ID) }];
+    }
+    if (page.dailyDate) {
+      // A journal entry is filed by its date, so it has no parent to change and no name to rename.
+      return [
+        { label: "Open", icon: FileText, onSelect: () => openPage(page.id) },
+        { separator: true },
+        { label: "Delete", icon: Trash2, danger: true, onSelect: () => void remove(page) },
+      ];
+    }
+    const items: MenuItem[] = [
+      { label: "Open", icon: page.isFolder ? FolderOpen : FileText, onSelect: () => open(page) },
+      { separator: true },
+    ];
+    if (page.isFolder) {
+      items.push(
+        { label: "New page inside", icon: Plus, onSelect: () => void createPage(page.id) },
+        { label: "New folder inside", icon: FolderPlus, onSelect: () => void newFolderIn(page.id) },
+        { separator: true },
+      );
+    }
+    items.push(
+      { label: "Rename", icon: Pencil, onSelect: () => startRename(page) },
+      {
+        label: "Move to Vault",
+        icon: FolderUp,
+        disabled: (page.parentId ?? null) === null,
+        onSelect: () => void movePage(page.id, null, 0),
+      },
+      { separator: true },
+      { label: "Delete", icon: Trash2, danger: true, onSelect: () => void remove(page) },
+    );
+    return items;
+  };
+
+  /** Right-clicking the empty space acts on the folder you are standing in. */
+  const hereMenu = (): MenuItem[] => {
+    if (inJournal) {
+      return [{ label: "Today's note", icon: CalendarHeart, onSelect: () => void openDaily(toLocalDate(new Date())) }];
+    }
+    const items: MenuItem[] = [
+      { label: "New page", icon: Plus, onSelect: () => void createPage(folderId) },
+      { label: "New folder", icon: FolderPlus, onSelect: () => void newFolderIn(folderId) },
+    ];
+    if (folderId == null) {
+      items.push({ separator: true }, { label: "Import Markdown", icon: Download, onSelect: () => void runImport() });
+    }
+    items.push(
+      { separator: true },
+      layout === "grid"
+        ? { label: "List view", icon: List, onSelect: () => setLayout("list") }
+        : { label: "Grid view", icon: Grid2x2, onSelect: () => setLayout("grid") },
+    );
+    return items;
+  };
+
   /** The line under a name: what the thing is, in the fewest words that are actually informative. */
   const subtitle = (page: Page) => {
     if (page.id === JOURNAL_ID) return itemCount(journalEntries(pages).length);
@@ -254,16 +394,23 @@ export default function VaultBrowserPane() {
   };
 
   return (
-    <div className="h-full w-full overflow-y-auto" onDragOver={(e) => e.preventDefault()} onDrop={(e) => void onDropHere(e)}>
+    <div
+      className="h-full w-full overflow-y-auto"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => void onDropHere(e)}
+      onContextMenu={(e) => showMenu(e, hereMenu())}
+    >
       <div className="max-w-5xl mx-auto p-6 space-y-4">
         {/* Breadcrumb + actions */}
         <div className="flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-1 text-sm min-w-0">
             <button
               onClick={() => openFolder(null)}
+              {...crumbDropProps(null)}
               className={clsx(
                 "flex items-center gap-1.5 px-2 py-1 hoverable",
                 folderId == null ? "text-white font-medium" : "text-[var(--ink-muted)] hover:text-white",
+                dropCrumb === "root" && "ring-1 ring-white/40 bg-white/[0.08]",
               )}
             >
               <Library className="size-4" /> Vault
@@ -273,9 +420,11 @@ export default function VaultBrowserPane() {
                 <ChevronRight className="size-3.5 shrink-0 text-[var(--ink-faint)]" />
                 <button
                   onClick={() => openFolder(f.id)}
+                  {...crumbDropProps(f.id)}
                   className={clsx(
                     "truncate px-2 py-1 hoverable",
                     i === trail.length - 1 ? "text-white font-medium" : "text-[var(--ink-muted)] hover:text-white",
+                    dropCrumb === f.id && "ring-1 ring-white/40 bg-white/[0.08]",
                   )}
                 >
                   {f.title}
@@ -317,7 +466,7 @@ export default function VaultBrowserPane() {
             </div>
             {!inJournal && (
               <button
-                onClick={() => void newFolder()}
+                onClick={() => void newFolderIn(inJournal ? null : folderId)}
                 title="New folder"
                 className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 hoverable border border-white/10"
               >
@@ -400,6 +549,7 @@ export default function VaultBrowserPane() {
                 {...dragProps(page)}
                 {...dropProps(page)}
                 onClick={() => renaming !== page.id && open(page)}
+                onContextMenu={(e) => showMenu(e, entryMenu(page))}
                 className={clsx(
                   "group border border-white/10 bg-white/[0.02] p-3 cursor-pointer hoverable",
                   dropTarget === page.id && "ring-1 ring-white/40 bg-white/[0.08]",
@@ -436,6 +586,7 @@ export default function VaultBrowserPane() {
                 {...dragProps(page)}
                 {...dropProps(page)}
                 onClick={() => renaming !== page.id && open(page)}
+                onContextMenu={(e) => showMenu(e, entryMenu(page))}
                 className={clsx(
                   "group flex items-center gap-3 px-3 py-2 cursor-pointer hoverable border-b border-white/5 last:border-b-0",
                   dropTarget === page.id && "ring-1 ring-white/40 bg-white/[0.08]",
@@ -469,6 +620,8 @@ export default function VaultBrowserPane() {
           </p>
         )}
       </div>
+
+      {menu && <ContextMenu anchor={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }

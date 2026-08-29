@@ -1,10 +1,26 @@
-import { useMemo, useState } from "react";
-import { ChevronRight, FileText, Folder, FolderOpen, FolderPlus, Plus, Trash2, CalendarHeart, Download, Loader2, X } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import {
+  CalendarHeart,
+  ChevronRight,
+  Download,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  FolderUp,
+  Loader2,
+  Pencil,
+  Plus,
+  Trash2,
+  X,
+} from "lucide-react";
 import clsx from "clsx";
 import { useStore } from "../state/store";
 import { parseLocal } from "../lib/time";
 import { importMarkdownFolder } from "../lib/import";
 import { JOURNAL_ID, browsablePages, childrenOf, isAncestor, journalEntries } from "../lib/pageTree";
+import { dragSource, setPageDrag } from "../lib/pageDrag";
+import ContextMenu, { type MenuAnchor, type MenuItem } from "./ContextMenu";
 import type { Page } from "../lib/ipc";
 
 // Re-exported from its new home in `lib/pageTree` — the vault browser needs the same cycle guard,
@@ -19,36 +35,128 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
   const createFolder = useStore((s) => s.createFolder);
   const deletePage = useStore((s) => s.deletePage);
   const movePage = useStore((s) => s.movePage);
+  const renamePage = useStore((s) => s.renamePage);
   const pages = useStore((s) => s.pages);
   const [expanded, setExpanded] = useState(false);
   const [dropHover, setDropHover] = useState(false);
+  const [menu, setMenu] = useState<MenuAnchor | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(page.title);
+  const renameRef = useRef<HTMLInputElement | null>(null);
 
   const kids = byParent.get(page.id) ?? [];
   const active = currentPageId === page.id;
   const isFolder = !!page.isFolder;
 
+  // A node can hold a drop unless it would swallow itself or one of its own ancestors, which would
+  // cut the whole subtree off from the root.
+  const accepts = (src: number | null) => src != null && src !== page.id && !isAncestor(pages, src, page.id);
+
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDropHover(false);
-    const src = Number(e.dataTransfer.getData("text/page"));
-    if (src && src !== page.id && !isAncestor(pages, src, page.id)) {
-      movePage(src, page.id, 0);
+    const src = dragSource(e);
+    setPageDrag(null);
+    if (accepts(src)) {
+      movePage(src!, page.id, 0);
       setExpanded(true);
     }
   };
 
+  const startRename = () => {
+    setDraft(page.title);
+    setRenaming(true);
+    requestAnimationFrame(() => renameRef.current?.select());
+  };
+
+  const commitRename = () => {
+    const name = draft.trim();
+    setRenaming(false);
+    if (name && name !== page.title) void renamePage(page.id, name);
+  };
+
+  const confirmDelete = () => {
+    // Deleting a folder never deletes what's inside it: the children reparent to the top level
+    // (the schema's ON DELETE SET NULL). Say so, so nobody hesitates over the button.
+    const warning = isFolder && kids.length > 0 ? ` Its ${kids.length} item(s) move to the top level.` : "";
+    if (confirm(`Delete "${page.title}"?${warning}`)) deletePage(page.id);
+  };
+
+  const items: MenuItem[] = [
+    {
+      label: "Open",
+      icon: isFolder ? FolderOpen : FileText,
+      onSelect: () => (isFolder ? openFolder(page.id) : openPage(page.id)),
+    },
+    { separator: true },
+    {
+      label: isFolder ? "New page inside" : "Add sub-page",
+      icon: Plus,
+      onSelect: () => {
+        void createPage(page.id);
+        setExpanded(true);
+      },
+    },
+    ...(isFolder
+      ? [
+          {
+            label: "New folder inside",
+            icon: FolderPlus,
+            onSelect: () => {
+              void createFolder("New folder", page.id);
+              setExpanded(true);
+            },
+          } as MenuItem,
+        ]
+      : []),
+    { separator: true },
+    { label: "Rename", icon: Pencil, onSelect: startRename },
+    {
+      label: "Move to Vault",
+      icon: FolderUp,
+      disabled: (page.parentId ?? null) === null,
+      onSelect: () => void movePage(page.id, null, 0),
+    },
+    { separator: true },
+    { label: "Delete", icon: Trash2, danger: true, onSelect: confirmDelete },
+  ];
+
   return (
     <div>
       <div
-        draggable
-        onDragStart={(e) => e.dataTransfer.setData("text/page", String(page.id))}
+        draggable={!renaming}
+        onDragStart={(e) => {
+          setPageDrag(page.id);
+          e.dataTransfer.setData("text/page", String(page.id));
+          e.dataTransfer.effectAllowed = "move";
+        }}
+        onDragEnd={() => {
+          setPageDrag(null);
+          setDropHover(false);
+        }}
         onDragOver={(e) => {
+          const src = dragSource(e);
+          // Refusing here (no preventDefault) lets the drag fall through to the Pages container,
+          // which files it at the top level, and keeps the cursor honest about what will happen.
+          if (!accepts(src)) {
+            if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+            return;
+          }
           e.preventDefault();
+          e.stopPropagation();
+          e.dataTransfer.dropEffect = "move";
           setDropHover(true);
         }}
         onDragLeave={() => setDropHover(false)}
         onDrop={onDrop}
+        onContextMenu={(e) => {
+          // The rename field keeps its own cut/copy/paste menu.
+          if ((e.target as HTMLElement).closest("input")) return;
+          e.preventDefault();
+          e.stopPropagation();
+          setMenu({ x: e.clientX, y: e.clientY, items });
+        }}
         className={clsx(
           "group flex items-center gap-1 pr-1 text-sm cursor-pointer",
           active ? "is-selected text-white" : "hoverable text-[var(--ink-muted)] hover:text-white",
@@ -56,7 +164,7 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
         )}
         style={{ paddingLeft: depth * 12 + 4 }}
         // A folder isn't a document — clicking it browses TO it (the Drive view), it never opens an editor.
-        onClick={() => (isFolder ? openFolder(page.id) : openPage(page.id))}
+        onClick={() => !renaming && (isFolder ? openFolder(page.id) : openPage(page.id))}
       >
         <button
           onClick={(e) => {
@@ -81,7 +189,25 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
               <FileText className="size-3.5 inline text-gray-500" />
             ))}
         </span>
-        <span className="truncate flex-1 py-1">{page.title}</span>
+        {renaming ? (
+          <input
+            ref={renameRef}
+            value={draft}
+            aria-label="Rename"
+            autoFocus
+            onChange={(e) => setDraft(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={commitRename}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") setRenaming(false);
+            }}
+            className="flex-1 min-w-0 my-0.5 bg-[var(--raised)] border border-white/20 px-1 py-0.5 text-sm text-white outline-none"
+          />
+        ) : (
+          <span className="truncate flex-1 py-1">{page.title}</span>
+        )}
         {isFolder && (
           <button
             onClick={(e) => {
@@ -109,10 +235,7 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
         <button
           onClick={(e) => {
             e.stopPropagation();
-            // Deleting a folder never deletes what's inside it — the children reparent to the top
-            // level (the schema's ON DELETE SET NULL). Say so, so nobody hesitates over the button.
-            const warning = isFolder && kids.length > 0 ? ` Its ${kids.length} item(s) move to the top level.` : "";
-            if (confirm(`Delete "${page.title}"?${warning}`)) deletePage(page.id);
+            confirmDelete();
           }}
           title={isFolder ? "Delete folder" : "Delete page"}
           className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-white/10 hover:text-rose-300 shrink-0"
@@ -121,6 +244,7 @@ function TreeNode({ page, byParent, depth }: { page: Page; byParent: Map<number 
         </button>
       </div>
       {expanded && kids.map((k) => <TreeNode key={k.id} page={k} byParent={byParent} depth={depth + 1} />)}
+      {menu && <ContextMenu anchor={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }
@@ -181,6 +305,7 @@ export default function VaultTree() {
   const createPage = useStore((s) => s.createPage);
   const createFolder = useStore((s) => s.createFolder);
   const openPage = useStore((s) => s.openPage);
+  const deletePage = useStore((s) => s.deletePage);
   const loadPages = useStore((s) => s.loadPages);
   const currentPageId = useStore((s) => s.currentPageId);
   const [importing, setImporting] = useState<{ done: number; total: number } | null>(null);
@@ -205,15 +330,36 @@ export default function VaultTree() {
   const openFolder = useStore((s) => s.openFolder);
   const byParent = useMemo(() => childrenOf(manual), [manual]);
   const roots = byParent.get(null) ?? [];
+  const [menu, setMenu] = useState<MenuAnchor | null>(null);
 
   // Dropping a page onto the Pages container (not onto another node) moves it to the top level.
+  // A page already sitting at the top level is left alone rather than written back unchanged.
   const onRootDrop = (e: React.DragEvent) => {
-    const src = Number(e.dataTransfer.getData("text/page"));
-    if (src) movePage(src, null, 0);
+    const src = dragSource(e);
+    setPageDrag(null);
+    if (src == null) return;
+    const page = pages.find((p) => p.id === src);
+    if (!page || (page.parentId ?? null) === null) return;
+    movePage(src, null, 0);
   };
 
+  const containerMenu: MenuItem[] = [
+    { label: "New page", icon: Plus, onSelect: () => void createPage(null) },
+    { label: "New folder", icon: FolderPlus, onSelect: () => void createFolder("New folder", null) },
+    { separator: true },
+    { label: "Import Markdown", icon: Download, onSelect: () => void runImport() },
+  ];
+
   return (
-    <div className="mt-1 space-y-0.5" onDragOver={(e) => e.preventDefault()} onDrop={onRootDrop}>
+    <div
+      className="mt-1 space-y-0.5"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={onRootDrop}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setMenu({ x: e.clientX, y: e.clientY, items: containerMenu });
+      }}
+    >
       <OpenPages />
 
       <div className="flex items-center justify-between px-3 pt-2 pb-0.5">
@@ -263,6 +409,28 @@ export default function VaultTree() {
             <div
               key={p.id}
               onClick={() => openPage(p.id)}
+              // A journal entry is filed by its date, so it has no parent to change and no name to
+              // rename. Its menu is the two things that ARE true of it.
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  items: [
+                    { label: "Open", icon: FileText, onSelect: () => openPage(p.id) },
+                    { separator: true },
+                    {
+                      label: "Delete",
+                      icon: Trash2,
+                      danger: true,
+                      onSelect: () => {
+                        if (confirm(`Delete "${p.title}"?`)) void deletePage(p.id);
+                      },
+                    },
+                  ],
+                });
+              }}
               className={clsx(
                 "flex items-center gap-1.5 px-2 py-1 text-sm cursor-pointer",
                 currentPageId === p.id ? "is-selected text-white" : "hoverable text-[var(--ink-muted)] hover:text-white",
@@ -274,6 +442,8 @@ export default function VaultTree() {
           ))}
         </>
       )}
+
+      {menu && <ContextMenu anchor={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }

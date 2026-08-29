@@ -362,3 +362,116 @@ describe("VaultBrowserPane - layout and empty states", () => {
     expect(names).toEqual(["2026-06-14", "2026-06-12"]);
   });
 });
+
+describe("VaultBrowserPane - drag targets beyond the folder card", () => {
+  it("dropping on a breadcrumb files the page back out of the folder", async () => {
+    useStore.setState({ vaultFolderId: 1 });
+    render(<VaultBrowserPane />);
+    // Standing in Work, drag its child Kickoff onto the root Vault crumb.
+    dropOn(screen.getByRole("button", { name: "Vault" }), 3);
+    const { api } = await import("../lib/ipc");
+    expect(api.movePage).toHaveBeenCalledWith(3, null, 0);
+  });
+
+  it("leaves a page alone when it is dropped on the crumb it already sits under", async () => {
+    render(<VaultBrowserPane />);
+    dropOn(screen.getByRole("button", { name: "Vault" }), 2); // Roadmap is already at the root
+    const { api } = await import("../lib/ipc");
+    expect(api.movePage).not.toHaveBeenCalled();
+  });
+
+  it("will not file a journal entry, which is gathered by date and would just disappear", async () => {
+    render(<VaultBrowserPane />);
+    dropOn(entry(1), 10); // the daily note onto Work
+    const { api } = await import("../lib/ipc");
+    expect(api.movePage).not.toHaveBeenCalled();
+  });
+
+  it("does not offer a journal entry as a drag at all", () => {
+    useStore.setState({ vaultFolderId: JOURNAL_ID });
+    render(<VaultBrowserPane />);
+    expect(entry(10).getAttribute("draggable")).toBe(null);
+  });
+});
+
+/** Right-click `target` and hand back the menu that opens. */
+function menuOn(target: Element): HTMLElement {
+  fireEvent.contextMenu(target, { clientX: 10, clientY: 10 });
+  return screen.getByRole("menu");
+}
+
+describe("VaultBrowserPane - right-click menu", () => {
+  it("offers a folder the things a folder can do", () => {
+    render(<VaultBrowserPane />);
+    const menu = menuOn(entry(1));
+    const labels = within(menu).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open", "New page inside", "New folder inside", "Rename", "Move to Vault", "Delete"]);
+  });
+
+  it("renames from the menu, in place on the card", async () => {
+    render(<VaultBrowserPane />);
+    await userEvent.click(within(menuOn(entry(1))).getByText("Rename"));
+    const field = screen.getByLabelText("Rename");
+    await userEvent.clear(field);
+    await userEvent.type(field, "Archive{Enter}");
+    const { api } = await import("../lib/ipc");
+    expect(api.renamePage).toHaveBeenCalledWith(1, "Archive");
+  });
+
+  it("files a page back out to the vault root", async () => {
+    useStore.setState({ vaultFolderId: 1 });
+    render(<VaultBrowserPane />);
+    await userEvent.click(within(menuOn(entry(3))).getByText("Move to Vault"));
+    const { api } = await import("../lib/ipc");
+    expect(api.movePage).toHaveBeenCalledWith(3, null, 0);
+  });
+
+  it("greys out Move to Vault for something already at the root", () => {
+    render(<VaultBrowserPane />);
+    expect(within(menuOn(entry(2))).getByText("Move to Vault").closest("button")).toBeDisabled();
+  });
+
+  it("creates inside the folder you right-clicked, not the one you are standing in", async () => {
+    render(<VaultBrowserPane />);
+    await userEvent.click(within(menuOn(entry(1))).getByText("New folder inside"));
+    const { api } = await import("../lib/ipc");
+    expect(api.createFolder).toHaveBeenCalledWith("New folder", 1);
+    // ...and the browser follows it in, so the new folder is visible to name.
+    expect(useStore.getState().vaultFolderId).toBe(1);
+  });
+
+  it("acts on the current folder when you right-click the empty space", async () => {
+    useStore.setState({ vaultFolderId: 1 });
+    const { container } = render(<VaultBrowserPane />);
+    await userEvent.click(within(menuOn(container.firstChild as Element)).getByText("New page"));
+    const { api } = await import("../lib/ipc");
+    expect(api.createPage).toHaveBeenCalledWith("Untitled", 1);
+  });
+
+  it("offers the virtual Journal nothing it cannot do", () => {
+    render(<VaultBrowserPane />);
+    const labels = within(menuOn(entry(JOURNAL_ID))).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open"]);
+  });
+
+  it("offers a journal entry no rename and no move, since its date is its filing", () => {
+    useStore.setState({ vaultFolderId: JOURNAL_ID });
+    render(<VaultBrowserPane />);
+    const labels = within(menuOn(entry(10))).getAllByRole("menuitem").map((b) => b.textContent);
+    expect(labels).toEqual(["Open", "Delete"]);
+  });
+
+  it("closes on Escape without doing anything", async () => {
+    render(<VaultBrowserPane />);
+    const menu = menuOn(entry(1));
+    fireEvent.keyDown(menu, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("closes when you click away", () => {
+    render(<VaultBrowserPane />);
+    menuOn(entry(1));
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+});
