@@ -57,6 +57,28 @@ test("creates a vault page from the sidebar", async ({ page }) => {
   await expect(title).toHaveValue("My first note");
 });
 
+test("spell check toggles off for one page, on the real editable", async ({ page }) => {
+  // The only suite that can prove this: the flag has to land on ProseMirror's contenteditable
+  // (`editor.domElement`), and neither jsdom nor a mocked editor has one. A wrong element here
+  // compiles, passes the unit tests, and does nothing at all in the app.
+  await enterVault(page);
+  await nav(page).getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("button", { name: "New page" }).first().click();
+  await expect(page.getByPlaceholder("Untitled")).toBeVisible();
+
+  const editable = page.locator(".pushin-editor [contenteditable='true']").first();
+  const toggle = page.getByRole("button", { name: /spell check/i });
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await expect(editable).toHaveAttribute("spellcheck", "false");
+  await expect(page.getByPlaceholder("Untitled")).toHaveAttribute("spellcheck", "false");
+
+  await toggle.click();
+  await expect(editable).toHaveAttribute("spellcheck", "true");
+});
+
 test("makes a folder in the vault browser and files a page into it", async ({ page }) => {
   // Scoped to <main>: the sidebar carries its own New folder / New page buttons, and an unscoped
   // `.first()` picks the sidebar's — which creates the folder but never opens the rename field.
@@ -158,4 +180,26 @@ test("command palette opens with Cmd/Ctrl-K and can ask the vault", async ({ pag
   await input.fill("what did I note");
   await page.getByText(/Ask your vault:/).click();
   await expect(page.getByText("(mock answer)")).toBeVisible();
+});
+
+test("right-clicking a vault folder offers its actions, and Rename works from there", async ({ page }) => {
+  const browser = page.locator("main");
+  await enterVault(page);
+  await browser.getByRole("button", { name: "New folder" }).click();
+  const rename = browser.getByLabel("Rename");
+  await rename.fill("Work");
+  await rename.press("Enter");
+  await expect(browser.getByText("Work")).toBeVisible();
+
+  await browser.getByText("Work").click({ button: "right" });
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: "New folder inside" })).toBeVisible();
+  await menu.getByRole("menuitem", { name: "Rename" }).click();
+  await expect(menu).toBeHidden();
+
+  // The menu hands off to the same in-place field the hover button opens.
+  const again = browser.getByLabel("Rename");
+  await again.fill("Archive");
+  await again.press("Enter");
+  await expect(browser.getByText("Archive")).toBeVisible();
 });
