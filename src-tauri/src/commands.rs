@@ -1460,6 +1460,15 @@ pub async fn update_page(
     db::get_page(&conn, id).map_err(err)
 }
 
+/// Turn this page's spell check on or off. Returns the refreshed page. Deliberately per page: the
+/// same vault holds prose worth checking and lecture/code notes where every identifier squiggles.
+#[tauri::command]
+pub fn set_page_spellcheck(state: State<AppState>, id: i64, on: bool) -> Result<Page, String> {
+    let conn = state.db();
+    db::set_page_spellcheck(&conn, id, on).map_err(err)?;
+    db::get_page(&conn, id).map_err(err)
+}
+
 /// Delete a page (its outgoing/incoming links cascade; children are re-parented to the root via the
 /// ON DELETE SET NULL FK). Returns the refreshed tree.
 #[tauri::command]

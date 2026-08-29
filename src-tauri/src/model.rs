@@ -369,6 +369,10 @@ pub struct Page {
     /// True when this row is a FOLDER — a container in the vault tree rather than a document. It has
     /// no body, is never embedded, and is skipped by search + the link graph.
     pub is_folder: bool,
+    /// Whether the browser's spell checker runs inside this page's editor. Per page, not per app:
+    /// a vault holds both prose that wants checking and code/jargon notes where a squiggle under
+    /// every identifier hides the real typos. Defaults true, including for pre-0025 notes.
+    pub spellcheck: bool,
     pub created_at: String,
     pub updated_at: String,
     pub indexed: bool,

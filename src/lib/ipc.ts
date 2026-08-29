@@ -397,6 +397,9 @@ export interface Page {
   dailyDate?: string;
   /** True while the page is an unsorted quick-capture in the Inbox. */
   inbox: boolean;
+  /** Whether the editor spell-checks this page. Optional so rows minted before 0025 (and the E2E
+   *  mock bridge) read as spell-checked, which is what they were. */
+  spellcheck?: boolean;
   /** True when this row is a FOLDER — a container in the vault tree, not a document. Optional so
    *  rows minted before 0024 (and the E2E mock bridge) read as plain pages. */
   isFolder?: boolean;
@@ -578,6 +581,9 @@ export const api = {
   deletePage: (id: number) => invoke<Page[]>("delete_page", { id }),
   movePage: (id: number, parentId: number | null, sortOrder: number) =>
     invoke<Page[]>("move_page", { id, parentId, sortOrder }),
+  /** Turn the editor's spell check on or off for ONE page. Per page on purpose: a vault holds both
+   *  prose worth checking and code/lecture notes where every identifier squiggles. */
+  setPageSpellcheck: (id: number, on: boolean) => invoke<Page>("set_page_spellcheck", { id, on }),
   pageBacklinks: (id: number) => invoke<Page[]>("page_backlinks", { id }),
   searchPages: (query: string) => invoke<Page[]>("search_pages", { query }),
   unlinkedMentions: (id: number) => invoke<Page[]>("unlinked_mentions", { id }),

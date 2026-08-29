@@ -27,6 +27,7 @@ vi.mock("../lib/ipc", () => ({
     unlinkedMentions: vi.fn().mockResolvedValue([]),
     pageEntities: vi.fn().mockResolvedValue([]),
     labelsFor: vi.fn().mockResolvedValue([]),
+    setPageSpellcheck: vi.fn().mockResolvedValue({ id: 1 }),
   },
 }));
 
@@ -46,6 +47,38 @@ const page: Page = {
 };
 
 beforeEach(() => vi.clearAllMocks());
+
+describe("PageEditor (per-page spell check)", () => {
+  it("starts on, and reflects a page that has it turned off", () => {
+    const { unmount } = render(<PageEditor page={page} />);
+    expect(screen.getByRole("button", { name: /spell check/i })).toHaveAttribute("aria-pressed", "true");
+    unmount();
+    // The flag rides on the page, so opening a different note shows that note's setting.
+    render(<PageEditor page={{ ...page, id: 2, spellcheck: false }} />);
+    expect(screen.getByRole("button", { name: /spell check/i })).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("persists the toggle against the page it was clicked on", async () => {
+    render(<PageEditor page={page} />);
+    await userEvent.click(screen.getByRole("button", { name: /spell check/i }));
+    expect(api.setPageSpellcheck).toHaveBeenCalledWith(1, false);
+    await waitFor(() => expect(screen.getByRole("button", { name: /spell check/i })).toHaveAttribute("aria-pressed", "false"));
+  });
+
+  it("turns spell check off on the title field too, not just the body", async () => {
+    render(<PageEditor page={page} />);
+    expect(screen.getByPlaceholderText("Untitled")).toHaveAttribute("spellcheck", "true");
+    await userEvent.click(screen.getByRole("button", { name: /spell check/i }));
+    await waitFor(() => expect(screen.getByPlaceholderText("Untitled")).toHaveAttribute("spellcheck", "false"));
+  });
+
+  it("snaps back when the write fails, rather than showing a preference it never stored", async () => {
+    (api.setPageSpellcheck as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("db locked"));
+    render(<PageEditor page={page} />);
+    await userEvent.click(screen.getByRole("button", { name: /spell check/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /spell check/i })).toHaveAttribute("aria-pressed", "true"));
+  });
+});
 
 describe("PageEditor (autosave wiring)", () => {
   it("loads backlinks / mentions / linked entities on mount", async () => {

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useCreateBlockNote, SuggestionMenuController, getDefaultReactSlashMenuItems, type DefaultReactSuggestionItem } from "@blocknote/react";
 import { filterSuggestionItems } from "@blocknote/core";
 import { BlockNoteView } from "@blocknote/mantine";
-import { Check, FileText, Loader2, Link2, CheckSquare, CalendarDays, AlertTriangle } from "lucide-react";
+import { Check, FileText, Loader2, Link2, CheckSquare, CalendarDays, AlertTriangle, SpellCheck, SpellCheck2 } from "lucide-react";
 import { useStore } from "../state/store";
 import { api, type Page, type EntityRef } from "../lib/ipc";
 import { blocksToPlainText, extractLinkTitles, pageToInitialContent } from "../lib/blocks";
@@ -32,6 +32,9 @@ export default function PageEditor({ page }: { page: Page }) {
   const [backlinks, setBacklinks] = useState<Page[]>([]);
   const [mentions, setMentions] = useState<Page[]>([]);
   const [entities, setEntities] = useState<EntityRef[]>([]);
+  // Spell check is a property of THIS page, loaded with it. Held in local state so the toggle is
+  // instant; the write-back below is what makes it stick.
+  const [spellcheck, setSpellcheck] = useState(page.spellcheck ?? true);
 
   const initialContent = useMemo(() => pageToInitialContent(page) as PartialPageBlock[] | undefined, [page]);
   const editor = useCreateBlockNote({ schema, initialContent });
@@ -109,6 +112,26 @@ export default function PageEditor({ page }: { page: Page }) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Push the flag onto the editor's contenteditable itself (`domElement` is ProseMirror's editable
+  // node). BlockNote sets no `spellcheck` attribute of its own, so the element would otherwise just
+  // inherit from the container above, which is the belt to this braces: the attribute is inherited,
+  // but writing it on the editable is what makes the browser drop the squiggles it already drew.
+  useEffect(() => {
+    editor.domElement?.setAttribute("spellcheck", String(spellcheck));
+  }, [editor, spellcheck]);
+
+  const toggleSpellcheck = async () => {
+    const next = !spellcheck;
+    setSpellcheck(next);
+    try {
+      await api.setPageSpellcheck(page.id, next);
+    } catch {
+      // Don't leave the UI claiming a preference that was never stored: a toggle that silently
+      // forgets itself on reload is worse than one that visibly refuses.
+      setSpellcheck(!next);
+    }
+  };
 
   // `[[` link picker. Triggered on "[" (a second "[" lands in the query, which we strip), listing
   // matching pages plus a "create new page" option.
@@ -188,20 +211,32 @@ export default function PageEditor({ page }: { page: Page }) {
 
   return (
     <div className="h-full w-full overflow-y-auto">
-      <div className="max-w-3xl mx-auto px-12 py-10">
+      <div className="max-w-3xl mx-auto px-12 py-10" spellCheck={spellcheck}>
         <div className="flex items-center gap-2 mb-2 h-5">
+          {/* Top-left, next to the save state: the two things about this page's editing session. */}
+          <button
+            onClick={toggleSpellcheck}
+            title={spellcheck ? "Spell check on for this page. Click to turn it off." : "Spell check off for this page. Click to turn it on."}
+            aria-pressed={spellcheck}
+            className={`flex items-center gap-1 text-[11px] px-1.5 py-0.5 hoverable ${
+              spellcheck ? "text-[var(--ink-faint)] hover:text-white" : "text-amber-400/80 hover:text-amber-300"
+            }`}
+          >
+            {spellcheck ? <SpellCheck className="size-3" /> : <SpellCheck2 className="size-3" />}
+            <span>{spellcheck ? "Spell check" : "Spell check off"}</span>
+          </button>
           {status === "saving" && (
-            <span className="text-[11px] text-gray-500 flex items-center gap-1">
+            <span className="text-[11px] text-gray-500 ml-auto flex items-center gap-1">
               <Loader2 className="size-3 animate-spin" /> Saving…
             </span>
           )}
           {status === "saved" && (
-            <span className="text-[11px] text-gray-600 flex items-center gap-1">
+            <span className="text-[11px] text-gray-600 ml-auto flex items-center gap-1">
               <Check className="size-3" /> Saved
             </span>
           )}
           {status === "error" && (
-            <span className="text-[11px] text-amber-400 flex items-center gap-1" role="status">
+            <span className="text-[11px] text-amber-400 ml-auto flex items-center gap-1" role="status">
               <AlertTriangle className="size-3" /> Couldn&apos;t save, retrying
             </span>
           )}
@@ -213,6 +248,7 @@ export default function PageEditor({ page }: { page: Page }) {
             scheduleSave();
           }}
           placeholder="Untitled"
+          spellCheck={spellcheck}
           className="w-full bg-transparent outline-none text-3xl font-bold tracking-tight placeholder:text-gray-700 mb-2"
         />
         <div className="mb-4">

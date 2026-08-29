@@ -257,6 +257,11 @@ export async function installMockBridge(page: Page) {
         return state.pages.filter((p: any) => !p.inbox).map(lite);
       },
       move_page: () => state.pages.filter((p: any) => !p.inbox).map(lite),
+      set_page_spellcheck: ({ id, on }: any) => {
+        const p = state.pages.find((x: any) => x.id === id);
+        if (p) p.spellcheck = on;
+        return p ?? null;
+      },
       page_backlinks: () => [],
       page_entities: () => [],
       entity_pages: () => [],

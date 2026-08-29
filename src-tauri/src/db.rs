@@ -30,6 +30,7 @@ const MIGRATION_0021: &str = include_str!("../migrations/0021_task_missed.sql");
 const MIGRATION_0022: &str = include_str!("../migrations/0022_ics_sync.sql");
 const MIGRATION_0023: &str = include_str!("../migrations/0023_vault_file_sync.sql");
 const MIGRATION_0024: &str = include_str!("../migrations/0024_page_folders.sql");
+const MIGRATION_0025: &str = include_str!("../migrations/0025_page_spellcheck.sql");
 
 /// 0022's uuid backfill for `ics_subscriptions`, shared with its test so the two can't drift.
 ///
@@ -191,6 +192,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         // already-synced table, so 0015's triggers carry it to paired devices as-is.
         conn.execute_batch(MIGRATION_0024)?;
         conn.pragma_update(None, "user_version", 24)?;
+    }
+    if version < 25 {
+        // notes.spellcheck — per-page spell check. Another plain column on the synced `notes`
+        // table (see 0024), defaulting ON so nothing changes for existing notes.
+        conn.execute_batch(MIGRATION_0025)?;
+        conn.pragma_update(None, "user_version", 25)?;
     }
     ensure_booking_public_fields(conn)?;
     Ok(())
@@ -1667,6 +1674,7 @@ fn row_to_page(r: &Row, indexed: bool, with_body: bool) -> rusqlite::Result<Page
         daily_date: r.get("daily_date")?,
         inbox: r.get::<_, i64>("inbox")? != 0,
         is_folder: r.get::<_, i64>("is_folder")? != 0,
+        spellcheck: r.get::<_, i64>("spellcheck")? != 0,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         indexed,
@@ -1677,7 +1685,7 @@ fn row_to_page(r: &Row, indexed: bool, with_body: bool) -> rusqlite::Result<Page
 /// All non-archived pages (lightweight: no bodies), ordered for the sidebar tree.
 pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder, spellcheck,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE archived = 0 AND (origin IS NULL OR origin != 'memory') ORDER BY sort_order, created_at",
     )?;
@@ -1691,7 +1699,7 @@ pub fn list_pages(conn: &Connection) -> Result<Vec<Page>> {
 /// A single page with its full body.
 pub fn get_page(conn: &Connection, id: i64) -> Result<Page> {
     let page = conn.query_row(
-        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder,
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder, spellcheck,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE id = ?1",
         params![id],
@@ -1751,6 +1759,17 @@ pub fn rename_page(conn: &Connection, id: i64, title: &str) -> Result<()> {
     conn.execute(
         "UPDATE notes SET title = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, title, now_iso()],
+    )?;
+    Ok(())
+}
+
+/// Toggle a page's spell check. Its own tiny writer rather than a field on `update_page`, which
+/// rewrites body + embedding: flipping a display preference must not round-trip the document or
+/// re-embed it. `updated_at` still moves so device sync carries the flip.
+pub fn set_page_spellcheck(conn: &Connection, id: i64, on: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET spellcheck = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, on as i64, now_iso()],
     )?;
     Ok(())
 }
@@ -1837,7 +1856,7 @@ pub fn page_backlinks(conn: &Connection, target_id: i64) -> Result<Vec<Page>> {
     let this_title = this.title.to_lowercase();
     let mut stmt = conn.prepare(
         "SELECT DISTINCT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived,
-                n.daily_date, n.inbox, n.is_folder, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+                n.daily_date, n.inbox, n.is_folder, n.spellcheck, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
          FROM page_links l JOIN notes n ON n.id = l.source_id
          WHERE n.archived = 0 AND (l.target_id = ?1 OR (l.target_id IS NULL AND lower(l.target_title) = ?2))
          ORDER BY n.updated_at DESC, n.id DESC",
@@ -1859,7 +1878,7 @@ pub fn unlinked_mentions(conn: &Connection, page_id: i64) -> Result<Vec<Page>> {
         return Ok(vec![]); // too-short titles ("a") would match everything
     }
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder, spellcheck,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes
          WHERE archived = 0 AND id != ?1 AND instr(lower(content), ?2) > 0
@@ -1880,7 +1899,7 @@ pub fn unlinked_mentions(conn: &Connection, page_id: i64) -> Result<Vec<Page>> {
 pub fn search_pages(conn: &Connection, query: &str) -> Result<Vec<Page>> {
     let like = format!("%{}%", query.trim());
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder,
+        "SELECT id, title, icon, parent_id, content, sort_order, archived, daily_date, inbox, is_folder, spellcheck,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE archived = 0 AND is_folder = 0 AND (title LIKE ?1 OR content LIKE ?1)
          ORDER BY updated_at DESC, id DESC LIMIT 50",
@@ -1930,7 +1949,7 @@ pub fn capture(conn: &Connection, content: &str, embedding: Option<&[u8]>, model
 /// The unsorted Inbox, newest first.
 pub fn list_inbox(conn: &Connection) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder,
+        "SELECT id, title, icon, parent_id, content, content_json, sort_order, archived, daily_date, inbox, is_folder, spellcheck,
                 created_at, updated_at, embedding IS NOT NULL AS indexed
          FROM notes WHERE inbox = 1 ORDER BY created_at DESC, id DESC",
     )?;
@@ -1978,7 +1997,7 @@ pub fn page_entities(conn: &Connection, page_id: i64) -> Result<Vec<EntityRef>> 
 pub fn entity_pages(conn: &Connection, kind: &str, entity_id: i64) -> Result<Vec<Page>> {
     let mut stmt = conn.prepare(
         "SELECT n.id, n.title, n.icon, n.parent_id, n.content, n.sort_order, n.archived, n.daily_date,
-                n.inbox, n.is_folder, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
+                n.inbox, n.is_folder, n.spellcheck, n.created_at, n.updated_at, n.embedding IS NOT NULL AS indexed
          FROM entity_links l JOIN notes n ON n.id = l.page_id
          WHERE n.archived = 0 AND l.entity_kind = ?1 AND l.entity_id = ?2
          ORDER BY n.updated_at DESC, n.id DESC",
@@ -2426,6 +2445,44 @@ mod tests {
         assert_eq!(entity_pages(&conn, "task", 42).unwrap().len(), 1, "entity_pages (aliased)");
         assert_eq!(list_inbox(&conn).unwrap().len(), 1, "list_inbox");
         unlinked_mentions(&conn, target).unwrap(); // may be empty; it must not throw
+    }
+
+    /// Spell check is a per-page flag, defaults ON, and survives a body rewrite. The last part is
+    /// the one that bites: `update_page` is what autosave calls on every keystroke pause, so if it
+    /// touched `spellcheck` the toggle would silently flip itself back the moment you typed.
+    #[test]
+    fn spellcheck_is_per_page_defaults_on_and_survives_a_save() {
+        let conn = mem();
+        let notes = insert_page(&conn, "CS 4820", None, "amortized O(1)", None, None, None).unwrap();
+        let prose = insert_page(&conn, "Letter", None, "dear reader", None, None, None).unwrap();
+
+        assert!(get_page(&conn, notes).unwrap().spellcheck, "a new page starts with spell check on");
+
+        set_page_spellcheck(&conn, notes, false).unwrap();
+        assert!(!get_page(&conn, notes).unwrap().spellcheck, "the page it was set on is off");
+        assert!(get_page(&conn, prose).unwrap().spellcheck, "and only that page: the flag is not global");
+
+        update_page(&conn, notes, "CS 4820", None, "amortized O(1) plus more", None, None, None).unwrap();
+        assert!(!get_page(&conn, notes).unwrap().spellcheck, "editing the body does not re-enable it");
+
+        set_page_spellcheck(&conn, notes, true).unwrap();
+        assert!(get_page(&conn, notes).unwrap().spellcheck, "and it turns back on");
+    }
+
+    /// The upgrade path for 0025, the mirror of the 0024 one: a note written before the column
+    /// existed must read as spell-checked, because that is what it was doing yesterday. A missing
+    /// `DEFAULT 1` would silently disable spell check across an entire existing vault on upgrade.
+    #[test]
+    fn notes_that_predate_the_spellcheck_column_still_have_it_on() {
+        let conn = mem();
+        conn.execute(
+            "INSERT INTO notes(content, title, sort_order, created_at, updated_at)
+             VALUES('legacy body', 'Legacy', 0, '2026-01-01T00:00:00', '2026-01-01T00:00:00')",
+            [],
+        )
+        .unwrap();
+        let page = list_pages(&conn).unwrap().into_iter().next().unwrap();
+        assert!(page.spellcheck, "an existing note keeps spell check on across the migration");
     }
 
     /// The Context Engine's recall spine must not index folders. A folder has no body, so it would

@@ -174,6 +174,7 @@ pub fn run() {
             commands::update_page,
             commands::delete_page,
             commands::move_page,
+            commands::set_page_spellcheck,
             commands::page_backlinks,
             commands::search_pages,
             commands::page_graph,
